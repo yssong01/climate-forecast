@@ -1,0 +1,45 @@
+# 환경변수 / 비밀키
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# 캐시 / 임시 데이터
+cache/
+*.json.bak
+*.log
+
+# 모델 체크포인트 (용량 커서 git 제외)
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# ChromaDB 로컬 저장소
+chroma_db/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
