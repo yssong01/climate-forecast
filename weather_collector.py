@@ -92,6 +92,32 @@ class RobustWeatherCollector:
 
     # ── 시간 계산 ──────────────────────────────────────────────────
 
+    def fetch_at(self, tm: str, retries: int = 2, timeout: int = 10) -> dict:
+        """
+        특정 시각의 ASOS 관측 데이터 수집 (과거 데이터 수집용).
+        tm 형식: YYYYMMDDHHmm (예: 202608062200)
+        """
+        if not self.api_key or self.api_key == "여기에_발급받은_API_키_입력":
+            return self._fallback(tm)
+
+        params = {"tm": tm, "stn": self.stn, "help": "1", "authKey": self.api_key}
+
+        for attempt in range(1, retries + 1):
+            try:
+                resp = requests.get(ASOS_URL, params=params, timeout=timeout)
+                if resp.status_code == 200:
+                    parsed = self._parse_asos(resp.text, tm)
+                    if parsed:
+                        parsed["status"] = "SUCCESS_LIVE"
+                        return parsed
+            except Exception as e:
+                if attempt == retries:
+                    print(f"[WARN] fetch_at {tm} 실패: {e}")
+            if attempt < retries:
+                time.sleep(0.5)
+
+        return self._fallback(tm)
+
     @staticmethod
     def _obs_time() -> str:
         """
@@ -248,11 +274,16 @@ class RobustWeatherCollector:
 
     def to_model_vector(self, data: dict) -> list[float]:
         """
-        8차원 수치 벡터 반환 — pipeline_model.py num_enc 입력과 일치.
-        [temperature, precipitation, humidity, wind_speed,
-         wind_dir_sin, wind_dir_cos, pressure, precip_type]
+        10차원 수치 벡터 반환 — train.record_to_vec 와 순서가 반드시 같아야 한다.
+        [기온, 강수량, 습도, 풍속, 풍향sin, 풍향cos, 기압, 강수형태,
+         시각sin, 시각cos]
         """
         wd_rad = np.deg2rad(data.get("wind_dir", 0.0))
+
+        ts = str(data.get("timestamp", ""))      # YYYYMMDDHHmm
+        hour = int(ts[8:10]) if len(ts) >= 10 else 0
+        h_rad = 2.0 * np.pi * hour / 24.0
+
         return [
             data.get("temperature",   20.0),
             data.get("precipitation",  0.0),
@@ -262,6 +293,8 @@ class RobustWeatherCollector:
             float(np.cos(wd_rad)),
             data.get("pressure",    1013.0),
             float(data.get("precip_type", 0)),
+            float(np.sin(h_rad)),
+            float(np.cos(h_rad)),
         ]
 
 

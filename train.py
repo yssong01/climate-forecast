@@ -1,25 +1,31 @@
 """
-train.py — Phase 2: 수치 단독 기준 모델 학습
-논문 Eq.1 2축 버전: s = √(A² + (0.4·B)²) → 다음 시각 [기온, 강수량] 동시 예측
+train.py — Phase 3-4: 3축 Tri-CHEF 학습 (Gram-Schmidt 직교화 + 학습 안정화)
+논문 Eq.1: s = √(A² + (α·B)² + (φ·C)²)
 
-Re 축 (안정 대기): 기온·습도·기압·강수형태  → 광역 패턴
-Im 축 (동적 기상): 강수량·풍속·풍향sin/cos → 국지 변동
+Re 축 (A): 위성 이미지 → ResNet18 4채널
+Im 축 (B): 기상 문서   → MiniLM 384 프로젝션
+Z  축 (C): 수치 센서   → MLP 인코더
 
-기온 헤드: 항상 변화 있음 → 모델 동작 검증 (퍼시스턴스 대비 MAE)
-강수 헤드: 강수 이벤트 예측 → Phase 3 멀티모달 확장 기반
+Phase 3-4 수정 사항
+  1. Gram-Schmidt 직교화 (ORTHOGONALIZE 플래그로 ablation)
+  2. dying-clamp 버그 수정 (pipeline_model: clamp → softplus)
+  3. 손실 스케일 정규화 — 기온 MSE 가 강수 MSE 를 1000배 압도하던 문제
+  4. 축 직교성·강수 예측 분산 진단 로그
 """
 import os
 import json
 import time
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from weather_collector import RobustWeatherCollector
+from satellite_collector import SimulatedSatelliteCollector
+from text_collector import SimulatedTextCollector
+from pipeline_model import TriCHEFPipeline
 
 load_dotenv()
 
@@ -29,10 +35,40 @@ EMBED_DIM  = 64
 BATCH_SIZE = 32
 EPOCHS     = 150
 LR         = 1e-3
-ALPHA      = 0.4    # Im 축 감쇠 계수 (논문 deployed default α=0.4)
+ALPHA_INIT = 0.4    # Im 축(텍스트) 가중치 초기값 — 학습 중 자동 조정
+PHI_INIT   = 0.2    # Z  축(수치)  가중치 초기값 — 학습 중 자동 조정
 N_HOURS    = 720    # 수집 기간: 30일 × 24시간 (장마철 포함 확보)
 PATIENCE   = 20     # Early stopping
 VAL_RATIO  = 0.2
+
+# 예보 시계 — t 시각 관측으로 t+LEAD_HOURS 를 예측한다.
+# 1시간에서는 퍼시스턴스(T(t+1)≈T(t))가 사실상 무적이라 모델 기여를 측정할
+# 수 없었다(실측: 기온 +0.7%). 6시간이면 일주기가 지배적이 되어 시각 특성과
+# 기압 추세를 학습한 모델이 baseline 을 이길 여지가 생긴다.
+LEAD_HOURS = 6
+
+# Gram-Schmidt 직교화 — ablation.py 실측 결과 기본값 False.
+#   ON  : 기온 0.8886 / 강수 0.3267
+#   OFF : 기온 0.8452 / 강수 0.2889   ← 우세
+# OFF 조건에서 네트워크가 학습한 Re-Im 상관도가 0.4809(ON은 0.0846)로,
+# 축 간 공유 정보가 회귀 성능에 기여함을 뜻한다. 검색 태스크(논문 원본)와
+# 달리 예보 태스크에서는 직교성 강제가 손해다.
+ORTHOGONALIZE = False
+PERSISTENCE_RESIDUAL = True   # 기온을 delta 예측으로 전환 (아래 설명 참조)
+
+# Phase 3-5 동적 게이팅 — 입력마다 축 가중치를 다르게 산출한다.
+DYNAMIC_GATE  = True
+# 게이트 엔트로피 정규화 계수. 가중치가 소수 축에 집중되도록 압력을 준다.
+GATE_ENTROPY_WEIGHT = 0.05
+# 엔트로피 항 워밍업 에폭. 이 구간에서는 λ=0 으로 두고 이후 선형 증가시킨다.
+# 에폭 1부터 집중 압력을 걸면 모델이 어느 축이 유용한지 배우기 전에 초기
+# 순서가 고착된다(Phase 3-5 1차 실측: 위성 축 98% 로 붕괴). 먼저 배우게 한
+# 뒤 집중시킨다.
+GATE_WARMUP_EPOCHS = 50
+# 위성 인코더 용량. ResNet18(1,100만)은 표본 572개를 암기해 게이트를 왜곡시킨다.
+COMPACT_SATELLITE = True
+PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
+SEED          = 42     # 학습/검증 분할 고정 → ablation 비교 가능
 
 CHECKPOINT  = "./checkpoints/numerical_trichef.pt"
 DATA_CACHE  = "./cache/historical_data.json"
@@ -42,18 +78,35 @@ os.makedirs("./checkpoints", exist_ok=True)
 # ── 1. 수치 벡터 변환 ─────────────────────────────────────────────
 
 def record_to_vec(r: dict) -> list[float]:
-    """관측 레코드 → 8차원 수치 벡터."""
+    """
+    관측 레코드 → 10차원 수치 벡터.
+
+    인덱스 8·9(시각 sin/cos)는 Phase 3-4 에서 추가했다. 기온의 일주기
+    (diurnal cycle)는 기온 예측의 지배적 요인인데 기존 8차원에는 시각
+    정보가 전혀 없어 모델이 낮/밤을 구분할 수 없었다.
+    인덱스 0(기온)은 퍼시스턴스 잔차 계산에 쓰이므로 위치를 바꾸지 말 것.
+    """
     wd_rad = np.deg2rad(r.get("wind_dir", 0.0))
+
+    ts = str(r.get("timestamp", ""))            # YYYYMMDDHHmm
+    hour = int(ts[8:10]) if len(ts) >= 10 else 0
+    h_rad = 2.0 * np.pi * hour / 24.0
+
     return [
-        r.get("temperature",   20.0),   # 0: 기온 (Re)
-        r.get("precipitation",  0.0),   # 1: 강수량 (Im)
-        r.get("humidity",      50.0),   # 2: 습도 (Re)
-        r.get("wind_speed",     1.5),   # 3: 풍속 (Im)
-        float(np.sin(wd_rad)),          # 4: 풍향 sin (Im)
-        float(np.cos(wd_rad)),          # 5: 풍향 cos (Im)
-        r.get("pressure",    1013.0),   # 6: 기압 (Re)
-        float(r.get("precip_type", 0)), # 7: 강수형태 (Re)
+        r.get("temperature",   20.0),   # 0: 기온      ← 퍼시스턴스 기준
+        r.get("precipitation",  0.0),   # 1: 강수량
+        r.get("humidity",      50.0),   # 2: 습도
+        r.get("wind_speed",     1.5),   # 3: 풍속
+        float(np.sin(wd_rad)),          # 4: 풍향 sin
+        float(np.cos(wd_rad)),          # 5: 풍향 cos
+        r.get("pressure",    1013.0),   # 6: 기압
+        float(r.get("precip_type", 0)), # 7: 강수형태
+        float(np.sin(h_rad)),           # 8: 시각 sin  ← 일주기
+        float(np.cos(h_rad)),           # 9: 시각 cos  ← 일주기
     ]
+
+
+NUM_FEATURES = 10   # record_to_vec 출력 차원
 
 
 # ── 2. 과거 데이터 수집 ───────────────────────────────────────────
@@ -100,213 +153,386 @@ def collect_historical(n_hours: int = N_HOURS) -> list[dict]:
 
 # ── 3. 데이터셋 ───────────────────────────────────────────────────
 
+def _parse_ts(ts) -> datetime:
+    """YYYYMMDDHHmm 문자열 → datetime."""
+    return datetime.strptime(str(ts)[:12], "%Y%m%d%H%M")
+
+
 class WeatherDataset(Dataset):
     """
-    입력 X: 시각 t의 8차원 수치 벡터 (표준화)
-    타깃 y: [기온_t+1, 강수량_t+1] — 2개 동시 예측
-      - 기온: 항상 변화 → 모델 동작 검증 (퍼시스턴스 기준 MAE 제공)
-      - 강수: 강수 이벤트 예측
+    입력 X_num: 시각 t 의 10차원 수치 벡터 (표준화)
+    입력 X_img: 시각 t 의 합성 위성 이미지 (4, 32, 32)
+    입력 X_txt: 시각 t 의 MiniLM 텍스트 임베딩 (384)
+    타깃 y    : [기온_{t+L}, 강수량_{t+L}]      L = lead_hours
+
+    수집 실패로 시각이 건너뛴 구간이 있으면 (t, t+L) 쌍의 실제 간격이 L 이
+    아닐 수 있다. 타임스탬프를 검사해 정확히 L 시간 떨어진 쌍만 사용한다.
     """
 
-    def __init__(self, records: list[dict], mean: np.ndarray = None, std: np.ndarray = None):
-        vecs = np.array([record_to_vec(r) for r in records], dtype=np.float32)
+    def __init__(self, records: list[dict],
+                 sat_collector: SimulatedSatelliteCollector = None,
+                 txt_collector: SimulatedTextCollector = None,
+                 lead_hours: int = 1,
+                 mean: np.ndarray = None, std: np.ndarray = None):
+        L = lead_hours
+        self.lead_hours = L
 
+        # ── 유효한 (t, t+L) 쌍만 선별 ────────────────────────────
+        times = [_parse_ts(r["timestamp"]) for r in records]
+        src_idx = [i for i in range(len(records) - L)
+                   if (times[i + L] - times[i]).total_seconds() == L * 3600]
+        if not src_idx:
+            raise ValueError(f"lead={L}시간 유효 쌍이 없습니다. 데이터 연속성 확인 필요.")
+        dropped = (len(records) - L) - len(src_idx)
+        if dropped > 0:
+            print(f"  [경고] 시각 불연속으로 {dropped}개 쌍 제외 "
+                  f"(사용 {len(src_idx)}개)")
+
+        src_records = [records[i] for i in src_idx]
+        tgt_records = [records[i + L] for i in src_idx]
+
+        # ── Z축: 수치 특성 ───────────────────────────────────────
+        vecs = np.array([record_to_vec(r) for r in src_records], dtype=np.float32)
         if mean is None:
             self.mean = vecs.mean(axis=0)
             self.std  = np.where(vecs.std(axis=0) > 1e-6, vecs.std(axis=0), 1.0)
         else:
             self.mean, self.std = mean, std
+        self.X_num = torch.tensor((vecs - self.mean) / self.std, dtype=torch.float32)
 
-        vecs_norm = (vecs - self.mean) / self.std
-        self.X = torch.tensor(vecs_norm[:-1], dtype=torch.float32)
+        # ── Re축 / Im축 ──────────────────────────────────────────
+        self.X_img = (torch.tensor(sat_collector.get_batch(src_records),
+                                   dtype=torch.float32)
+                      if sat_collector is not None else None)
+        self.X_txt = (torch.tensor(txt_collector.get_batch(src_records),
+                                   dtype=torch.float32)
+                      if txt_collector is not None else None)
 
-        temp_next   = np.array([r["temperature"]   for r in records[1:]], dtype=np.float32)
-        precip_next = np.array([r["precipitation"] for r in records[1:]], dtype=np.float32)
-        self.y = torch.tensor(
-            np.stack([temp_next, precip_next], axis=1), dtype=torch.float32
-        )  # shape: (N, 2)
+        # ── 타깃 ─────────────────────────────────────────────────
+        temp_tgt   = np.array([r["temperature"]   for r in tgt_records], dtype=np.float32)
+        precip_tgt = np.array([r["precipitation"] for r in tgt_records], dtype=np.float32)
+        self.y = torch.tensor(np.stack([temp_tgt, precip_tgt], axis=1),
+                              dtype=torch.float32)
 
-        # 기온 퍼시스턴스 기준: T_{t+1} ≈ T_t (단순 지속 예보)
-        temp_curr = np.array([r["temperature"] for r in records[:-1]], dtype=np.float32)
-        self.temp_persistence_mae = float(np.mean(np.abs(temp_next - temp_curr)))
+        # 퍼시스턴스 기준선을 샘플 단위로 보관 → 검증셋과 동일한 표본에서
+        # baseline 을 계산해야 공정한 비교가 된다(전체 평균과 비교하면 안 됨).
+        temp_now = np.array([r["temperature"] for r in src_records], dtype=np.float32)
+        self.temp_persist_abs = torch.tensor(np.abs(temp_tgt - temp_now),
+                                             dtype=torch.float32)
+        self.temp_persistence_mae = float(self.temp_persist_abs.mean())
+
+        # 타깃 통계 — 헤드 편향 초기화 및 손실 스케일 정규화에 사용
+        self.temp_mean   = float(temp_tgt.mean())
+        self.temp_std    = float(max(temp_tgt.std(), 1e-3))
+        self.precip_mean = float(precip_tgt.mean())
 
     def __len__(self):
-        return len(self.X)
+        return len(self.X_num)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        return self.X_num[idx], self.X_img[idx], self.X_txt[idx], self.y[idx]
 
 
-# ── 4. 모델 ───────────────────────────────────────────────────────
-
-class NumericalTriCHEF(nn.Module):
-    """
-    Phase 2: 2축 Tri-CHEF 수치 회귀 모델 (논문 Eq.1 적용).
-
-    score = √( v_re² + (α·v_im)² )  →  회귀 헤드
-
-    Re 축: 기온[0]·습도[2]·기압[6]·강수형태[7] — 안정·광역 대기 상태
-    Im 축: 강수량[1]·풍속[3]·풍향sin[4]·풍향cos[5] — 동적·국지 기상 이벤트
-    """
-
-    def __init__(self, embed_dim: int = EMBED_DIM, alpha: float = ALPHA):
-        super().__init__()
-        self.alpha = alpha
-
-        self.enc_re = nn.Sequential(
-            nn.Linear(4, 32), nn.LayerNorm(32), nn.GELU(),
-            nn.Linear(32, embed_dim),
-        )
-        self.enc_im = nn.Sequential(
-            nn.Linear(4, 32), nn.LayerNorm(32), nn.GELU(),
-            nn.Linear(32, embed_dim),
-        )
-        # 기온 예측 헤드 (항상 유효 신호 → 모델 동작 검증)
-        self.head_temp = nn.Sequential(
-            nn.Linear(embed_dim, 32), nn.GELU(),
-            nn.Linear(32, 1),
-        )
-        # 강수량 예측 헤드 (희소 이벤트 → Phase 3 확장 기반)
-        self.head_precip = nn.Sequential(
-            nn.Linear(embed_dim, 32), nn.GELU(),
-            nn.Linear(32, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_re = x[:, [0, 2, 6, 7]]
-        x_im = x[:, [1, 3, 4, 5]]
-
-        v_re = F.normalize(self.enc_re(x_re), dim=-1)
-        v_im = F.normalize(self.enc_im(x_im), dim=-1)
-
-        magnitude = torch.sqrt(v_re ** 2 + (self.alpha * v_im) ** 2 + 1e-7)
-
-        temp_pred   = self.head_temp(magnitude)
-        precip_pred = torch.clamp(self.head_precip(magnitude), min=0.0, max=200.0)
-        return torch.cat([temp_pred, precip_pred], dim=-1)  # (N, 2)
-
-    def encode(self, x: torch.Tensor):
-        """Phase 3 멀티모달 통합용: (v_re, v_im) 임베딩 반환."""
-        x_re = x[:, [0, 2, 6, 7]]
-        x_im = x[:, [1, 3, 4, 5]]
-        v_re = F.normalize(self.enc_re(x_re), dim=-1)
-        v_im = F.normalize(self.enc_im(x_im), dim=-1)
-        return v_re, v_im
+# ── 4. 모델: pipeline_model.py의 TriCHEFPipeline 사용 ─────────────
+#   Phase 3-1: Z축(수치) 활성, Re/Im 축 stub
+#   Phase 3-2~: 순차적으로 실제 인코더 교체
 
 
 # ── 5. 학습 ───────────────────────────────────────────────────────
 
-def train():
-    print(f"{'='*50}")
-    print(f" Tri-CHEF Phase 2 — 수치 기준 모델 학습")
-    print(f" 디바이스: {DEVICE} | embed_dim: {EMBED_DIM} | α: {ALPHA}")
-    print(f"{'='*50}\n")
+def train(orthogonalize: bool = ORTHOGONALIZE,
+          persistence_residual: bool = PERSISTENCE_RESIDUAL,
+          lead_hours: int = LEAD_HOURS,
+          use_re: bool = True, use_im: bool = True,
+          early_stop: bool = True,
+          dynamic_gate: bool = DYNAMIC_GATE,
+          gate_entropy_weight: float = GATE_ENTROPY_WEIGHT,
+          checkpoint: str = CHECKPOINT,
+          verbose: bool = True) -> dict:
+    """
+    3축 Tri-CHEF 학습. 플래그를 바꿔 호출하면 ablation 대조군이 된다.
 
-    # 데이터 수집
+    use_re / use_im : 해당 축 입력을 차단(영벡터)해 기여도를 측정한다.
+                      Z축(수치)은 퍼시스턴스 기준선에 필요하므로 항상 활성.
+    early_stop      : ablation 비교 시 False 로 두어 모든 조건을 동일 에폭수로
+                      학습한다. 조기 종료는 조건마다 학습 길이를 다르게 만들어
+                      '성능 차이'와 '학습량 차이'를 구분할 수 없게 한다.
+    반환: 최종 성능 지표 dict (ablation.py 에서 비교용으로 사용)
+    """
+    axes = "Z" + ("+Re" if use_re else "") + ("+Im" if use_im else "")
+    if verbose:
+        print(f"{'='*70}")
+        print(f" Tri-CHEF Phase 3-4 — 예보 시계 +{lead_hours}시간 | 활성 축: {axes}")
+        print(f" 디바이스: {DEVICE} | embed_dim: {EMBED_DIM}")
+        print(f" Gram-Schmidt 직교화: {'ON' if orthogonalize else 'OFF'}"
+              f" | 기온 Δ 예측: {'ON' if persistence_residual else 'OFF'}")
+        gdesc = (f"동적 게이트 (균등 초기화, λ={gate_entropy_weight}, "
+                 f"워밍업 {GATE_WARMUP_EPOCHS}에폭)" if dynamic_gate else "정적 α/φ")
+        print(f" 축 가중치: {gdesc}")
+        print(f" 위성 인코더: {'소형 CNN' if COMPACT_SATELLITE else 'ResNet18'}")
+        print(f"{'='*70}\n")
+
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+
     records = collect_historical()
     if len(records) < 20:
         print("[ERROR] 데이터 부족 (최소 20개 필요). API 연결을 확인하세요.")
-        return
+        return {}
 
-    # 데이터셋
-    full_ds = WeatherDataset(records)
+    if verbose:
+        print("위성 이미지 생성 중 (합성, 4ch 32×32)...")
+    sat_collector = SimulatedSatelliteCollector()
+    if verbose:
+        print("기상 예보문 MiniLM 임베딩 생성 중...")
+    txt_collector = SimulatedTextCollector()
+
+    full_ds = WeatherDataset(records,
+                             sat_collector=sat_collector,
+                             txt_collector=txt_collector,
+                             lead_hours=lead_hours)
     n_val   = max(2, int(len(full_ds) * VAL_RATIO))
     n_train = len(full_ds) - n_val
-    train_ds, val_ds = random_split(full_ds, [n_train, n_val])
+    # SEED 고정 → 직교화 ON/OFF 비교 시 동일한 분할 사용
+    train_ds, val_ds = random_split(
+        full_ds, [n_train, n_val],
+        generator=torch.Generator().manual_seed(SEED)
+    )
 
-    # 검증셋도 학습셋의 mean/std 기준으로 표준화 (data leakage 방지)
-    val_ds.dataset.mean = full_ds.mean
-    val_ds.dataset.std  = full_ds.std
-
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  drop_last=False)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False)
 
-    print(f"학습: {n_train}개 | 검증: {n_val}개 | 배치 크기: {BATCH_SIZE}")
-    print(f"기온 퍼시스턴스 기준 MAE: {full_ds.temp_persistence_mae:.4f} °C  "
-          f"(T_{{t+1}} ≈ T_t 예측 시)")
-    print(f"평균 강수량: {full_ds.y[:, 1].mean().item():.4f} mm  "
-          f"(강수량 0 예측 시 MAE)\n")
+    # baseline 은 반드시 검증셋과 동일한 표본에서 계산한다.
+    # 전체 평균과 비교하면 표본 차이만으로 '개선'처럼 보일 수 있다.
+    val_idx      = val_ds.indices
+    temp_naive   = full_ds.temp_persist_abs[val_idx].mean().item()
+    precip_naive = full_ds.y[val_idx, 1].abs().mean().item()
 
-    # 모델·옵티마이저
-    model     = NumericalTriCHEF(embed_dim=EMBED_DIM, alpha=ALPHA).to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    if verbose:
+        print(f"\n학습: {n_train}개 | 검증: {n_val}개 | 배치 크기: {BATCH_SIZE}")
+        print(f"기준선 — 검증셋 {n_val}개 기준 (모델과 동일 표본)")
+        print(f"  기온 퍼시스턴스 T(t+{lead_hours})≈T(t) : {temp_naive:.4f} °C   "
+              f"[전체 {full_ds.temp_persistence_mae:.4f}]")
+        print(f"  강수 상시 0 예측            : {precip_naive:.4f} mm   "
+              f"[전체 {full_ds.precip_mean:.4f}]\n")
+
+    # 모델 — 타깃 평균을 헤드 편향에 주입해 편향 학습 낭비 제거
+    model = TriCHEFPipeline(
+        embed_dim=EMBED_DIM, num_features=NUM_FEATURES,
+        alpha_init=ALPHA_INIT, phi_init=PHI_INIT,
+        orthogonalize=orthogonalize,
+        temp_mean=full_ds.temp_mean, precip_mean=full_ds.precip_mean,
+        persistence_residual=persistence_residual,
+        feat_mean=full_ds.mean.tolist(), feat_std=full_ds.std.tolist(),
+        dynamic_gate=dynamic_gate, compact_satellite=COMPACT_SATELLITE,
+    ).to(DEVICE)
+
+    # 차단된 축의 인코더는 forward 에서 호출되지 않아 gradient 를 받지 않는다.
+    # 옵티마이저에 넘기기 전에 동결해 '실제 학습되는 파라미터'만 집계한다.
+    if not use_re:
+        for p in model.enc_re.parameters():
+            p.requires_grad_(False)
+    if not use_im:
+        for p in model.enc_im.parameters():
+            p.requires_grad_(False)
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    n_params  = sum(p.numel() for p in trainable)
+    if verbose:
+        print(f"학습 파라미터: {n_params:,}개 / 표본 {n_train}개  "
+              f"(비율 {n_params / n_train:,.0f}:1)")
+
+    optimizer = torch.optim.AdamW(trainable, lr=LR, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=8, factor=0.5
     )
-    criterion = nn.MSELoss()
+    mse = nn.MSELoss()
 
-    best_val_mae = float("inf")
-    no_improve   = 0
+    # 손실 스케일 정규화: 기온 MSE 는 σ²(≈수십) 규모, 강수 MSE 는 O(1) 규모라
+    # 그대로 더하면 강수 항이 전체의 0.1% 미만이 되어 학습되지 않는다.
+    temp_var = full_ds.temp_std ** 2
 
-    print(f"{'Epoch':>6} | {'Train Loss':>10} | {'기온 MAE':>9} | {'강수 MAE':>9} | LR")
-    print("-" * 60)
+    best_score = float("inf")
+    best_stats = {}
+    no_improve = 0
+    # 지표별 최저치를 독립 추적 — 합산 score 기반 조기 종료가 한쪽 지표를
+    # 가려버리는 문제를 피하고, ablation 조건 간 공정한 비교를 가능하게 한다.
+    best_temp_only   = float("inf")
+    best_precip_only = float("inf")
+
+    if verbose:
+        whead = "w Re/Im/Z" if dynamic_gate else "  α     φ"
+        print(f"{'Epoch':>6} | {'Loss':>8} | {'기온MAE':>8} | {'강수MAE':>8} | "
+              f"{'강수σ':>6} | {'|Δ기온|':>6} | {whead} | LR")
+        print("-" * 92)
 
     for epoch in range(1, EPOCHS + 1):
 
-        # Train — loss = MSE(기온) + 0.5 * MSE(강수량)
+        # 엔트로피 워밍업 — warmup 구간은 λ=0, 이후 목표값까지 선형 증가.
+        if epoch <= GATE_WARMUP_EPOCHS:
+            lam_now = 0.0
+        else:
+            ramp = min(1.0, (epoch - GATE_WARMUP_EPOCHS) / max(1, GATE_WARMUP_EPOCHS))
+            lam_now = gate_entropy_weight * ramp
+
         model.train()
         train_loss = 0.0
-        for x_b, y_b in train_loader:
-            x_b, y_b = x_b.to(DEVICE), y_b.to(DEVICE)
+        for x_num, x_img, x_txt, y_b in train_loader:
+            x_num, y_b = x_num.to(DEVICE), y_b.to(DEVICE)
+            x_img = x_img.to(DEVICE) if use_re else None
+            x_txt = x_txt.to(DEVICE) if use_im else None
+
             optimizer.zero_grad()
-            pred = model(x_b)
-            loss = criterion(pred[:, 0:1], y_b[:, 0:1]) + \
-                   0.5 * criterion(pred[:, 1:2], y_b[:, 1:2])
+            pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt)
+            loss = (mse(pred[:, 0:1], y_b[:, 0:1]) / temp_var
+                    + PRECIP_WEIGHT * mse(pred[:, 1:2], y_b[:, 1:2]))
+            # 게이트 엔트로피 정규화 — 가중치를 소수 축에 집중시키는 압력.
+            # 이 항이 없으면 게이트도 정적 α/φ 와 마찬가지로 무용 축의
+            # 가중치를 키우는 방향으로 학습된다(Phase 3-4 실측).
+            if dynamic_gate and lam_now > 0:
+                loss = loss + lam_now * model.gate_entropy()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_loss += loss.item()
         train_loss /= len(train_loader)
 
-        # Validation — 기온 MAE (학습 조기종료 기준)
+        # ── 검증 ──────────────────────────────────────────────────
         model.eval()
-        val_temp_mae = 0.0
-        val_precip_mae = 0.0
+        temp_abs, precip_abs, precip_preds, deltas = [], [], [], []
         with torch.no_grad():
-            for x_b, y_b in val_loader:
-                x_b, y_b = x_b.to(DEVICE), y_b.to(DEVICE)
-                pred = model(x_b)
-                val_temp_mae   += torch.mean(torch.abs(pred[:, 0:1] - y_b[:, 0:1])).item()
-                val_precip_mae += torch.mean(torch.abs(pred[:, 1:2] - y_b[:, 1:2])).item()
-        val_temp_mae   /= len(val_loader)
-        val_precip_mae /= len(val_loader)
-        val_mae = val_temp_mae  # Early stopping 기준: 기온 MAE
+            for i, (x_num, x_img, x_txt, y_b) in enumerate(val_loader):
+                x_num, y_b = x_num.to(DEVICE), y_b.to(DEVICE)
+                x_img = x_img.to(DEVICE) if use_re else None
+                x_txt = x_txt.to(DEVICE) if use_im else None
+                pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt,
+                             collect_diagnostics=(i == 0))
+                temp_abs.append((pred[:, 0] - y_b[:, 0]).abs())
+                precip_abs.append((pred[:, 1] - y_b[:, 1]).abs())
+                precip_preds.append(pred[:, 1])
+                if persistence_residual:
+                    # 모델이 퍼시스턴스에 실제로 얹은 보정량 |Δ|
+                    t_now = x_num[:, 0] * model.feat_std[0] + model.feat_mean[0]
+                    deltas.append((pred[:, 0] - t_now).abs())
 
-        scheduler.step(val_mae)
+        # 샘플 단위 평균 (배치 크기가 달라도 편향되지 않도록)
+        val_temp_mae   = torch.cat(temp_abs).mean().item()
+        val_precip_mae = torch.cat(precip_abs).mean().item()
+        precip_std     = torch.cat(precip_preds).std().item()
+        delta_mag      = torch.cat(deltas).mean().item() if deltas else 0.0
+
+        # 조기 종료 기준: 두 baseline 대비 상대 오차의 합 (skill score)
+        # 1.0 미만이면 해당 지표가 baseline 을 이긴 것.
+        val_score = val_temp_mae / temp_naive + val_precip_mae / precip_naive
+
+        best_temp_only   = min(best_temp_only,   val_temp_mae)
+        best_precip_only = min(best_precip_only, val_precip_mae)
+
+        scheduler.step(val_score)
         current_lr = optimizer.param_groups[0]["lr"]
 
-        if epoch % 10 == 0 or epoch == 1:
-            mark = " ★" if val_mae < best_val_mae else ""
-            print(f"{epoch:6d} | {train_loss:10.4f} | {val_temp_mae:8.4f}°C | "
-                  f"{val_precip_mae:8.4f}mm | {current_lr:.2e}{mark}")
+        if verbose and (epoch % 10 == 0 or epoch == 1):
+            w = model.axis_weights()
+            mark = " ★" if val_score < best_score else ""
+            if dynamic_gate:
+                # 게이트가 각 축에 실제로 배분한 비중 (합 = 1)
+                wcol = (f"{w.get('w_re',0):.3f}/{w.get('w_im',0):.3f}/"
+                        f"{w.get('w_z',0):.3f}")
+            else:
+                wcol = f"{w['alpha']:5.3f} {w['phi']:5.3f}"
+            print(f"{epoch:6d} | {train_loss:8.4f} | {val_temp_mae:7.4f}° | "
+                  f"{val_precip_mae:7.4f}m | {precip_std:6.3f} | {delta_mag:6.3f} | "
+                  f"{wcol} | {current_lr:.1e}{mark}")
 
-        if val_mae < best_val_mae:
-            best_val_mae = val_mae
-            no_improve   = 0
-            torch.save({
+        if val_score < best_score:
+            best_score = val_score
+            no_improve = 0
+            w = model.axis_weights()
+            best_stats = {
                 "epoch":          epoch,
-                "model_state":    model.state_dict(),
                 "val_temp_mae":   val_temp_mae,
                 "val_precip_mae": val_precip_mae,
-                "embed_dim":      EMBED_DIM,
-                "alpha":          ALPHA,
-                "mean":           full_ds.mean.tolist(),
-                "std":            full_ds.std.tolist(),
-            }, CHECKPOINT)
+                "precip_pred_std": precip_std,
+                "delta_magnitude": delta_mag,
+                "val_score":      val_score,
+                "alpha_learned":  w["alpha"],
+                "phi_learned":    w["phi"],
+                "diagnostics":    dict(model.last_diagnostics),
+            }
+            torch.save({
+                **best_stats,
+                "model_state":  model.state_dict(),
+                "embed_dim":    EMBED_DIM,
+                "orthogonalize": orthogonalize,
+                "persistence_residual": persistence_residual,
+                "lead_hours":   lead_hours,
+                "num_features": NUM_FEATURES,
+                "alpha_init":   ALPHA_INIT,
+                "phi_init":     PHI_INIT,
+                "mean":         full_ds.mean.tolist(),
+                "std":          full_ds.std.tolist(),
+                "temp_mean":    full_ds.temp_mean,
+                "precip_mean":  full_ds.precip_mean,
+            }, checkpoint)
         else:
             no_improve += 1
-            if no_improve >= PATIENCE:
-                print(f"\nEarly stopping — epoch {epoch} (patience {PATIENCE} 초과)")
+            if early_stop and no_improve >= PATIENCE:
+                if verbose:
+                    print(f"\nEarly stopping — epoch {epoch}")
                 break
 
-    print(f"\n{'='*55}")
-    print(f" 학습 완료")
-    print(f" Best Val 기온 MAE  : {best_val_mae:.4f} °C")
-    print(f" 퍼시스턴스 기준    : {full_ds.temp_persistence_mae:.4f} °C  "
-          f"({'개선' if best_val_mae < full_ds.temp_persistence_mae else '미달성 — 에폭 늘리거나 데이터 확인'})")
-    print(f" Best Val 강수 MAE  : (위 저장된 체크포인트 기준)")
-    print(f" 체크포인트         : {CHECKPOINT}")
-    print(f"{'='*55}")
+    # ── 결과 요약 ────────────────────────────────────────────────
+    d = best_stats.get("diagnostics", {})
+    result = {**best_stats,
+              "temp_naive": temp_naive, "precip_naive": precip_naive,
+              "orthogonalize": orthogonalize,
+              "persistence_residual": persistence_residual,
+              "lead_hours": lead_hours, "axes": axes,
+              "epochs_run": epoch, "n_params": n_params,
+              # 지표별 독립 최저치 — ablation 비교의 기준
+              "best_temp_mae":   best_temp_only,
+              "best_precip_mae": best_precip_only,
+              "temp_gain_pct":   (1 - best_temp_only   / temp_naive)   * 100,
+              "precip_gain_pct": (1 - best_precip_only / precip_naive) * 100}
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f" Phase 3-4 학습 완료  (+{lead_hours}h 예보 | 직교화 "
+              f"{'ON' if orthogonalize else 'OFF'}"
+              f" | 기온Δ {'ON' if persistence_residual else 'OFF'})")
+        print(f"{'-'*70}")
+        print(f" 기온 MAE : {best_temp_only:.4f} °C  vs 퍼시스턴스 "
+              f"{temp_naive:.4f} °C  → {result['temp_gain_pct']:+.1f}%")
+        print(f" 강수 MAE : {best_precip_only:.4f} mm  vs 상시0예측 "
+              f"{precip_naive:.4f} mm  → {result['precip_gain_pct']:+.1f}%")
+        print(f" 학습 에폭: {epoch}  (조기종료 {'ON' if early_stop else 'OFF'})")
+        print(f" 강수 예측 표준편차: {best_stats['precip_pred_std']:.4f} mm  "
+              f"({'정상 — 입력에 반응함' if best_stats['precip_pred_std'] > 1e-3 else '⚠ 붕괴 — 상수 출력'})")
+        if persistence_residual:
+            dm = best_stats['delta_magnitude']
+            print(f" 기온 보정량 평균 |Δ|: {dm:.4f} °C  "
+                  f"({'퍼시스턴스에 실질 보정 추가' if dm > 0.05 else '⚠ ≈0 — 사실상 퍼시스턴스 복사'})")
+        print(f"{'-'*70}")
+        d_final = best_stats.get("diagnostics", {})
+        if dynamic_gate and "w_re" in d_final:
+            print(f" 게이트 축 배분 (합=1): Re(위성) {d_final['w_re']:.4f} | "
+                  f"Im(텍스트) {d_final['w_im']:.4f} | Z(수치) {d_final['w_z']:.4f}")
+            print(f" 게이트 엔트로피: {d_final.get('gate_entropy', 0):.4f}  "
+                  f"(최대 1.0986=균등배분, 낮을수록 한 축에 집중)")
+        else:
+            print(f" 학습된 축 가중치: α(Im)={best_stats['alpha_learned']:.4f} "
+                  f"(초기 {ALPHA_INIT}) | φ(Z)={best_stats['phi_learned']:.4f} "
+                  f"(초기 {PHI_INIT})")
+        if d:
+            print(f" 축 직교성 |cos| (0=직교, 무작위 기준 {1/np.sqrt(EMBED_DIM):.4f})")
+            print(f"   직교화 전: Re-Im {d.get('cos_re_im_pre',0):.4f} | "
+                  f"Re-Z {d.get('cos_re_z_pre',0):.4f} | Im-Z {d.get('cos_im_z_pre',0):.4f}")
+            print(f"   직교화 후: Re-Im {d.get('cos_re_im_post',0):.4f} | "
+                  f"Re-Z {d.get('cos_re_z_post',0):.4f} | Im-Z {d.get('cos_im_z_post',0):.4f}")
+        print(f" 체크포인트: {checkpoint}")
+        print(f"{'='*70}")
+
+    return result
 
 
 if __name__ == "__main__":
