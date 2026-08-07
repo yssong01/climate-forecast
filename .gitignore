@@ -23,6 +23,10 @@ cache/
 *.json.bak
 *.log
 
+# 기상자료개방포털 파일셋 원본 다운로드 (import_kma_fileset.py 입력 —
+# cache/historical_data_1y.json 으로 변환 후에는 원본 보관 불필요)
+dawnload/
+
 # 모델 체크포인트 (용량 커서 git 제외)
 checkpoints/
 *.pt
