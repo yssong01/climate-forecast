@@ -22,7 +22,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-from weather_collector import RobustWeatherCollector, STATIONS, STATION_COORDS
+from weather_collector import RobustWeatherCollector, STATIONS, STATION_COORDS, KST
 from satellite_collector import SimulatedSatelliteCollector
 from text_collector import SimulatedTextCollector
 from pipeline_model import TriCHEFPipeline
@@ -148,7 +148,10 @@ def collect_historical(n_hours: int = N_HOURS,
               f"— 목표({target_total}개, {len(stations)}개 관측소) 부족, 재수집")
 
     all_records = []
-    now = datetime.now()
+    # ASOS 시각은 KST 기준 — 컨테이너 기본 시간대(UTC)에 의존하지 않도록
+    # 명시한다 (weather_collector.KST 참조). 여기서 datetime.now()를 그대로
+    # 쓰면 Docker에서 수집 창 전체가 9시간 밀려 어긋난다.
+    now = datetime.now(KST)
 
     print(f"ASOS 과거 {n_hours}시간 × {len(stations)}개 관측소 수집 시작 "
           f"(예상 {target_total}개, 약 {target_total * 0.3 / 60:.0f}분 소요)...")

@@ -11,7 +11,16 @@ import hashlib
 import requests
 import numpy as np
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+
+# ASOS 관측 시각은 KST 기준이다. datetime.now()는 시스템 로컬 시간대를
+# 따르는데, Docker 컨테이너는 기본값이 UTC라 이 저장소를 컨테이너에서
+# 돌리면 실제 KST보다 9시간 뒤처진 시각을 "현재"로 계산해 API에 요청하게
+# 된다 — 그 시각도 이미 지난 관측이라 API가 정상 응답을 주는 경우가 많아
+# 조용히 9시간 묵은 데이터를 "실시간"으로 표시하는 버그가 된다. 컨테이너의
+# TZ 설정에 의존하지 않도록 여기서 시간대를 명시한다.
+KST = ZoneInfo("Asia/Seoul")
 
 load_dotenv()
 
@@ -143,7 +152,7 @@ class RobustWeatherCollector:
         현재 분이 10분 미만이면 전 시각 기준.
         반환 형식: YYYYMMDDHHmm (예: 202608062200)
         """
-        now = datetime.now()
+        now = datetime.now(KST)
         if now.minute < 10:
             now -= timedelta(hours=1)
         return now.strftime("%Y%m%d%H00")
