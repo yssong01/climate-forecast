@@ -1,0 +1,13 @@
+# 대시보드/추론 서빙 전용 최소 의존성.
+# requirements.txt(전체 연구 환경: whisper, chromadb, stable-baselines3 등
+# Phase 3-6 및 향후 확장용 포함)와 별도로 관리한다 — Docker 이미지 크기와
+# 빌드 시간을 대시보드 실행에 필요한 만큼으로 제한하기 위함이다.
+streamlit>=1.32.0
+streamlit-autorefresh>=1.0.1
+plotly>=5.20.0
+numpy>=1.26.0,<2
+pandas>=2.2.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+sentence-transformers>=3.0.0
+transformers>=4.40.0

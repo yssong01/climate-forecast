@@ -30,8 +30,13 @@ class SimulatedSatelliteCollector:
         """
         record : weather_collector 레코드 (timestamp, temperature 등 포함)
         반환   : float32 ndarray, shape (4, 32, 32), 값 [0, 1]
+
+        시드에 관측소 코드(stn)를 포함한다 — 다중 관측소 확장 이후 같은
+        시각의 서울과 부산이 timestamp 만으로 시드를 만들면 동일한 공간
+        패턴(coarse/fine noise)을 공유하게 되어 관측소 간 위성 이미지가
+        인위적으로 유사해진다.
         """
-        seed_str = record.get("timestamp", "00000000000")
+        seed_str = f"{record.get('timestamp', '00000000000')}_{record.get('stn', '0')}"
         seed = int(hashlib.sha256(seed_str.encode()).hexdigest()[:8], 16) % (2**31)
         rng = np.random.RandomState(seed)
 

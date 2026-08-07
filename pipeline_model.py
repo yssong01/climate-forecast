@@ -176,7 +176,7 @@ class ModalityGate(nn.Module):
     방향을 학습할 수 있어야 한다(현재 시뮬레이션에서는 검증만 가능).
     """
 
-    def __init__(self, in_dim: int = 10, hidden: int = 16,
+    def __init__(self, in_dim: int = 12, hidden: int = 16,
                  init_weights: tuple = None):
         """
         init_weights=None (기본): 균등 초기화 (1/3, 1/3, 1/3).
@@ -224,7 +224,7 @@ class TriCHEFPipeline(nn.Module):
     """
 
     def __init__(self, embed_dim: int = 64,
-                 num_features: int = 10,
+                 num_features: int = 12,
                  alpha_init: float = 0.4,
                  phi_init:   float = 0.2,
                  orthogonalize: bool = False,

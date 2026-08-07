@@ -25,6 +25,24 @@ STATIONS = {
     "광주": "156", "대구": "143", "부산": "159", "제주": "184",
 }
 
+# 관측소별 위도·경도 — Z축 입력 특성(지역 구분)에 사용.
+# 값의 정밀도는 특성 스케일 목적으로 충분하며 항법용이 아니다.
+STATION_COORDS = {
+    "108": (37.5714, 126.9658),  # 서울
+    "112": (37.4776, 126.6249),  # 인천
+    "119": (37.2569, 126.9827),  # 수원
+    "101": (37.9026, 127.7357),  # 춘천
+    "105": (37.7514, 128.8911),  # 강릉
+    "133": (36.3721, 127.3720),  # 대전
+    "131": (36.6392, 127.4407),  # 청주
+    "146": (35.8410, 127.1191),  # 전주
+    "156": (35.1729, 126.8916),  # 광주
+    "143": (35.8858, 128.6531),  # 대구
+    "159": (35.1047, 129.0320),  # 부산
+    "184": (33.5141, 126.5297),  # 제주
+}
+_COORD_DEFAULT = (36.5, 127.5)   # 미등록 관측소 fallback (한반도 중심 근사)
+
 
 class RobustWeatherCollector:
 
@@ -274,15 +292,17 @@ class RobustWeatherCollector:
 
     def to_model_vector(self, data: dict) -> list[float]:
         """
-        10차원 수치 벡터 반환 — train.record_to_vec 와 순서가 반드시 같아야 한다.
+        12차원 수치 벡터 반환 — train.record_to_vec 와 순서가 반드시 같아야 한다.
         [기온, 강수량, 습도, 풍속, 풍향sin, 풍향cos, 기압, 강수형태,
-         시각sin, 시각cos]
+         시각sin, 시각cos, 위도, 경도]
         """
         wd_rad = np.deg2rad(data.get("wind_dir", 0.0))
 
         ts = str(data.get("timestamp", ""))      # YYYYMMDDHHmm
         hour = int(ts[8:10]) if len(ts) >= 10 else 0
         h_rad = 2.0 * np.pi * hour / 24.0
+
+        lat, lon = STATION_COORDS.get(str(data.get("stn", self.stn)), _COORD_DEFAULT)
 
         return [
             data.get("temperature",   20.0),
@@ -295,6 +315,8 @@ class RobustWeatherCollector:
             float(data.get("precip_type", 0)),
             float(np.sin(h_rad)),
             float(np.cos(h_rad)),
+            lat,
+            lon,
         ]
 
 
@@ -317,4 +339,4 @@ if __name__ == "__main__":
     print(f"기압:     {data.get('pressure')} hPa")
 
     vec = collector.to_model_vector(data)
-    print(f"\n모델 입력 벡터 (8차원): {[round(v, 3) for v in vec]}")
+    print(f"\n모델 입력 벡터 (12차원): {[round(v, 3) for v in vec]}")

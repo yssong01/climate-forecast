@@ -11,6 +11,8 @@ Gram-Schmidt 직교화는 잔차 노름이 0에 가까워질 때 NaN·발산이 
   T5. gradient 흐름 — 전체 파이프라인 역전파에서 NaN/Inf 없음
   T6. softplus 수정 — clamp 는 gradient 0, softplus 는 항상 > 0
 """
+import sys
+
 import torch
 import torch.nn.functional as F
 
@@ -92,12 +94,12 @@ check("soft_normalize(0) = 0",
 
 # ── T5: 전체 파이프라인 gradient ──────────────────────────────────
 print("\n[T5] 전체 파이프라인 역전파")
-model = TriCHEFPipeline(embed_dim=D, num_features=10,
+model = TriCHEFPipeline(embed_dim=D, num_features=12,
                         temp_mean=28.0, precip_mean=0.5,
                         orthogonalize=True, persistence_residual=True,
-                        feat_mean=[28.0] + [0.0] * 9,
-                        feat_std=[1.0] * 10)
-num = torch.randn(4, 10)
+                        feat_mean=[28.0] + [0.0] * 11,
+                        feat_std=[1.0] * 12)
+num = torch.randn(4, 12)
 img = torch.rand(4, 4, 32, 32)
 txt = torch.randn(4, 384)
 pred = model(num, img, txt, collect_diagnostics=True)
@@ -134,3 +136,7 @@ n_pass, n_all = sum(results), len(results)
 print(f" 결과: {n_pass}/{n_all} 통과"
       + ("  — 학습 진행 가능" if n_pass == n_all else "  — 실패 항목 수정 필요"))
 print("=" * 66)
+
+# 실패를 종료 코드로 알린다. 이게 없으면 항목이 깨져도 프로세스가 0을 반환해
+# CI(.github/workflows/ci.yml)가 초록불을 띄운다 — 테스트가 있으나 마나가 된다.
+sys.exit(0 if n_pass == n_all else 1)

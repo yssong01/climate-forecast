@@ -15,6 +15,10 @@ import os
 import json
 import numpy as np
 
+from weather_collector import STATIONS
+
+_STATION_NAMES = {v: k for k, v in STATIONS.items()}
+
 CACHE_FILE = "./cache/text_embeddings.npz"
 CACHE_META = "./cache/text_embeddings_meta.json"
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -40,7 +44,12 @@ class SimulatedTextCollector:
         return self._model
 
     def record_to_text(self, record: dict) -> str:
-        """ASOS 레코드 → 기상청 스타일 한국어 예보문."""
+        """
+        ASOS 레코드 → 기상청 스타일 한국어 예보문.
+        관측소 이름을 포함해 Im 축이 지역을 구분할 수 있게 한다
+        (다중 관측소 확장 이후 필요 — 그 전엔 항상 서울 단일 관측소였다).
+        """
+        stn_name = _STATION_NAMES.get(str(record.get("stn", "")), "관측소")
         temp  = record.get("temperature",   20.0)
         humid = record.get("humidity",      50.0)
         ws    = record.get("wind_speed",     1.5)
@@ -103,11 +112,23 @@ class SimulatedTextCollector:
         wd_name = dirs[int(((wd + 22.5) % 360) / 45)]
 
         return (
-            f"현재 기온 {temp:.1f}°C로 {t_desc}. "
+            f"{stn_name} 지역 현재 기온 {temp:.1f}°C로 {t_desc}. "
             f"습도 {humid:.0f}%({h_desc}), {wd_name}풍 {ws:.1f}m/s. "
             f"기압 {pres:.0f}hPa, {p_desc}. "
             f"강수 상황: {r_desc}."
         )
+
+    def encode_single(self, record: dict) -> np.ndarray:
+        """
+        단일 레코드 → MiniLM 임베딩 (384,).
+
+        get_batch() 와 달리 디스크 캐시(text_embeddings.npz)를 읽거나 쓰지
+        않는다. 실시간 추론(predict.py)에서 매 호출마다 새 timestamp 를 쓰면
+        캐시가 항상 미스되어, get_batch() 를 쓰면 학습에 쓴 8,546개짜리 캐시를
+        1개짜리로 덮어써버린다.
+        """
+        text = self.record_to_text(record)
+        return self.model.encode([text], convert_to_numpy=True)[0].astype(np.float32)
 
     def get_batch(self, records: list) -> np.ndarray:
         """

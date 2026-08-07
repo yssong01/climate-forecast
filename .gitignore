@@ -43,3 +43,12 @@ Thumbs.db
 # IDE
 .vscode/settings.json
 .idea/
+
+# 기타
+삭제예정/
+참고자료/
+메모.txt
+
+# AI 도구 세션/설정 (프로젝트 코드와 무관한 로컬 상태)
+.claude/
+.omc/

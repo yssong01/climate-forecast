@@ -22,7 +22,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-from weather_collector import RobustWeatherCollector
+from weather_collector import RobustWeatherCollector, STATIONS, STATION_COORDS
 from satellite_collector import SimulatedSatelliteCollector
 from text_collector import SimulatedTextCollector
 from pipeline_model import TriCHEFPipeline
@@ -37,9 +37,15 @@ EPOCHS     = 150
 LR         = 1e-3
 ALPHA_INIT = 0.4    # Im 축(텍스트) 가중치 초기값 — 학습 중 자동 조정
 PHI_INIT   = 0.2    # Z  축(수치)  가중치 초기값 — 학습 중 자동 조정
-N_HOURS    = 720    # 수집 기간: 30일 × 24시간 (장마철 포함 확보)
+N_HOURS    = 720    # 관측소당 수집 기간: 30일 × 24시간 (장마철 포함 확보)
 PATIENCE   = 20     # Early stopping
 VAL_RATIO  = 0.2
+
+# 데이터 확장 — 서울 단일 관측소(표본 572개)는 이번 세션 대부분의 이상 현상
+# (위성 인코더 과적합, 게이트 왜곡)의 근본 원인이었다. 12개 관측소 전체로
+# 확장해 표본을 약 15배(≈8,600개)로 늘린다.
+STATIONS_TO_COLLECT = list(STATIONS.values())          # 12개 관측소 전체
+STATION_NAMES = {v: k for k, v in STATIONS.items()}    # 코드 → 한글명
 
 # 예보 시계 — t 시각 관측으로 t+LEAD_HOURS 를 예측한다.
 # 1시간에서는 퍼시스턴스(T(t+1)≈T(t))가 사실상 무적이라 모델 기여를 측정할
@@ -79,11 +85,14 @@ os.makedirs("./checkpoints", exist_ok=True)
 
 def record_to_vec(r: dict) -> list[float]:
     """
-    관측 레코드 → 10차원 수치 벡터.
+    관측 레코드 → 12차원 수치 벡터.
 
     인덱스 8·9(시각 sin/cos)는 Phase 3-4 에서 추가했다. 기온의 일주기
     (diurnal cycle)는 기온 예측의 지배적 요인인데 기존 8차원에는 시각
     정보가 전혀 없어 모델이 낮/밤을 구분할 수 없었다.
+    인덱스 10·11(위도·경도)은 다중 관측소 확장(1단계)에서 추가했다.
+    관측소마다 기후가 다르므로(강릉의 동해 영향, 제주의 해양성 기후 등)
+    지역 좌표 없이는 하나의 모델이 12개 관측소를 구분할 수 없다.
     인덱스 0(기온)은 퍼시스턴스 잔차 계산에 쓰이므로 위치를 바꾸지 말 것.
     """
     wd_rad = np.deg2rad(r.get("wind_dir", 0.0))
@@ -91,6 +100,8 @@ def record_to_vec(r: dict) -> list[float]:
     ts = str(r.get("timestamp", ""))            # YYYYMMDDHHmm
     hour = int(ts[8:10]) if len(ts) >= 10 else 0
     h_rad = 2.0 * np.pi * hour / 24.0
+
+    lat, lon = STATION_COORDS.get(str(r.get("stn", "108")), (36.5, 127.5))
 
     return [
         r.get("temperature",   20.0),   # 0: 기온      ← 퍼시스턴스 기준
@@ -103,52 +114,71 @@ def record_to_vec(r: dict) -> list[float]:
         float(r.get("precip_type", 0)), # 7: 강수형태
         float(np.sin(h_rad)),           # 8: 시각 sin  ← 일주기
         float(np.cos(h_rad)),           # 9: 시각 cos  ← 일주기
+        lat,                            # 10: 위도     ← 관측소 위치
+        lon,                            # 11: 경도     ← 관측소 위치
     ]
 
 
-NUM_FEATURES = 10   # record_to_vec 출력 차원
+NUM_FEATURES = 12   # record_to_vec 출력 차원
 
 
 # ── 2. 과거 데이터 수집 ───────────────────────────────────────────
 
-def collect_historical(n_hours: int = N_HOURS) -> list[dict]:
-    """ASOS API로 최근 n_hours 시간의 관측 데이터 수집."""
+def collect_historical(n_hours: int = N_HOURS,
+                       stations: list = None) -> list[dict]:
+    """
+    ASOS API로 각 관측소별 최근 n_hours 시간의 관측 데이터 수집.
+    관측소를 순회하며 관측소 블록 단위로 이어붙인다(블록 내부는 시간순).
+    """
+    stations = stations or STATIONS_TO_COLLECT
+    target_total = n_hours * len(stations)
 
-    # 캐시 재사용 (API 호출 절약)
+    # 캐시 재사용 (API 호출 절약) — 레코드 수뿐 아니라 관측소 구성도 검증한다.
+    # 이전 세션의 단일 관측소 캐시(720개)는 여기서 자동으로 부족 판정되어
+    # 재수집이 트리거된다.
     if os.path.exists(DATA_CACHE):
         with open(DATA_CACHE, "r", encoding="utf-8") as f:
             cached = json.load(f)
-        if len(cached) >= int(n_hours * 0.9):
-            print(f"[캐시] {len(cached)}개 로드 완료 (API 절약)")
+        cached_stations = {r.get("stn") for r in cached}
+        if len(cached) >= int(target_total * 0.9) and cached_stations >= set(stations):
+            print(f"[캐시] {len(cached)}개 로드 완료 "
+                  f"({len(cached_stations)}개 관측소, API 절약)")
             return cached
-        print(f"[캐시] {len(cached)}개 — 부족하여 재수집")
+        print(f"[캐시] {len(cached)}개 ({len(cached_stations)}개 관측소) "
+              f"— 목표({target_total}개, {len(stations)}개 관측소) 부족, 재수집")
 
-    collector = RobustWeatherCollector()
-    records   = []
-    now       = datetime.now()
+    all_records = []
+    now = datetime.now()
 
-    print(f"ASOS 과거 {n_hours}시간 데이터 수집 시작 ({collector.stn}번 관측소)...")
+    print(f"ASOS 과거 {n_hours}시간 × {len(stations)}개 관측소 수집 시작 "
+          f"(예상 {target_total}개, 약 {target_total * 0.3 / 60:.0f}분 소요)...")
 
-    for i in range(n_hours, 0, -1):
-        dt = now - timedelta(hours=i)
-        tm = dt.strftime("%Y%m%d%H00")
-        data = collector.fetch_at(tm)
+    for si, stn in enumerate(stations, 1):
+        stn_name = STATION_NAMES.get(stn, stn)
+        collector = RobustWeatherCollector(stn=stn)
+        records = []
 
-        if data.get("status") == "SUCCESS_LIVE":
-            records.append(data)
+        for i in range(n_hours, 0, -1):
+            dt = now - timedelta(hours=i)
+            tm = dt.strftime("%Y%m%d%H00")
+            data = collector.fetch_at(tm)
 
-        if i % 24 == 0:
-            done = n_hours - i
-            print(f"  {done:3d}/{n_hours} 처리 | 성공: {len(records)}개")
+            if data.get("status") == "SUCCESS_LIVE":
+                records.append(data)
 
-        time.sleep(0.3)  # API 과부하 방지
+            time.sleep(0.3)  # API 과부하 방지
 
-    print(f"수집 완료: {len(records)}/{n_hours}개 성공\n")
+        print(f"  [{si:2d}/{len(stations)}] {stn_name}({stn}): "
+              f"{len(records)}/{n_hours}개 성공")
+        all_records.extend(records)
+
+    print(f"\n전체 수집 완료: {len(all_records)}/{target_total}개 "
+          f"({len(stations)}개 관측소)\n")
 
     with open(DATA_CACHE, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
+        json.dump(all_records, f, ensure_ascii=False, indent=2)
 
-    return records
+    return all_records
 
 
 # ── 3. 데이터셋 ───────────────────────────────────────────────────
@@ -160,13 +190,20 @@ def _parse_ts(ts) -> datetime:
 
 class WeatherDataset(Dataset):
     """
-    입력 X_num: 시각 t 의 10차원 수치 벡터 (표준화)
+    입력 X_num: 시각 t 의 12차원 수치 벡터 (표준화)
     입력 X_img: 시각 t 의 합성 위성 이미지 (4, 32, 32)
     입력 X_txt: 시각 t 의 MiniLM 텍스트 임베딩 (384)
     타깃 y    : [기온_{t+L}, 강수량_{t+L}]      L = lead_hours
 
     수집 실패로 시각이 건너뛴 구간이 있으면 (t, t+L) 쌍의 실제 간격이 L 이
     아닐 수 있다. 타임스탬프를 검사해 정확히 L 시간 떨어진 쌍만 사용한다.
+
+    다중 관측소 확장(1단계) 이후 records 는 관측소 블록을 이어붙인 리스트다
+    (서울 720개, 인천 720개, ...). 블록 경계에서는 시각 간격 조건만으로는
+    걸러지지 않는 오염 쌍이 생길 수 있다 — 각 관측소가 "지금부터 n_hours 전"
+    까지 동일한 실시간 구간을 수집하므로, 한 관측소 블록의 마지막 레코드와
+    다음 관측소 블록의 초반 레코드가 우연히 L시간 간격을 만족할 수 있다.
+    관측소 코드가 같은 쌍만 사용해 이를 원천 차단한다.
     """
 
     def __init__(self, records: list[dict],
@@ -177,15 +214,17 @@ class WeatherDataset(Dataset):
         L = lead_hours
         self.lead_hours = L
 
-        # ── 유효한 (t, t+L) 쌍만 선별 ────────────────────────────
+        # ── 유효한 (t, t+L) 쌍만 선별 — 동일 관측소 + 정확히 L시간 간격 ──
         times = [_parse_ts(r["timestamp"]) for r in records]
+        stns  = [r.get("stn") for r in records]
         src_idx = [i for i in range(len(records) - L)
-                   if (times[i + L] - times[i]).total_seconds() == L * 3600]
+                   if stns[i] == stns[i + L]
+                   and (times[i + L] - times[i]).total_seconds() == L * 3600]
         if not src_idx:
             raise ValueError(f"lead={L}시간 유효 쌍이 없습니다. 데이터 연속성 확인 필요.")
         dropped = (len(records) - L) - len(src_idx)
         if dropped > 0:
-            print(f"  [경고] 시각 불연속으로 {dropped}개 쌍 제외 "
+            print(f"  [경고] 관측소 경계·시각 불연속으로 {dropped}개 쌍 제외 "
                   f"(사용 {len(src_idx)}개)")
 
         src_records = [records[i] for i in src_idx]
@@ -225,6 +264,9 @@ class WeatherDataset(Dataset):
         self.temp_mean   = float(temp_tgt.mean())
         self.temp_std    = float(max(temp_tgt.std(), 1e-3))
         self.precip_mean = float(precip_tgt.mean())
+
+        # 관측소 구성 진단 — 다중 관측소 확장 검증용
+        self.n_stations = len({r.get("stn") for r in src_records})
 
     def __len__(self):
         return len(self.X_num)
@@ -309,7 +351,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
     precip_naive = full_ds.y[val_idx, 1].abs().mean().item()
 
     if verbose:
-        print(f"\n학습: {n_train}개 | 검증: {n_val}개 | 배치 크기: {BATCH_SIZE}")
+        print(f"\n학습: {n_train}개 | 검증: {n_val}개 | 배치 크기: {BATCH_SIZE} "
+              f"| 관측소: {full_ds.n_stations}개")
         print(f"기준선 — 검증셋 {n_val}개 기준 (모델과 동일 표본)")
         print(f"  기온 퍼시스턴스 T(t+{lead_hours})≈T(t) : {temp_naive:.4f} °C   "
               f"[전체 {full_ds.temp_persistence_mae:.4f}]")
@@ -465,6 +508,12 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "embed_dim":    EMBED_DIM,
                 "orthogonalize": orthogonalize,
                 "persistence_residual": persistence_residual,
+                # dynamic_gate/compact_satellite 는 모델 아키텍처 자체를 바꾼다
+                # (게이트 네트워크 유무, ResNet18 vs 소형 CNN). 이 값 없이는
+                # 체크포인트만으로 TriCHEFPipeline 을 재구성할 수 없어
+                # load_state_dict 가 shape mismatch 로 실패한다.
+                "dynamic_gate": dynamic_gate,
+                "compact_satellite": COMPACT_SATELLITE,
                 "lead_hours":   lead_hours,
                 "num_features": NUM_FEATURES,
                 "alpha_init":   ALPHA_INIT,

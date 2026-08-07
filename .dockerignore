@@ -1,0 +1,26 @@
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# 학습 산출물 — 런타임에 볼륨 마운트 (Dockerfile 상단 주석 참고)
+cache/
+checkpoints/
+
+# 비밀키 — 런타임에 --env-file 또는 -e 로 주입
+.env
+.env.local
+
+# 문서/참고자료 — 이미지에 불필요
+*.md
+참고자료/
+메모.txt
+
+# 도구 설정
+.claude/
+.omc/
+.vscode/
+.idea/
