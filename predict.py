@@ -14,6 +14,7 @@ train.record_to_vec() 을 그대로 재사용한다 — 별도 구현하면 두 
 import argparse
 import json
 import sys
+from datetime import datetime, timedelta
 
 import numpy as np
 import torch
@@ -93,10 +94,19 @@ def predict(stn: str = "108",
     precip_pred = max(0.0, pred[0, 1].item())
     gate = model.axis_weights()   # dynamic_gate=False 면 {"alpha":..,"phi":..}
 
+    observed_at = record.get("timestamp")
+    # accuracy.py 가 (관측소, 목표시각)으로 로그를 남기려면 이 시각이 필요하다
+    # — 시간대는 관측시각 문자열이 이미 KST 벽시계 표기라 그대로 산술한다.
+    target_time = (
+        datetime.strptime(str(observed_at)[:12], "%Y%m%d%H%M")
+        + timedelta(hours=lead_hours)
+    ).strftime("%Y%m%d%H00") if observed_at else None
+
     return {
         "station_code": stn,
         "station_name": STATION_NAMES.get(stn, stn),
-        "observed_at":  record.get("timestamp"),
+        "observed_at":  observed_at,
+        "target_time":  target_time,
         "data_status":  record.get("status"),   # SUCCESS_LIVE / FALLBACK_*
         "current": {
             "temperature":   record.get("temperature"),

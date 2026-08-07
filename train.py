@@ -233,6 +233,12 @@ class WeatherDataset(Dataset):
         src_records = [records[i] for i in src_idx]
         tgt_records = [records[i + L] for i in src_idx]
 
+        # 관측소·시각 메타데이터 — 학습에는 쓰이지 않지만 backtest_accuracy.py
+        # 가 샘플별 예측을 (관측소, 목표시각)으로 정확도 로그에 남기는 데 필요.
+        self.stns = [r.get("stn") for r in src_records]
+        self.src_timestamps = [r["timestamp"] for r in src_records]
+        self.tgt_timestamps = [r["timestamp"] for r in tgt_records]
+
         # ── Z축: 수치 특성 ───────────────────────────────────────
         vecs = np.array([record_to_vec(r) for r in src_records], dtype=np.float32)
         if mean is None:
