@@ -220,7 +220,10 @@ class TriCHEFPipeline(nn.Module):
       Phase 3-3  ✓  Im축 기상 문서 (MiniLM 384 프로젝션)
       Phase 3-4  ✓  Gram-Schmidt 직교화 + dying-clamp 수정
       Phase 3-5  ✓  ModalityGate 입력 조건부 축 가중치
-      Phase 3-6  —  PPO RL 위상 필터 θ<30°/80°
+      Phase 3-6  ✓  PPO 경보 게이트 (rl_phase_filter.py) — 이 모델은 동결해
+                    상태 특성 공급원으로만 쓴다. 논문의 위상각 θ 는 여기서
+                    axis_report() 로 노출하지만, 축이 모두 단위 정규화라
+                    게이트 배분으로 퇴화한다(README 한계 6).
     """
 
     def __init__(self, embed_dim: int = 64,
@@ -353,6 +356,46 @@ class TriCHEFPipeline(nn.Module):
         v_im = (self.enc_im(txt_x) if txt_x is not None
                 else torch.zeros(B, self.embed_dim, device=num_x.device))
         return v_re, v_im, v_z
+
+    # ── Phase 3-6: 샘플별 축 진단 (RL 상태 구성용) ───────────────
+
+    @torch.no_grad()
+    def axis_report(self,
+                    num_x: torch.Tensor,
+                    img_x: torch.Tensor = None,
+                    txt_x: torch.Tensor = None) -> dict:
+        """
+        샘플별 축 진단 — Phase 3-6 경보 게이트의 상태 특성.
+
+        last_diagnostics 는 배치 평균만 남겨서 RL 상태로 쓸 수 없다.
+        여기서는 샘플마다 개별 값을 (B,) 텐서로 돌려준다.
+
+            theta = atan2(‖w_im·v_im‖, ‖w_re·v_re‖)   [논문의 위상각]
+
+        주의 — theta 는 이 구현에서 퇴화한다. 세 인코더가 모두 F.normalize
+        출력이라 ‖v‖ = 1 이므로 theta = atan2(w_im, w_re) 가 되어, 축 자체의
+        per-sample 정보가 아니라 게이트 배분의 재표현일 뿐이다. 실제 축별
+        정보는 축 간 코사인에 남아 있으므로 함께 반환한다.
+        이 퇴화는 test_phase36.py T1 에서 수치로 확인한다.
+        """
+        v_re, v_im, v_z = self.encode(num_x, img_x, txt_x)
+
+        if self.dynamic_gate:
+            w = self.gate(num_x)
+        else:
+            ones = torch.ones(num_x.size(0), 1, device=num_x.device)
+            w = torch.cat([ones, self.alpha * ones, self.phi * ones], dim=-1)
+
+        a_re = w[:, 0] * v_re.norm(dim=-1)
+        a_im = w[:, 1] * v_im.norm(dim=-1)
+
+        return {
+            "gate":      w,                                        # (B, 3)
+            "theta":     torch.atan2(a_im, a_re),                  # (B,)
+            "cos_re_im": F.cosine_similarity(v_re, v_im, dim=-1),  # (B,)
+            "cos_re_z":  F.cosine_similarity(v_re, v_z,  dim=-1),
+            "cos_im_z":  F.cosine_similarity(v_im, v_z,  dim=-1),
+        }
 
     # ── 순전파 ───────────────────────────────────────────────────
 

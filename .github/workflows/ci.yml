@@ -7,13 +7,12 @@ on:
     branches: [main]
 
 jobs:
-  # 수치 안정성 검증 — Gram-Schmidt 직교화, gradient 흐름, dying-clamp 회귀
-  # 테스트 등 19개 항목(test_phase34.py). API 키·GPU 불필요, 순수 텐서 연산만
-  # 검증하므로 시크릿 없이 안전하게 돌린다.
-  #
-  # test_phase34.py 는 실패 시 종료 코드 1을 반환한다. 결과를 출력만 하고
-  # 항상 0으로 끝나면, 항목이 깨져도 이 잡은 초록불이 된다 — 테스트를 CI에
-  # 붙이는 것과 CI가 테스트 결과에 반응하는 것은 별개다.
+  # 수치 검증 2종. API 키·GPU 불필요하고 순수 텐서/배열 연산만 다루므로
+  # 시크릿 없이 안전하게 돌린다.
+  #   test_phase34.py — Gram-Schmidt 직교화, gradient 흐름, dying-clamp 회귀
+  #   test_phase36.py — 경보 보상표, 피로 누적, MDP 성질, GAE 종료 부트스트랩
+  # 두 스크립트 모두 실패 시 종료 코드 1을 반환한다. 예전에는 결과를 출력만
+  # 하고 항상 0으로 끝나서, 항목이 깨져도 이 잡이 초록불이었다.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -31,6 +30,9 @@ jobs:
 
       - name: Run Phase 3-4 numerical stability tests
         run: python test_phase34.py
+
+      - name: Run Phase 3-6 alarm gate tests
+        run: python test_phase36.py
 
   # Dockerfile 이 실제로 빌드되는지 확인 — 체크포인트는 런타임 마운트 대상이라
   # 빌드 단계에서는 필요 없다.
