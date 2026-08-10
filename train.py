@@ -23,7 +23,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from weather_collector import RobustWeatherCollector, STATIONS, STATION_COORDS, KST
-from satellite_collector import SimulatedSatelliteCollector
+from interp_field_collector import InterpolatedFieldCollector
+from tendency_collector import TendencyCollector, TENDENCY_DIM
 from text_collector import SimulatedTextCollector
 from pipeline_model import TriCHEFPipeline
 
@@ -66,18 +67,79 @@ PERSISTENCE_RESIDUAL = True   # 기온을 delta 예측으로 전환 (아래 설�
 DYNAMIC_GATE  = True
 # 게이트 엔트로피 정규화 계수. 가중치가 소수 축에 집중되도록 압력을 준다.
 GATE_ENTROPY_WEIGHT = 0.05
-# 엔트로피 항 워밍업 에폭. 이 구간에서는 λ=0 으로 두고 이후 선형 증가시킨다.
+
+# 엔트로피 항 워밍업 — 이 구간에서는 λ=0 으로 두고 이후 선형 증가시킨다.
 # 에폭 1부터 집중 압력을 걸면 모델이 어느 축이 유용한지 배우기 전에 초기
 # 순서가 고착된다(Phase 3-5 1차 실측: 위성 축 98% 로 붕괴). 먼저 배우게 한
-# 뒤 집중시킨다.
-GATE_WARMUP_EPOCHS = 50
+# 뒤 집중시킨다 — 이 의도 자체는 옳다.
+#
+# 문제는 원래 이 워밍업을 "에폭 수"로 고정(50)했다는 점이다. 2026-08-07
+# 재학습(328,802개, 이전 대비 38배)에서 학습이 36에폭 만에 조기종료됐는데,
+# 워밍업이 50에폭이라 엔트로피 정규화가 단 한 번도 걸리지 않은 채 끝났다 —
+# 게이트 배분이 예전과 달라진 게 실제 학습 때문인지 이 미작동 때문인지
+# 구분이 안 되는 오염된 결과였다.
+#
+# 근본 원인: "50에폭"이 실제로 의미하는 건 에폭 수 자체가 아니라
+# "그 50에폭 동안 모델이 본 그래디언트 스텝 수"다. 원래 캘리브레이션
+# 지점(Phase 3-5, 학습 표본 6,837개, 배치 32 → 에폭당 배치 약 213개)에서
+# 50에폭 = 약 10,650스텝. 데이터가 늘어나면 에폭당 스텝 수도 그만큼
+# 늘어나므로, 같은 "에폭 수"가 전혀 다른 학습량을 의미하게 된다. 그래서
+# 고정 에폭 수 대신 저 스텝 수를 재현하는 에폭 수를 학습 표본 수로부터
+# 역산한다 — train() 내부에서 n_train 이 확정된 뒤 계산.
+_REFERENCE_WARMUP_STEPS = 50 * (6837 // BATCH_SIZE)   # ≈ 10,650 (Phase 3-5 기준)
+_MIN_WARMUP_EPOCHS = 3   # 극단적으로 큰 데이터셋에서도 최소한의 학습 기회는 보장
 # 위성 인코더 용량. ResNet18(1,100만)은 표본 572개를 암기해 게이트를 왜곡시킨다.
 COMPACT_SATELLITE = True
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
 SEED          = 42     # 학습/검증 분할 고정 → ablation 비교 가능
 
+# Phase 3-7 hurdle 헤드 — precip_breakdown.py 실측(2026-08-07): 검증셋의
+# 93.3%가 무강수인데 softplus 단독 강수 헤드는 정확히 0을 못 내, 그 미세한
+# 비영 오차가 누적돼 baseline(상시 0예측)을 이긴 강수 구간의 이득(+10.2%)을
+# 삼켜버렸다. head_rain(이진 분류) 을 추가해 "오는가"를 명시적으로 학습시킨다.
+WET_THRESH = 0.1              # mm — accuracy.PRECIP_THRESH 와 동일 기준 재사용
+HURDLE_BCE_WEIGHT = 1.0       # BCE 는 그 자체로 O(1) 스케일이라 강수 MSE 항과 비슷하게 둠
+
+# Phase 3-8 극한기상 경보 헤드 — head_rain 과 같은 이진분류 패턴을 폭염·한파에
+# 적용한다. 임계값은 기상청 주의보 발표기준(공식 규정값)이라 데이터에서
+# 추정하지 않고 고정한다 — wet_prior/rain_pos_weight 와 달리 "무엇을 사건으로
+# 볼지"는 기상청이 이미 정의했고, 우리가 반응형으로 계산하는 건 "그 정의에
+# 해당하는 표본이 학습셋에 몇 % 있는가"(prior)와 "그로부터 나오는 클래스
+# 불균형 보정(pos_weight)"뿐이다.
+#   폭염주의보: 일 최고기온 33°C 이상   (기상청 특보 발표기준)
+#   한파주의보: 아침 최저기온 -12°C 이하 (기상청 특보 발표기준)
+# 강풍(순간풍속 14m/s)은 12관측소·3.5년 환산 표본이 약 300개(0.1%)로
+# 지나치게 희박해 이번 확장에서 제외했다(실측, 2026-08-07).
+HEATWAVE_THRESH = 33.0        # °C
+COLDWAVE_THRESH = -12.0       # °C
+
+# 극한기상 헤드가 3개(폭염/한파/황사)로 늘어나면서 강수 hurdle 이 계속
+# 나빠졌다(precip_breakdown.py 실측, 2026-08-09: 무강수 구간 평균 예측
+# 0.0546→0.0677mm, baseline 대비 손해 -16.0%→-25.6%). 헤드 4개(강수·폭염·
+# 한파·황사) 모두 embed_dim=64 짜리 하나의 공유 magnitude 표현에서 갈라져
+# 나오는데, EXTREME_BCE_WEIGHT=1.0(HURDLE_BCE_WEIGHT와 동급)이면 극한기상
+# 3개가 강수 1개보다 그래디언트 예산을 3배 더 가져간다 — 항 개수 불균형이
+# 곧 표현 경쟁으로 번진 것으로 보인다. 0.3 으로 낮춰 극한기상 쪽 압력을
+# 줄이고 강수가 회복되는지 실측한다(가설 검증용 실험치, 결과 보고 추가
+# 튜닝 예정).
+EXTREME_BCE_WEIGHT = 0.3
+
+# Phase 3-9 황사 헤드 + 폭염·한파 라벨 소스 교체 — import_weather_issues.py
+# 가 만든 기상청 "날씨 이슈별 데이터"(공식 폭염특보/한파특보/황사관측여부)
+# 조회표. 순간 임계값 근사 대신 실제 발표된 특보를 쓴다(WeatherDataset.
+# __init__ 참고). 이 파일이 없으면 폭염·한파는 기존 임계값 근사로, 황사는
+# 전부 마스크 제외로 조용히 폴백한다 — import_weather_issues.py 를 먼저
+# 실행하지 않아도 학습 자체는 깨지지 않는다.
+WEATHER_ISSUE_LABELS = "./cache/weather_issue_labels.json"
+
 CHECKPOINT  = "./checkpoints/numerical_trichef.pt"
-DATA_CACHE  = "./cache/historical_data.json"
+# historical_data.json(원본 30일)이 아니라 historical_data_1y.json 을 쓴다.
+# 후자는 apihub 수집(collect_year.py)과 기상자료개방포털 파일셋 임포트
+# (import_kma_fileset.py)로 병합해온 누적 데이터셋 — 2026-08-07 기준
+# 12개 관측소 × 2023-01-01~현재, 328,802개 레코드(원래 목표였던 "최근
+# 1년"보다 훨씬 긴 3.5년치). collect_incremental.py 가 이 파일에 계속
+# 새 시간을 채워 넣으므로 재학습 때마다 최신 상태를 그대로 반영한다.
+DATA_CACHE  = "./cache/historical_data_1y.json"
 os.makedirs("./checkpoints", exist_ok=True)
 
 
@@ -191,6 +253,26 @@ def _parse_ts(ts) -> datetime:
     return datetime.strptime(str(ts)[:12], "%Y%m%d%H%M")
 
 
+def _prf_metrics(probs: torch.Tensor, labels: torch.Tensor,
+                 thresh: float = 0.5) -> dict:
+    """
+    이진분류 정밀도/재현율/F1 — 폭염·한파처럼 양성이 1% 미만인 사건은
+    정확도(accuracy)가 "항상 무사건" 예측만으로도 99%를 넘어 무의미하다.
+    양성을 실제로 잡아내는지가 관심사이므로 precision/recall/F1 로 본다.
+    """
+    pred_pos = (probs >= thresh).float()
+    tp = (pred_pos * labels).sum().item()
+    fp = (pred_pos * (1 - labels)).sum().item()
+    fn = ((1 - pred_pos) * labels).sum().item()
+    precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    f1 = (2 * precision * recall / (precision + recall)
+          if (precision + recall) > 0 and not (np.isnan(precision) or np.isnan(recall))
+          else 0.0)
+    return {"precision": precision, "recall": recall, "f1": f1,
+            "n_pos": int(labels.sum().item()), "n_pred_pos": int(pred_pos.sum().item())}
+
+
 class WeatherDataset(Dataset):
     """
     입력 X_num: 시각 t 의 12차원 수치 벡터 (표준화)
@@ -198,40 +280,54 @@ class WeatherDataset(Dataset):
     입력 X_txt: 시각 t 의 MiniLM 텍스트 임베딩 (384)
     타깃 y    : [기온_{t+L}, 강수량_{t+L}]      L = lead_hours
 
-    수집 실패로 시각이 건너뛴 구간이 있으면 (t, t+L) 쌍의 실제 간격이 L 이
-    아닐 수 있다. 타임스탬프를 검사해 정확히 L 시간 떨어진 쌍만 사용한다.
+    수집 실패로 시각이 건너뛴 구간이 있으면 (t, t+L) 쌍이 아예 존재하지
+    않을 수 있다 — (관측소, 시각) 인덱스로 직접 조회해 그런 레코드는
+    제외한다.
 
-    다중 관측소 확장(1단계) 이후 records 는 관측소 블록을 이어붙인 리스트다
-    (서울 720개, 인천 720개, ...). 블록 경계에서는 시각 간격 조건만으로는
-    걸러지지 않는 오염 쌍이 생길 수 있다 — 각 관측소가 "지금부터 n_hours 전"
-    까지 동일한 실시간 구간을 수집하므로, 한 관측소 블록의 마지막 레코드와
-    다음 관측소 블록의 초반 레코드가 우연히 L시간 간격을 만족할 수 있다.
-    관측소 코드가 같은 쌍만 사용해 이를 원천 차단한다.
+    이전 구현은 리스트에서 인덱스가 L 칸 떨어진 두 레코드의 시각차만
+    검사했다. 이는 records 가 '관측소 블록 단위로 이어붙여지고, 블록
+    내부는 시간순'이라는 저장 순서를 전제하는데, 단일 수집 실행
+    (collect_historical 한 번)에서는 항상 성립했지만 apihub 수집
+    (collect_year.py)과 웹 포털 파일셋 임포트(import_kma_fileset.py)를
+    여러 번에 걸쳐 병합한 뒤로는 그 순서가 우연에 의존하게 됐다 — 실측
+    328,802개 병합본에서 96.9%는 우연히 정렬이 맞았지만, 다음 병합에서
+    순서가 달라지면 조용히 페어를 잃는 구조였다. 인덱스 조회 방식은
+    records 의 순서와 완전히 무관하다.
     """
 
     def __init__(self, records: list[dict],
-                 sat_collector: SimulatedSatelliteCollector = None,
+                 sat_collector=None,   # InterpolatedFieldCollector — Re축, 실측 공간보간장
                  txt_collector: SimulatedTextCollector = None,
                  lead_hours: int = 1,
                  mean: np.ndarray = None, std: np.ndarray = None):
         L = lead_hours
         self.lead_hours = L
 
-        # ── 유효한 (t, t+L) 쌍만 선별 — 동일 관측소 + 정확히 L시간 간격 ──
-        times = [_parse_ts(r["timestamp"]) for r in records]
-        stns  = [r.get("stn") for r in records]
-        src_idx = [i for i in range(len(records) - L)
-                   if stns[i] == stns[i + L]
-                   and (times[i + L] - times[i]).total_seconds() == L * 3600]
+        # ── 유효한 (t, t+L) 쌍만 선별 — (관측소, 시각) 인덱스 직접 조회 ──
+        # records 의 저장 순서에 의존하지 않는다(클래스 docstring 참고).
+        # 같은 (stn, 시각) 이 중복되면 나중 항목이 이긴다 — 이 저장소의
+        # 다른 dedup 병합(collect_year.load_existing 등)과 같은 규칙.
+        by_key = {(r.get("stn"), str(r["timestamp"])[:12]): i
+                  for i, r in enumerate(records)}
+
+        src_idx, tgt_idx = [], []
+        for i, r in enumerate(records):
+            tgt_ts = (_parse_ts(r["timestamp"]) + timedelta(hours=L)) \
+                .strftime("%Y%m%d%H%M")
+            j = by_key.get((r.get("stn"), tgt_ts))
+            if j is not None:
+                src_idx.append(i)
+                tgt_idx.append(j)
+
         if not src_idx:
             raise ValueError(f"lead={L}시간 유효 쌍이 없습니다. 데이터 연속성 확인 필요.")
-        dropped = (len(records) - L) - len(src_idx)
+        dropped = len(records) - len(src_idx)
         if dropped > 0:
-            print(f"  [경고] 관측소 경계·시각 불연속으로 {dropped}개 쌍 제외 "
+            print(f"  [정보] {dropped}개 레코드는 +{L}h 뒤 관측이 없어 제외 "
                   f"(사용 {len(src_idx)}개)")
 
         src_records = [records[i] for i in src_idx]
-        tgt_records = [records[i + L] for i in src_idx]
+        tgt_records = [records[j] for j in tgt_idx]
 
         # 관측소·시각 메타데이터 — 학습에는 쓰이지 않지만 backtest_accuracy.py
         # 가 샘플별 예측을 (관측소, 목표시각)으로 정확도 로그에 남기는 데 필요.
@@ -277,11 +373,54 @@ class WeatherDataset(Dataset):
         # 관측소 구성 진단 — 다중 관측소 확장 검증용
         self.n_stations = len({r.get("stn") for r in src_records})
 
+        # ── Phase 3-9 공식 라벨(폭염·한파·황사 특보) ────────────────
+        # import_weather_issues.py 가 만든 (관측소,날짜)→기상청 공식판정
+        # 조회표. 있으면 그 순간 임계값 근사 대신 실제 발표된 특보를 쓴다
+        # (2026-08-09 구조점검에서 지적한 "라벨 정의 근사 오차" 해소).
+        # 조회 실패(관측소/날짜 갭)시 폭염·한파는 기존 임계값 근사로 폴백하고,
+        # 황사는 대체할 신뢰 가능한 라벨이 없어 마스크로 손실 계산에서 뺀다.
+        issue_labels = {}
+        if os.path.exists(WEATHER_ISSUE_LABELS):
+            with open(WEATHER_ISSUE_LABELS, "r", encoding="utf-8") as f:
+                issue_labels = json.load(f)
+
+        heat_list, cold_list, dust_list, dust_mask_list = [], [], [], []
+        n_heat_off = n_cold_off = n_dust_off = 0
+        for i, r in enumerate(tgt_records):
+            ts = str(r["timestamp"])
+            date_str = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
+            day = issue_labels.get(str(r.get("stn")), {}).get(date_str, {})
+
+            if "heatwave_advisory" in day:
+                heat_list.append(day["heatwave_advisory"]); n_heat_off += 1
+            else:
+                heat_list.append(int(temp_tgt[i] >= HEATWAVE_THRESH))
+
+            if "coldwave_advisory" in day:
+                cold_list.append(day["coldwave_advisory"]); n_cold_off += 1
+            else:
+                cold_list.append(int(temp_tgt[i] <= COLDWAVE_THRESH))
+
+            if "dust_observed" in day:
+                dust_list.append(day["dust_observed"]); dust_mask_list.append(1); n_dust_off += 1
+            else:
+                dust_list.append(0); dust_mask_list.append(0)
+
+        self.y_heatwave = torch.tensor(heat_list, dtype=torch.float32)
+        self.y_coldwave = torch.tensor(cold_list, dtype=torch.float32)
+        self.y_dust     = torch.tensor(dust_list, dtype=torch.float32)
+        self.dust_mask  = torch.tensor(dust_mask_list, dtype=torch.float32)
+        self.n_heat_official = n_heat_off
+        self.n_cold_official = n_cold_off
+        self.n_dust_official = n_dust_off
+
     def __len__(self):
         return len(self.X_num)
 
     def __getitem__(self, idx):
-        return self.X_num[idx], self.X_img[idx], self.X_txt[idx], self.y[idx]
+        return (self.X_num[idx], self.X_img[idx], self.X_txt[idx], self.y[idx],
+                self.y_heatwave[idx], self.y_coldwave[idx],
+                self.y_dust[idx], self.dust_mask[idx])
 
 
 # ── 4. 모델: pipeline_model.py의 TriCHEFPipeline 사용 ─────────────
@@ -298,6 +437,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
           early_stop: bool = True,
           dynamic_gate: bool = DYNAMIC_GATE,
           gate_entropy_weight: float = GATE_ENTROPY_WEIGHT,
+          lr_schedule: str = "plateau",
           checkpoint: str = CHECKPOINT,
           verbose: bool = True) -> dict:
     """
@@ -308,6 +448,21 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
     early_stop      : ablation 비교 시 False 로 두어 모든 조건을 동일 에폭수로
                       학습한다. 조기 종료는 조건마다 학습 길이를 다르게 만들어
                       '성능 차이'와 '학습량 차이'를 구분할 수 없게 한다.
+    lr_schedule     : "plateau" (기본) — ReduceLROnPlateau, 검증 손실이
+                        8에폭 정체되면 LR 반감. 검증 손실 자체에 반응하는
+                        보수적 스케줄.
+                      "cosine_restarts" — CosineAnnealingWarmRestarts.
+                        재시작 주기(T_0)를 고정 에폭이 아니라 게이트 워밍업의
+                        2배로 둔다 — 엔트로피 정규화가 λ=0→목표값으로 램프업을
+                        마치는 시점(gate_warmup_epochs~2×gate_warmup_epochs)에
+                        정확히 첫 재시작이 걸리도록. 이 구간은 손실 함수 자체의
+                        형태가 바뀌는 지점이라(엔트로피 항이 새로 추가됨),
+                        LR을 다시 올려 최적화기가 바뀐 지형을 재탐색할 구체적
+                        근거가 있다. 고정 에폭(예: 20/40/80)을 쓰지 않는 이유는
+                        GATE_WARMUP_EPOCHS 와 같은 함정 때문이다 — 이번 데이터
+                        규모(328k)에서 학습이 16~36에폭에 조기종료되는 것이
+                        실측됐는데, 고정 재시작 지점이 그보다 늦으면 단 한 번도
+                        발동하지 않는다.
     반환: 최종 성능 지표 dict (ablation.py 에서 비교용으로 사용)
     """
     axes = "Z" + ("+Re" if use_re else "") + ("+Im" if use_im else "")
@@ -318,7 +473,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         print(f" Gram-Schmidt 직교화: {'ON' if orthogonalize else 'OFF'}"
               f" | 기온 Δ 예측: {'ON' if persistence_residual else 'OFF'}")
         gdesc = (f"동적 게이트 (균등 초기화, λ={gate_entropy_weight}, "
-                 f"워밍업 {GATE_WARMUP_EPOCHS}에폭)" if dynamic_gate else "정적 α/φ")
+                 f"워밍업은 학습 표본 수에서 역산 — 아래 참조)" if dynamic_gate else "정적 α/φ")
         print(f" 축 가중치: {gdesc}")
         print(f" 위성 인코더: {'소형 CNN' if COMPACT_SATELLITE else 'ResNet18'}")
         print(f"{'='*70}\n")
@@ -332,11 +487,15 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         return {}
 
     if verbose:
-        print("위성 이미지 생성 중 (합성, 4ch 32×32)...")
-    sat_collector = SimulatedSatelliteCollector()
+        print("Re축 공간보간장 생성 중 (12관측소 실측 IDW 보간, 4ch 32×32)...")
+    # Phase 3-10 실험 — SimulatedSatelliteCollector(노이즈, 정보량 0 확인됨)
+    # 대신 같은 시각 다른 11개 관측소 실측값을 IDW 보간한 필드를 Re축에 넣는다.
+    sat_collector = InterpolatedFieldCollector(records, STATION_COORDS)
     if verbose:
-        print("기상 예보문 MiniLM 임베딩 생성 중...")
-    txt_collector = SimulatedTextCollector()
+        print("Im축 시간 경향 벡터 생성 중 (기온·기압·습도·풍속 × 1h/3h/6h 차분)...")
+    # Phase 3-11 실험 — SimulatedTextCollector(Z축 재포장, 중복정보 확인됨)
+    # 대신 단일 스냅샷에서 유도 불가능한 시간 미분(∂s/∂t)을 Im축에 넣는다.
+    txt_collector = TendencyCollector(records)
 
     full_ds = WeatherDataset(records,
                              sat_collector=sat_collector,
@@ -344,6 +503,18 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                              lead_hours=lead_hours)
     n_val   = max(2, int(len(full_ds) * VAL_RATIO))
     n_train = len(full_ds) - n_val
+
+    # 게이트 워밍업 — Phase 3-5 캘리브레이션 스텝 수를 현재 데이터 규모에서
+    # 재현하는 에폭 수로 역산 (위 _REFERENCE_WARMUP_STEPS 주석 참고).
+    steps_per_epoch = max(1, n_train // BATCH_SIZE)
+    gate_warmup_epochs = max(_MIN_WARMUP_EPOCHS,
+                             round(_REFERENCE_WARMUP_STEPS / steps_per_epoch))
+    if verbose:
+        print(f"게이트 워밍업: {gate_warmup_epochs}에폭 "
+              f"(에폭당 {steps_per_epoch}배치 × {gate_warmup_epochs} ≈ "
+              f"{steps_per_epoch*gate_warmup_epochs:,}스텝, 기준 "
+              f"{_REFERENCE_WARMUP_STEPS:,}스텝)")
+
     # SEED 고정 → 직교화 ON/OFF 비교 시 동일한 분할 사용
     train_ds, val_ds = random_split(
         full_ds, [n_train, n_val],
@@ -368,6 +539,54 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         print(f"  강수 상시 0 예측            : {precip_naive:.4f} mm   "
               f"[전체 {full_ds.precip_mean:.4f}]\n")
 
+    # hurdle 헤드 사전확률·클래스 불균형 가중치 — 학습 표본에서 직접 계산
+    # (고정 상수 아님). 검증셋을 보면 데이터 누설이라 반드시 train_ds 에서만.
+    train_precip = full_ds.y[train_ds.indices, 1]
+    n_wet = int((train_precip >= WET_THRESH).sum().item())
+    n_dry = len(train_precip) - n_wet
+    wet_prior = n_wet / len(train_precip)
+    rain_pos_weight = torch.tensor([n_dry / max(n_wet, 1)], device=DEVICE)
+    if verbose:
+        print(f"Hurdle 헤드 — 학습셋 강수 비율 {wet_prior:.4f} "
+              f"({n_wet}/{len(train_precip)}), BCE pos_weight={rain_pos_weight.item():.2f}")
+
+    # Phase 3-8/3-9 극한기상 헤드 사전확률·클래스 불균형 가중치 — 폭염·한파
+    # 임계값(위 상수)은 고정 규정값이지만, 실제 쓰이는 라벨은 WeatherDataset
+    # 이 이미 계산해둔 y_heatwave/y_coldwave(공식 특보 있으면 그것, 없으면
+    # 임계값 근사 폴백)다. 그 라벨 기준으로 학습셋 내 비율을 실측한다.
+    train_heat = full_ds.y_heatwave[train_ds.indices]
+    n_heat = int(train_heat.sum().item())
+    heatwave_prior = n_heat / len(train_heat)
+    heatwave_pos_weight = torch.tensor(
+        [(len(train_heat) - n_heat) / max(n_heat, 1)], device=DEVICE)
+
+    train_cold = full_ds.y_coldwave[train_ds.indices]
+    n_cold = int(train_cold.sum().item())
+    coldwave_prior = n_cold / len(train_cold)
+    coldwave_pos_weight = torch.tensor(
+        [(len(train_cold) - n_cold) / max(n_cold, 1)], device=DEVICE)
+
+    # 황사 — 기상청 공식 라벨이 있는 표본에서만 비율을 잰다(마스크=0인 표본은
+    # "무황사로 확인됨"이 아니라 "판정 불가"라 분모에서도 뺀다).
+    train_dust_mask = full_ds.dust_mask[train_ds.indices].bool()
+    train_dust = full_ds.y_dust[train_ds.indices][train_dust_mask]
+    n_dust = int(train_dust.sum().item())
+    n_dust_total = max(len(train_dust), 1)
+    dust_prior = n_dust / n_dust_total
+    dust_pos_weight = torch.tensor(
+        [(n_dust_total - n_dust) / max(n_dust, 1)], device=DEVICE)
+
+    if verbose:
+        print(f"극한기상 헤드 — 학습셋 폭염 비율 {heatwave_prior:.4f} "
+              f"({n_heat}/{len(train_heat)}, 공식라벨 {full_ds.n_heat_official}일), "
+              f"pos_weight={heatwave_pos_weight.item():.2f}")
+        print(f"              학습셋 한파 비율 {coldwave_prior:.4f} "
+              f"({n_cold}/{len(train_cold)}, 공식라벨 {full_ds.n_cold_official}일), "
+              f"pos_weight={coldwave_pos_weight.item():.2f}")
+        print(f"              학습셋 황사 비율 {dust_prior:.4f} "
+              f"({n_dust}/{n_dust_total}, 전부 공식라벨 — 판정 가능 표본만), "
+              f"pos_weight={dust_pos_weight.item():.2f}")
+
     # 모델 — 타깃 평균을 헤드 편향에 주입해 편향 학습 낭비 제거
     model = TriCHEFPipeline(
         embed_dim=EMBED_DIM, num_features=NUM_FEATURES,
@@ -377,6 +596,10 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         persistence_residual=persistence_residual,
         feat_mean=full_ds.mean.tolist(), feat_std=full_ds.std.tolist(),
         dynamic_gate=dynamic_gate, compact_satellite=COMPACT_SATELLITE,
+        wet_prior=wet_prior,
+        heatwave_prior=heatwave_prior, coldwave_prior=coldwave_prior,
+        dust_prior=dust_prior,
+        im_dim=TENDENCY_DIM,   # Phase 3-11 — 384(MiniLM) 대신 12(경향벡터)
     ).to(DEVICE)
 
     # 차단된 축의 인코더는 forward 에서 호출되지 않아 gradient 를 받지 않는다.
@@ -395,9 +618,19 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
               f"(비율 {n_params / n_train:,.0f}:1)")
 
     optimizer = torch.optim.AdamW(trainable, lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=8, factor=0.5
-    )
+    if lr_schedule == "cosine_restarts":
+        restart_t0 = max(2, gate_warmup_epochs * 2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=restart_t0, T_mult=2, eta_min=LR * 0.01
+        )
+        if verbose:
+            print(f"LR 스케줄: CosineAnnealingWarmRestarts "
+                  f"(첫 재시작 {restart_t0}에폭 — 게이트 워밍업 종료 시점, "
+                  f"이후 {restart_t0*2}, {restart_t0*6}, ...)")
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", patience=8, factor=0.5
+        )
     mse = nn.MSELoss()
 
     # 손실 스케일 정규화: 기온 MSE 는 σ²(≈수십) 규모, 강수 MSE 는 O(1) 규모라
@@ -421,16 +654,20 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
     for epoch in range(1, EPOCHS + 1):
 
         # 엔트로피 워밍업 — warmup 구간은 λ=0, 이후 목표값까지 선형 증가.
-        if epoch <= GATE_WARMUP_EPOCHS:
+        if epoch <= gate_warmup_epochs:
             lam_now = 0.0
         else:
-            ramp = min(1.0, (epoch - GATE_WARMUP_EPOCHS) / max(1, GATE_WARMUP_EPOCHS))
+            ramp = min(1.0, (epoch - gate_warmup_epochs) / gate_warmup_epochs)
             lam_now = gate_entropy_weight * ramp
 
         model.train()
         train_loss = 0.0
-        for x_num, x_img, x_txt, y_b in train_loader:
+        for x_num, x_img, x_txt, y_b, heat_b, cold_b, dust_b, dmask_b in train_loader:
             x_num, y_b = x_num.to(DEVICE), y_b.to(DEVICE)
+            heat_b = heat_b.to(DEVICE).unsqueeze(-1)
+            cold_b = cold_b.to(DEVICE).unsqueeze(-1)
+            dust_b = dust_b.to(DEVICE).unsqueeze(-1)
+            dmask_b = dmask_b.to(DEVICE).unsqueeze(-1)
             x_img = x_img.to(DEVICE) if use_re else None
             x_txt = x_txt.to(DEVICE) if use_im else None
 
@@ -438,6 +675,42 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt)
             loss = (mse(pred[:, 0:1], y_b[:, 0:1]) / temp_var
                     + PRECIP_WEIGHT * mse(pred[:, 1:2], y_b[:, 1:2]))
+            # Hurdle BCE — "비가 오는가"에 직접 그래디언트를 준다. softplus
+            # 회귀 손실만으로는 무강수 쪽으로 정확히 0을 향할 유인이 약해서
+            # (기울기가 실측치와의 차이에만 비례) 이 항이 없으면 dynamic_gate
+            # 케이스가 아니어도 동일한 문제가 재현된다(precip_breakdown.py).
+            if hasattr(model, "head_rain"):
+                is_wet = (y_b[:, 1:2] >= WET_THRESH).float()
+                rain_bce = nn.functional.binary_cross_entropy_with_logits(
+                    model._last_rain_logit, is_wet, pos_weight=rain_pos_weight
+                )
+                loss = loss + HURDLE_BCE_WEIGHT * rain_bce
+            # Phase 3-8/3-9 극한기상 BCE — 회귀 손실(기온 MSE)만으로는 폭염·한파
+            # 같은 꼬리 사건에 직접 그래디언트가 가지 않는다(전체 평균오차에
+            # 묻힘). head_rain 과 같은 이유로 이진분류를 별도 항으로 둔다.
+            # heat_b/cold_b 는 WeatherDataset 이 이미 계산해둔 라벨(기상청
+            # 공식 특보 있으면 그것, 없으면 임계값 근사 폴백)이라 여기서는
+            # 그대로 쓰기만 한다.
+            if hasattr(model, "head_heatwave"):
+                heat_bce = nn.functional.binary_cross_entropy_with_logits(
+                    model._last_heatwave_logit, heat_b, pos_weight=heatwave_pos_weight
+                )
+                loss = loss + EXTREME_BCE_WEIGHT * heat_bce
+            if hasattr(model, "head_coldwave"):
+                cold_bce = nn.functional.binary_cross_entropy_with_logits(
+                    model._last_coldwave_logit, cold_b, pos_weight=coldwave_pos_weight
+                )
+                loss = loss + EXTREME_BCE_WEIGHT * cold_bce
+            # 황사 BCE — dmask_b=0(공식 라벨 없음)인 표본은 손실에서 뺀다.
+            # 그 표본들의 dust_b=0 은 "무황사 확정"이 아니라 "판정 불가"라
+            # 그대로 넣으면 근거 없는 음성 라벨을 학습시키게 된다.
+            if hasattr(model, "head_dust") and dmask_b.sum() > 0:
+                dust_bce_raw = nn.functional.binary_cross_entropy_with_logits(
+                    model._last_dust_logit, dust_b, pos_weight=dust_pos_weight,
+                    reduction="none"
+                )
+                dust_bce = (dust_bce_raw * dmask_b).sum() / dmask_b.sum()
+                loss = loss + EXTREME_BCE_WEIGHT * dust_bce
             # 게이트 엔트로피 정규화 — 가중치를 소수 축에 집중시키는 압력.
             # 이 항이 없으면 게이트도 정적 α/φ 와 마찬가지로 무용 축의
             # 가중치를 키우는 방향으로 학습된다(Phase 3-4 실측).
@@ -452,8 +725,10 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         # ── 검증 ──────────────────────────────────────────────────
         model.eval()
         temp_abs, precip_abs, precip_preds, deltas = [], [], [], []
+        heat_probs, cold_probs, dust_probs = [], [], []
+        heat_true, cold_true, dust_true, dust_mask_all = [], [], [], []
         with torch.no_grad():
-            for i, (x_num, x_img, x_txt, y_b) in enumerate(val_loader):
+            for i, (x_num, x_img, x_txt, y_b, heat_b, cold_b, dust_b, dmask_b) in enumerate(val_loader):
                 x_num, y_b = x_num.to(DEVICE), y_b.to(DEVICE)
                 x_img = x_img.to(DEVICE) if use_re else None
                 x_txt = x_txt.to(DEVICE) if use_im else None
@@ -466,12 +741,33 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                     # 모델이 퍼시스턴스에 실제로 얹은 보정량 |Δ|
                     t_now = x_num[:, 0] * model.feat_std[0] + model.feat_mean[0]
                     deltas.append((pred[:, 0] - t_now).abs())
+                heat_true.append(heat_b); cold_true.append(cold_b)
+                dust_true.append(dust_b); dust_mask_all.append(dmask_b)
+                if hasattr(model, "head_heatwave"):
+                    heat_probs.append(torch.sigmoid(model._last_heatwave_logit).squeeze(-1).cpu())
+                if hasattr(model, "head_coldwave"):
+                    cold_probs.append(torch.sigmoid(model._last_coldwave_logit).squeeze(-1).cpu())
+                if hasattr(model, "head_dust"):
+                    dust_probs.append(torch.sigmoid(model._last_dust_logit).squeeze(-1).cpu())
 
         # 샘플 단위 평균 (배치 크기가 달라도 편향되지 않도록)
         val_temp_mae   = torch.cat(temp_abs).mean().item()
         val_precip_mae = torch.cat(precip_abs).mean().item()
         precip_std     = torch.cat(precip_preds).std().item()
         delta_mag      = torch.cat(deltas).mean().item() if deltas else 0.0
+
+        extreme_metrics = {}
+        if heat_probs:
+            extreme_metrics["heatwave"] = _prf_metrics(
+                torch.cat(heat_probs), torch.cat(heat_true))
+        if cold_probs:
+            extreme_metrics["coldwave"] = _prf_metrics(
+                torch.cat(cold_probs), torch.cat(cold_true))
+        if dust_probs:
+            dmask_cat = torch.cat(dust_mask_all).bool()
+            if dmask_cat.sum() > 0:
+                extreme_metrics["dust"] = _prf_metrics(
+                    torch.cat(dust_probs)[dmask_cat], torch.cat(dust_true)[dmask_cat])
 
         # 조기 종료 기준: 두 baseline 대비 상대 오차의 합 (skill score)
         # 1.0 미만이면 해당 지표가 baseline 을 이긴 것.
@@ -480,7 +776,12 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         best_temp_only   = min(best_temp_only,   val_temp_mae)
         best_precip_only = min(best_precip_only, val_precip_mae)
 
-        scheduler.step(val_score)
+        # CosineAnnealingWarmRestarts 는 검증 지표가 아니라 에폭 진행 자체로
+        # 스텝한다 — ReduceLROnPlateau 처럼 val_score 를 넘기면 타입 에러.
+        if lr_schedule == "cosine_restarts":
+            scheduler.step()
+        else:
+            scheduler.step(val_score)
         current_lr = optimizer.param_groups[0]["lr"]
 
         if verbose and (epoch % 10 == 0 or epoch == 1):
@@ -510,6 +811,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "alpha_learned":  w["alpha"],
                 "phi_learned":    w["phi"],
                 "diagnostics":    dict(model.last_diagnostics),
+                "extreme_metrics": extreme_metrics,
             }
             torch.save({
                 **best_stats,
@@ -523,6 +825,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # load_state_dict 가 shape mismatch 로 실패한다.
                 "dynamic_gate": dynamic_gate,
                 "compact_satellite": COMPACT_SATELLITE,
+                "im_dim":       TENDENCY_DIM,   # Im축 인코더 종류 복원용(384 vs 12)
                 "lead_hours":   lead_hours,
                 "num_features": NUM_FEATURES,
                 "alpha_init":   ALPHA_INIT,
@@ -587,6 +890,19 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                   f"Re-Z {d.get('cos_re_z_pre',0):.4f} | Im-Z {d.get('cos_im_z_pre',0):.4f}")
             print(f"   직교화 후: Re-Im {d.get('cos_re_im_post',0):.4f} | "
                   f"Re-Z {d.get('cos_re_z_post',0):.4f} | Im-Z {d.get('cos_im_z_post',0):.4f}")
+        em = best_stats.get("extreme_metrics", {})
+        if em:
+            print(f"{'-'*70}")
+            print(f" 극한기상 헤드 (판정 임계 0.5, precision/recall/F1 — 양성희박이라 accuracy 무의미)")
+            print(f"   라벨 소스 — 폭염·한파: 기상청 공식 특보(있으면)+임계값 근사(없으면) 폴백"
+                  f" / 황사: 공식 라벨만(판정 불가 표본 제외)")
+            for name, m in (("폭염", em.get("heatwave")),
+                            ("한파", em.get("coldwave")),
+                            ("황사", em.get("dust"))):
+                if m is None:
+                    continue
+                print(f"   {name}: P={m['precision']:.3f} R={m['recall']:.3f} "
+                      f"F1={m['f1']:.3f}  (실측양성 {m['n_pos']}개, 예측양성 {m['n_pred_pos']}개)")
         print(f" 체크포인트: {checkpoint}")
         print(f"{'='*70}")
 

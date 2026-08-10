@@ -17,7 +17,9 @@ import numpy as np
 import torch
 
 from train import collect_historical, WeatherDataset
-from satellite_collector import SimulatedSatelliteCollector
+from interp_field_collector import InterpolatedFieldCollector
+from tendency_collector import TendencyCollector
+from weather_collector import STATION_COORDS
 from text_collector import SimulatedTextCollector
 from predict import load_model, CHECKPOINT
 import accuracy
@@ -33,10 +35,16 @@ def main():
           f"강수MAE {ckpt['val_precip_mae']:.3f}mm")
 
     records = collect_historical()
+    # 2026-08-09: 체크포인트가 Re·Im축 모두 실제 데이터에 의존하므로 학습
+    # 때와 같은 컬렉터를 써야 한다 — 안 맞추면 입력 분포가 어긋나 모든
+    # 지표가 무너진다(hurdle_diagnose.py 에서 실측: 황사 F1 0.661→0.089).
+    # im_dim 으로 구/신버전 체크포인트를 자동 판별한다.
+    txt_collector = (TendencyCollector(records) if ckpt.get("im_dim", 384) < 128
+                     else SimulatedTextCollector())
     ds = WeatherDataset(
         records,
-        sat_collector=SimulatedSatelliteCollector(),
-        txt_collector=SimulatedTextCollector(),
+        sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
+        txt_collector=txt_collector,
         lead_hours=ckpt["lead_hours"],
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),

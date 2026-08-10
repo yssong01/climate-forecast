@@ -19,7 +19,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as tv_models
+# torchvision 은 compact=False(ResNet18 경로) 일 때만 필요하다 — 배포
+# 서빙 경로는 compact_satellite=True 고정(NumericalEncoder.__init__ 참고)
+# 이라 이 임포트를 지연시키면 서빙 이미지에서 torchvision 의존성 자체를
+# 뺄 수 있다(deploy_ablation.py 실측: Re축 기여도 0, 2026-08-08).
 
 
 # ── 수치 안정 유틸 ───────────────────────────────────────────────────
@@ -74,6 +77,19 @@ def _pairwise_abs_cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return F.cosine_similarity(a, b, dim=-1).abs().mean().item()
 
 
+def _binary_head(embed_dim: int, prior: float) -> nn.Sequential:
+    """
+    이진분류 헤드(강수/폭염/한파 공용) — 편향을 prior의 로짓으로 초기화.
+    head_rain 이 처음 도입한 패턴(logit(wet_prior))을 그대로 재사용한다.
+    prior 는 호출부(train.py)가 학습 표본에서 실측한 값을 넘긴다.
+    """
+    head = nn.Sequential(nn.Linear(embed_dim, 32), nn.GELU(), nn.Linear(32, 1))
+    p = min(max(prior, 1e-4), 1 - 1e-4)
+    with torch.no_grad():
+        head[-1].bias.fill_(math.log(p / (1 - p)))
+    return head
+
+
 # ── Z축: 수치 센서 인코더 ────────────────────────────────────────────
 
 class NumericalEncoder(nn.Module):
@@ -125,6 +141,7 @@ class SatelliteEncoder(nn.Module):
                 nn.Linear(64, embed_dim),
             )
         else:
+            import torchvision.models as tv_models   # 지연 임포트 — 위 주석 참고
             base = tv_models.resnet18(weights=None)
             base.conv1 = nn.Conv2d(
                 in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
@@ -149,6 +166,33 @@ class TextEncoder(nn.Module):
         self.proj = nn.Sequential(
             nn.Linear(text_dim, 128), nn.LayerNorm(128), nn.GELU(),
             nn.Linear(128, embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.proj(x), dim=-1)
+
+
+class TendencyEncoder(nn.Module):
+    """
+    Im축 대안 (Phase 3-11): 시간 경향 벡터 12차원 → embed_dim.
+
+    TextEncoder 를 대체한다. MiniLM 임베딩(384차원)은 Z축 스칼라를 버킷팅해
+    재인코딩한 것이라 정보이론적으로 Z를 못 넘지만(중복), 시간 미분 ∂s/∂t 는
+    단일 스냅샷에서 유도 불가능해 Z와 진짜로 독립이다 — tendency_collector.py
+    docstring 참고.
+
+    은닉폭 실험(2026-08-09): 32로 줄였더니(입력이 384→12로 작아졌다는 이유로)
+    강수·폭염·한파·황사 F1 이 전부 소폭 하락했다(예: 황사 0.671→0.611).
+    TextEncoder 가 주던 이득 일부가 "정보량"이 아니라 "학습 가능한 별도
+    경로의 비선형 용량"(암묵적 정규화, 2026-08-08 A/B 테스트에서 이미 확인된
+    현상) 이었을 가능성이 있어 — 입력 차원과 무관하게 128로 되돌려 용량
+    자체가 원인인지 검증한다.
+    """
+    def __init__(self, in_dim: int = 12, embed_dim: int = 64, hidden: int = 128):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, embed_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -238,7 +282,12 @@ class TriCHEFPipeline(nn.Module):
                  feat_mean: list = None,
                  feat_std:  list = None,
                  dynamic_gate: bool = False,
-                 compact_satellite: bool = True):
+                 compact_satellite: bool = True,
+                 im_dim: int = 384,
+                 wet_prior: float = 0.067,
+                 heatwave_prior: float = 0.01,
+                 coldwave_prior: float = 0.003,
+                 dust_prior: float = 0.05):
         """
         orthogonalize        : Gram-Schmidt 직교화 on/off (ablation 스위치)
         gs_eps               : 소프트 정규화 ε — gradient 상한 1/ε
@@ -247,6 +296,20 @@ class TriCHEFPipeline(nn.Module):
         persistence_residual : 기온을 절대값이 아닌 변화량(Δ)으로 예측
         feat_mean / feat_std : 입력 표준화 통계 (Δ 예측 시 필수)
         dynamic_gate         : True 면 정적 α/φ 대신 ModalityGate 사용 (Phase 3-5)
+        wet_prior            : 검증셋 실측 강수 비율(기본 0.067, 2026-08-07
+                                12관측소 3.5년 실측) — head_rain 편향을 이
+                                사전확률의 로짓으로 초기화해 학습 시작부터
+                                "대부분 무강수"를 반영한다.
+        heatwave_prior       : 학습셋 실측 폭염 비율(목표시각 기온≥33°C,
+                                기상청 폭염주의보 기준) — head_heatwave 편향
+                                초기화. 임계값 자체는 규정값이라 고정이지만
+                                비율은 train.py 가 실측해 넘긴다.
+        coldwave_prior       : 학습셋 실측 한파 비율(목표시각 기온≤-12°C,
+                                기상청 한파주의보 기준) — head_coldwave 편향
+                                초기화.
+        dust_prior           : 학습셋 실측 황사 비율(기상청 "날씨 이슈별
+                                데이터" 공식 황사관측여부 라벨 기준) —
+                                head_dust 편향 초기화.
         """
         super().__init__()
         self.embed_dim     = embed_dim
@@ -268,7 +331,12 @@ class TriCHEFPipeline(nn.Module):
         # 3축 인코더
         self.enc_re = SatelliteEncoder(4, embed_dim,
                                        compact=compact_satellite)   # A: 위성
-        self.enc_im = TextEncoder(384,      embed_dim)   # B: 텍스트
+        # Im축 인코더 — im_dim=384 면 MiniLM 텍스트(기존), 12 면 시간 경향
+        # 벡터(Phase 3-11). 체크포인트에 im_dim 을 저장해야 복원 시 아키텍처가
+        # 맞는다(dynamic_gate/compact_satellite 와 같은 이유).
+        self.im_dim = im_dim
+        self.enc_im = (TextEncoder(im_dim, embed_dim) if im_dim >= 128
+                       else TendencyEncoder(im_dim, embed_dim))
         self.enc_z  = NumericalEncoder(num_features, embed_dim)   # C: 수치
 
         # 축 가중치 — 정적(log 공간 학습) 또는 동적(입력 조건부 게이트)
@@ -286,6 +354,40 @@ class TriCHEFPipeline(nn.Module):
         self.head_precip = nn.Sequential(
             nn.Linear(embed_dim, 32), nn.GELU(), nn.Linear(32, 1),
         )
+        # Phase 3-7 hurdle 헤드 — "비가 오는가"를 별도 이진분류기로 분리.
+        #
+        # 왜 필요한가(2026-08-07 실측, precip_breakdown.py): 검증셋의
+        # 93.3%가 무강수인데 head_precip 은 softplus 출력이라 수학적으로
+        # 정확히 0을 낼 수 없다(softplus(x)>0 for all finite x). 무강수
+        # 구간에서 이 미세한 비영 오차가 표본 수(6만+)만큼 누적되면, 강수
+        # 구간(6.7%)에서 baseline을 이기고 얻는 이득(모델이 baseline보다
+        # +10.2% 나음, 실측 확인됨)을 통째로 삼켜버린다 — 전체 격차의
+        # 139.7%가 무강수 구간에서만 발생했다. 후처리 클리핑만으로는 최선의
+        # 경우(0.2mm 임계)에도 여전히 baseline에 8.2% 졌다: 약한 강수 예측을
+        # 함께 깎아먹기 때문이다. 즉 회귀 헤드 하나가 "오는가"와 "얼마나"를
+        # 동시에 표현하려는 구조 자체가 문제였다.
+        #
+        # head_rain 은 sigmoid 로 [0,1] 확률을 내고, 최종 예측은
+        # P(비) × softplus(양) 로 부드럽게 결합한다 — 이산 게이트(하드 0/1)
+        # 대신 이렇게 두는 이유는 P(비)→0 이면 예측이 연속적으로 0에
+        # 수렴하면서도, 학습 내내 미분 가능해 그래디언트가 끊기지 않기
+        # 때문이다(Phase 3-3 의 dying-clamp 교훈과 같은 이유로 하드 게이트를
+        # 피한다).
+        self.head_rain = _binary_head(embed_dim, wet_prior)
+
+        # Phase 3-8 극한기상 경보 헤드 — head_rain 과 동일한 구조·목적
+        # (연속 회귀로는 못 내는 "일어나는가"를 명시적으로 학습). 임계값은
+        # 기상청 주의보 발표기준(공식 규정값, 데이터에서 추정하지 않음):
+        #   폭염주의보: 일 최고기온 33°C 이상
+        #   한파주의보: 아침 최저기온 -12°C 이하
+        # 강풍(≥14m/s)은 실측 빈도가 학습셋 환산 약 300표본(0.1%)으로
+        # 지나치게 희박해 이번 확장에서 제외했다(정량 확인, 2026-08-07).
+        self.head_heatwave = _binary_head(embed_dim, heatwave_prior)
+        self.head_coldwave = _binary_head(embed_dim, coldwave_prior)
+        # Phase 3-9 황사 헤드 — 폭염/한파와 동일 패턴. 라벨은 ASOS 현상번호
+        # 추정치가 아니라 기상청 "날씨 이슈별 데이터"의 공식 황사관측여부를
+        # 쓴다(import_weather_issues.py, 2026-08-09).
+        self.head_dust = _binary_head(embed_dim, dust_prior)
 
         # 출력 편향 초기화 — magnitude 원소값이 ~1/√D 로 작아서 편향만
         # 학습하는 데 수십 에폭이 낭비되는 문제를 제거한다.
@@ -299,6 +401,10 @@ class TriCHEFPipeline(nn.Module):
         # 마지막 forward 의 축 진단 지표 (detach 된 float, 학습에 무관)
         self.last_diagnostics: dict = {}
         self._gate_w = None   # 동적 게이트의 마지막 출력 (엔트로피 정규화용)
+        self._last_rain_logit = None      # hurdle BCE 손실 계산용 (train.py 가 읽음)
+        self._last_heatwave_logit = None  # 폭염 BCE 손실 계산용
+        self._last_coldwave_logit = None  # 한파 BCE 손실 계산용
+        self._last_dust_logit = None      # 황사 BCE 손실 계산용
 
     # ── 축 가중치 ────────────────────────────────────────────────
 
@@ -478,10 +584,101 @@ class TriCHEFPipeline(nn.Module):
         else:
             temp_pred = delta_temp
 
-        # 강수는 물리적으로 음수 불가 → softplus 로 강제.
-        # clamp(x,0,·) 는 x<0 에서 gradient 가 정확히 0 이라 전 샘플이 음수로
-        # 떨어지면 학습이 영구 정지한다(Phase 3-3 실측 확인). softplus 는
-        # gradient = sigmoid(x) > 0 이므로 항상 회복 가능하다.
-        precip_pred = F.softplus(self.head_precip(magnitude))
+        # Hurdle: P(비) × 강수량. softplus 단독으로는 못 냈던 정확한 0을
+        # P(비)→0 극한에서 연속적으로 표현한다(위 head_rain 주석 참고).
+        # clamp(x,0,·) 대신 softplus 를 양(量) 헤드에 쓰는 이유는 여전히
+        # Phase 3-3 과 동일 — x<0 에서 gradient 0 이 되는 dying-clamp을
+        # 피한다.
+        rain_logit = self.head_rain(magnitude)
+        self._last_rain_logit = rain_logit   # train.py 가 BCE 손실 계산에 사용
+        rain_prob = torch.sigmoid(rain_logit)
+        amount = F.softplus(self.head_precip(magnitude))
+        precip_pred = rain_prob * amount
 
+        # 극한기상 경보 확률 — 회귀 출력(temp_pred/precip_pred)과 별개로
+        # 학습·추론 시 model._last_*_logit / extreme_event_probs() 로 읽는다.
+        # forward() 반환 shape(B,2)를 그대로 유지해 predict.py 등 기존
+        # 호출부를 건드리지 않는다(head_rain 도입 때와 같은 이유).
+        self._last_heatwave_logit = self.head_heatwave(magnitude)
+        self._last_coldwave_logit = self.head_coldwave(magnitude)
+        self._last_dust_logit = self.head_dust(magnitude)
+
+        return torch.cat([temp_pred, precip_pred], dim=-1)
+
+    @torch.no_grad()
+    def extreme_event_probs(self) -> dict:
+        """마지막 forward() 호출의 극한기상 확률(독립 이진분류, 합=1 아님)."""
+        return {
+            "heatwave": torch.sigmoid(self._last_heatwave_logit)
+                        if self._last_heatwave_logit is not None else None,
+            "coldwave": torch.sigmoid(self._last_coldwave_logit)
+                        if self._last_coldwave_logit is not None else None,
+            "dust":     torch.sigmoid(self._last_dust_logit)
+                        if self._last_dust_logit is not None else None,
+            "rain":     torch.sigmoid(self._last_rain_logit)
+                        if self._last_rain_logit is not None else None,
+        }
+
+
+# ── Tri-CHEF 없이 Z축만 — 대조군 ─────────────────────────────────────
+
+class ZOnlyBaseline(nn.Module):
+    """
+    Hermitian modulus를 거치지 않는 대조군. NumericalEncoder 출력을 헤드에
+    직접 넣는다 — TriCHEFPipeline과 embed_dim·persistence_residual·softplus
+    헤드·편향 초기화가 전부 동일하고, 딱 하나만 다르다: magnitude 연산을
+    거치는가.
+
+    이 비교가 필요한 이유(2026-08-07 실측): 4번의 학습 모두 게이트가
+    97~99.9% Z축으로 수렴했다. 그런데 magnitude = √((w_re·v_re)²+...+eps)
+    는 원소별 연산이라, w_re≈w_im≈0 인 지금도 magnitude[i] ≈ w_z·|v_z[i]|
+    로 축약될 뿐 v_z[i] 자체가 되지는 않는다 — 각 차원의 **부호가
+    사라진다**. 즉 게이트가 이미 Z축만 쓰기로 정했더라도, Tri-CHEF 구조를
+    유지하는 한 부호 정보 손실이라는 대가는 계속 치르고 있다. 이 클래스는
+    그 대가가 실제로 성능에 영향을 주는지 직접 재기 위한 것이다.
+    """
+
+    def __init__(self, embed_dim: int = 64, num_features: int = 12,
+                 temp_mean: float = 20.0, precip_mean: float = 0.5,
+                 persistence_residual: bool = True,
+                 feat_mean: list = None, feat_std: list = None):
+        super().__init__()
+        self.persistence_residual = persistence_residual
+
+        if persistence_residual:
+            if feat_mean is None or feat_std is None:
+                raise ValueError(
+                    "persistence_residual=True 이면 feat_mean/feat_std 가 필요합니다."
+                )
+            self.register_buffer("feat_mean", torch.tensor(feat_mean, dtype=torch.float32))
+            self.register_buffer("feat_std",  torch.tensor(feat_std,  dtype=torch.float32))
+
+        self.enc_z = NumericalEncoder(num_features, embed_dim)
+
+        self.head_temp = nn.Sequential(
+            nn.Linear(embed_dim, 32), nn.GELU(), nn.Linear(32, 1),
+        )
+        self.head_precip = nn.Sequential(
+            nn.Linear(embed_dim, 32), nn.GELU(), nn.Linear(32, 1),
+        )
+        with torch.no_grad():
+            self.head_temp[-1].bias.fill_(0.0 if persistence_residual else temp_mean)
+            b = math.log(math.expm1(max(precip_mean, 1e-3)))
+            self.head_precip[-1].bias.fill_(b)
+
+    def forward(self, num_x: torch.Tensor,
+               img_x: torch.Tensor = None, txt_x: torch.Tensor = None,
+               collect_diagnostics: bool = False) -> torch.Tensor:
+        """img_x/txt_x는 TriCHEFPipeline과 동일한 학습 루프를 재사용하기
+        위한 자리만 차지하는 인자 — 이 모델은 Z축만 본다."""
+        v_z = self.enc_z(num_x)   # 부호 보존 (F.normalize, abs 아님)
+
+        delta_temp = self.head_temp(v_z)
+        if self.persistence_residual:
+            temp_now  = num_x[:, 0:1] * self.feat_std[0] + self.feat_mean[0]
+            temp_pred = temp_now + delta_temp
+        else:
+            temp_pred = delta_temp
+
+        precip_pred = F.softplus(self.head_precip(v_z))
         return torch.cat([temp_pred, precip_pred], dim=-1)

@@ -48,6 +48,26 @@ def _sf(s: str, default: float) -> float:
         return default
 
 
+def _sf_or_none(s: str):
+    """빈 값이면 None — '결측'과 '진짜 0'을 구분해야 하는 필드용.
+
+    실측 사고(2026-08-07): 관측 자체가 결측인 시각(ASOS 장비 고장 등으로
+    모든 필드가 빈 CSV 행)을 _sf() 로 채우면 "기온 20.0°C, 습도 50.0%,
+    풍속 1.5m/s"라는 그럴듯한 값이 나오고, status="SUCCESS_LIVE"로 저장돼
+    실제 관측과 구분이 안 된 채 학습·검증에 섞여 들어갔다. 학습된 모델의
+    검증셋 최대 오차 사례 상위권이 전부 이 패턴이었다(예측 20°C 근처 vs
+    실측 -6~-7°C인 1월 사례들 — 모델이 이 오염된 20.0 을 일부 학습한
+    부작용으로 보인다). 328,802개 중 206개(0.063%)가 이 패턴으로 확인됨.
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def parse_file(path: str) -> list:
     """CSV 1개 → 내부 레코드 리스트. 인코딩은 EUC-KR로 고정 시도, 실패하면
     UTF-8도 시도한다(포털이 형식을 바꿀 가능성에 대비)."""
@@ -73,14 +93,24 @@ def parse_file(path: str) -> list:
         except (ValueError, KeyError):
             continue
 
+        # 핵심 필드가 결측이면 레코드 전체를 버린다 — 기본값으로 채워
+        # "그럴듯한 가짜 관측"을 만들지 않는다. 강수량만 예외: 빈 문자열이
+        # ASOS 관례상 "무강수(0)"를 뜻하므로 결측이 아니다(_sf 그대로 사용).
+        temp = _sf_or_none(row.get("기온(°C)"))
+        humid = _sf_or_none(row.get("습도(%)"))
+        wind = _sf_or_none(row.get("풍속(m/s)"))
+        pres = _sf_or_none(row.get("해면기압(hPa)"))
+        if None in (temp, humid, wind, pres):
+            continue
+
         records.append({
             "timestamp":     dt.strftime("%Y%m%d%H00"),
-            "temperature":   _sf(row.get("기온(°C)"), 20.0),
+            "temperature":   temp,
             "precipitation": max(0.0, _sf(row.get("강수량(mm)"), 0.0)),
-            "humidity":      _sf(row.get("습도(%)"), 50.0),
-            "wind_speed":    _sf(row.get("풍속(m/s)"), 1.5),
+            "humidity":      humid,
+            "wind_speed":    wind,
             "wind_dir":      _sf(row.get("풍향(16방위)"), 0.0),
-            "pressure":      _sf(row.get("해면기압(hPa)"), 1013.0),
+            "pressure":      pres,
             "precip_type":   0,   # apihub 경로도 항상 0 — WW 코드 매핑 전 상태와 동일
             "stn":           stn,
             "status":        "SUCCESS_LIVE",

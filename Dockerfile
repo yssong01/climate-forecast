@@ -12,7 +12,9 @@ COPY requirements-app.txt .
 
 # CPU 전용 torch — 대시보드 추론(1회 forward pass)은 GPU가 필요 없고,
 # 기본 CUDA 휠은 이미지 용량을 수 GB 불필요하게 키운다.
-RUN pip install --no-cache-dir torch torchvision \
+# torchvision 은 뺀다 — Re축(위성)은 deploy_ablation.py 실측(2026-08-08)
+# 으로 기여도 0이 확인돼 predict.py 서빙 경로에서 완전히 제거했다.
+RUN pip install --no-cache-dir torch \
       --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements-app.txt
 

@@ -1,0 +1,36 @@
+# 핵심 프레임워크
+torch>=2.2.0
+torchvision>=0.17.0
+
+# 웹 대시보드
+streamlit>=1.35.0
+streamlit-autorefresh>=1.0.1
+plotly>=5.20.0
+
+# 데이터 처리
+numpy>=1.26.0
+pandas>=2.2.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# 텍스트 인코더 (Im 축 — Phase 3)
+sentence-transformers>=3.0.0
+transformers>=4.40.0
+
+# 음성 처리 (Phase 3)
+openai-whisper>=20240930
+librosa>=0.10.0
+
+# 위성 이미지 (Phase 3)
+sentinelsat>=1.3.0
+Pillow>=10.0.0
+
+# 벡터 DB / RAG (Phase 3)
+chromadb>=0.5.0
+
+# 강화학습 (Phase 3)
+stable-baselines3>=2.3.0
+gymnasium>=0.29.0
+
+# 문서 파싱 (Phase 3)
+pdfplumber>=0.11.0

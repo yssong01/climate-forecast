@@ -48,7 +48,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from train import collect_historical, record_to_vec, _parse_ts, STATION_NAMES
-from satellite_collector import SimulatedSatelliteCollector
+from interp_field_collector import InterpolatedFieldCollector
+from tendency_collector import TendencyCollector
+from weather_collector import STATION_COORDS
 from text_collector import SimulatedTextCollector
 from predict import load_model
 
@@ -174,8 +176,13 @@ def build_station_series(records: list, model, ckpt: dict,
     src = [records[i] for i in src_idx]
     tgt = [records[i + L] for i in src_idx]
 
-    sat = SimulatedSatelliteCollector()
-    txt = SimulatedTextCollector()
+    # 2026-08-09: 현재 체크포인트는 Re·Im축 모두 실제 데이터에 의존하므로
+    # 학습 때와 같은 컬렉터를 써야 한다. records(전체)로 이웃/과거 조회
+    # 인덱스를 만들고 src(페어링된 부분집합)에 대해 계산한다. im_dim 으로
+    # 구/신버전 체크포인트를 자동 판별한다.
+    sat = InterpolatedFieldCollector(records, STATION_COORDS)
+    txt = (TendencyCollector(records) if ckpt.get("im_dim", 384) < 128
+          else SimulatedTextCollector())
 
     # ── 동결 모델 순전파 ──────────────────────────────────────────
     vecs  = np.array([record_to_vec(r) for r in src], dtype=np.float32)

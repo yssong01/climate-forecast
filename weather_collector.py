@@ -263,14 +263,30 @@ class RobustWeatherCollector:
             except (ValueError, TypeError):
                 return default
 
+        def sf_or_none(key: str):
+            """결측(-9 이하 또는 파싱 불가)이면 None — 기본값으로 채워
+            '그럴듯한 가짜 관측'을 만들지 않는다. import_kma_fileset.py
+            의 _sf_or_none 과 같은 이유(2026-08-07 실측: 결측이 기본값
+            20.0°C 등으로 위장돼 학습 데이터에 섞여 들어갔던 사고)."""
+            try:
+                v = float(d.get(key, "-9"))
+                return None if v <= -8 else v
+            except (ValueError, TypeError):
+                return None
+
+        temp, humid, wind, pres = (sf_or_none("TA"), sf_or_none("HM"),
+                                   sf_or_none("WS"), sf_or_none("PS"))
+        if None in (temp, humid, wind, pres):
+            return None
+
         return {
             "timestamp":     tm,
-            "temperature":   sf("TA",  20.0),
+            "temperature":   temp,
             "precipitation": max(0.0, sf("RN", 0.0)),
-            "humidity":      sf("HM",  50.0),
-            "wind_speed":    sf("WS",   1.5),
+            "humidity":      humid,
+            "wind_speed":    wind,
             "wind_dir":      sf("WD",   0.0),
-            "pressure":      sf("PS", 1013.0),
+            "pressure":      pres,
             "precip_type":   0,   # ASOS WW 코드는 추후 매핑
             "stn":           self.stn,
         }

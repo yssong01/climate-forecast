@@ -1,0 +1,27 @@
+# Tri-CHEF 학습 전용 GPU 이미지 — Dockerfile(서빙용)과 분리한다.
+#
+# 서빙 이미지는 대시보드가 1회 forward pass만 하면 돼서 CPU 전용 torch로
+# 충분하고, 용량도 가볍게 유지해야 한다(Dockerfile 상단 주석 참고). 학습은
+# 정반대 요구사항이다 — 328,654쌍(2026-08-07 기준, 3.5년치 12개 관측소)에
+# MiniLM 인코딩 + 다축 역전파를 반복해야 해서 GPU 없이는 비현실적이다.
+# 하나의 Dockerfile로 두 요구사항을 다 만족시키려 하지 않는다.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements-app.txt .
+
+# 로컬 GPU: RTX 4070, 드라이버 CUDA 12.6 지원(2026-08-07 nvidia-smi 확인).
+# cu124 휠은 그보다 낮은 버전이라 호환된다.
+RUN pip install --no-cache-dir torch torchvision \
+      --index-url https://download.pytorch.org/whl/cu124 \
+    && pip install --no-cache-dir -r requirements-app.txt \
+    && pip install --no-cache-dir scipy matplotlib
+# scipy/matplotlib은 여기(학습 전용 이미지)에만 추가한다 — requirements-app.txt
+# 는 서빙 이미지와 공유하므로 분포 진단(distribution_diagnostics.py)처럼
+# 학습·분석 전용 도구의 의존성을 얹으면 안 된다.
+
+COPY *.py ./
+
+ENTRYPOINT ["python"]
+CMD ["train.py"]
