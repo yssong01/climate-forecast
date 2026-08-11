@@ -109,6 +109,17 @@ def predict(stn: str = "108",
     lead_hours = ckpt["lead_hours"]
 
     # 대상 관측소 + 보간용 이웃 11개 — 전부 같은 시각(현재) 스냅샷이 필요하다.
+    #
+    # 이웃은 SUCCESS_LIVE 만 보간장에 넣는다. 폴백 레코드를 그대로 쓰면
+    # FALLBACK_CACHED 는 "직전 값의 복제(+미세 노이즈)"를, FALLBACK_DEFAULT 는
+    # 합성 기본값(20.0°C / 1013hPa)을 실측 관측인 양 IDW 에 태우게 된다 —
+    # 가짜 데이터를 입력으로 쓰지 않는다는 규칙(CLAUDE.md 1절 5항, Re축이
+    # 정보량 0이었던 바로 그 원인)에 정면으로 어긋난다. 빼면 컬렉터가
+    # 설계대로 "정보 없음"으로 처리한다(이웃이 하나도 없으면 중립값 0.5).
+    #
+    # 대상 관측소 자신의 레코드는 폴백이어도 그대로 쓴다 — Z축 입력이 아예
+    # 없으면 예보를 만들 수 없고, 그 상태는 data_status 로 호출부에 전달돼
+    # 화면 상단 배지에 경고로 표시된다.
     record = None
     neighbor_records = []
     for other_stn in STATIONS.values():
@@ -118,16 +129,22 @@ def predict(stn: str = "108",
             continue
         if other_stn == stn:
             record = r
-        neighbor_records.append(r)
+        if r.get("status") == "SUCCESS_LIVE":
+            neighbor_records.append(r)
     if record is None:
         record = RobustWeatherCollector(stn=stn).fetch()
-        neighbor_records.append(record)
+        if record.get("status") == "SUCCESS_LIVE":
+            neighbor_records.append(record)
+    # get_image() 는 대상 관측소를 스스로 제외하므로, 실제 보간에 쓰이는 건
+    # 여기서 자신을 뺀 수다.
+    live_neighbors = sum(1 for r in neighbor_records if str(r.get("stn")) != stn)
 
     field_collector = InterpolatedFieldCollector(neighbor_records, STATION_COORDS)
 
     # Im축 인코더 종류에 따라 분기 — im_dim=384 면 구버전(MiniLM 텍스트),
     # 12 면 신버전(시간 경향 벡터). 재학습 전환기 동안 두 체크포인트 모두
     # 이 함수 하나로 서빙하기 위해 필요하다.
+    live_lags = None   # MiniLM 분기에는 시차 조회 자체가 없다
     if getattr(model, "im_dim", 384) >= 128:
         txt_vec = SimulatedTextCollector().encode_single(record)
     else:
@@ -138,9 +155,16 @@ def predict(stn: str = "108",
             try:
                 past = target_collector.fetch_at(
                     (now_ts - timedelta(hours=lag)).strftime("%Y%m%d%H00"))
-                tendency_records.append(past)
             except Exception:
                 continue
+            # 과거 시각도 SUCCESS_LIVE 만 받는다. 폴백은 요청한 시각의
+            # 타임스탬프를 달고 오므로 그대로 넣으면 TendencyCollector 가
+            # "그 시각에 실제 관측이 있었다"고 믿고 차분을 계산한다 —
+            # FALLBACK_CACHED 는 변화량 ≈ 0 을, FALLBACK_DEFAULT 는 거대한
+            # 가짜 변화량을 만들어낸다. 빼면 설계대로 0(변화 정보 없음)이 된다.
+            if past.get("status") == "SUCCESS_LIVE":
+                tendency_records.append(past)
+        live_lags = len(tendency_records) - 1
         txt_vec = TendencyCollector(tendency_records).encode_single(record)
 
     mean = np.array(ckpt["mean"], dtype=np.float32)
@@ -183,6 +207,17 @@ def predict(stn: str = "108",
         "observed_at":  observed_at,
         "target_time":  target_time,
         "data_status":  record.get("status"),   # SUCCESS_LIVE / FALLBACK_*
+        # 실측으로 채워진 보조 입력의 개수. 대상 관측소의 status 만으로는
+        # Re·Im축이 얼마나 채워졌는지 알 수 없다 — 자기 조회는 성공했는데
+        # 이웃·과거 조회가 예산 상한이나 API 장애로 폴백된 상태가 가능하다.
+        # 그 경우 보간장은 중립값(0.5), 경향벡터는 0으로 채워지므로 예보의
+        # 근거가 실제로 얇아진다. 화면이 그 사실을 말할 수 있게 내보낸다.
+        "input_coverage": {
+            "neighbors_live":  live_neighbors,
+            "neighbors_total": len(STATIONS) - 1,
+            "lags_live":       live_lags,
+            "lags_total":      len(LAGS_HOURS) if live_lags is not None else None,
+        },
         "current": {
             "temperature":   record.get("temperature"),
             "precipitation": record.get("precipitation"),

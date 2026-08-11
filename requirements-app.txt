@@ -1,13 +1,19 @@
-# 대시보드/추론 서빙 전용 최소 의존성.
-# requirements.txt(전체 연구 환경: whisper, chromadb, stable-baselines3 등
-# Phase 3-6 및 향후 확장용 포함)와 별도로 관리한다 — Docker 이미지 크기와
-# 빌드 시간을 대시보드 실행에 필요한 만큼으로 제한하기 위함이다.
-streamlit>=1.32.0
+# 대시보드/추론 서빙 전용 최소 의존성 — Dockerfile(로컬 서빙 이미지)과
+# CI(.github/workflows/ci.yml)가 이 파일을 쓴다.
+# 전체 연구 환경(whisper, chromadb, stable-baselines3 등 Phase 3-6 및 향후
+# 확장용)은 requirements-research.txt 에 따로 있다.
+#
+# Streamlit Community Cloud 배포는 저장소 루트의 requirements.txt 하나만
+# 보므로 그쪽이 배포판 기준이다. 두 파일의 내용은 일부러 같게 유지한다
+# (torch 는 Dockerfile 이 별도 --index-url 로 먼저 설치하므로 여기엔 없다).
+streamlit>=1.49.0
 streamlit-autorefresh>=1.0.1
 plotly>=5.20.0
 numpy>=1.26.0,<2
 pandas>=2.2.0
 requests>=2.31.0
 python-dotenv>=1.0.0
-sentence-transformers>=3.0.0
-transformers>=4.40.0
+
+# sentence-transformers / transformers 는 뺐다 — 현행 체크포인트는 im_dim=12
+# (시간 경향 벡터)라 predict.py 의 MiniLM 분기를 타지 않는다. 자세한 근거는
+# requirements.txt 의 같은 항목 주석 참고.

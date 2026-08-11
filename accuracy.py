@@ -112,6 +112,27 @@ def resolve_pending(lookup: dict, path: str = LOG_PATH) -> int:
     return resolved
 
 
+def log_summary(path: str = LOG_PATH) -> dict:
+    """
+    로그 파일 자체의 규모 — 적중률이 아니라 "표본이 얼마나 있고 얼마나
+    대조됐는지"를 본다. 배포판에서 특히 중요하다: Streamlit Community Cloud
+    의 파일시스템은 휘발성이라, 앱이 실행 중에 추가한 항목은 재시작하면
+    사라지고 저장소에 커밋된 스냅샷만 남는다. 화면이 "지금 보고 있는 통계가
+    어디까지 영구인지"를 말할 수 있어야 한다.
+
+    반환: {"total","resolved","pending","latest_target"}
+          latest_target 은 대조 완료된 항목 중 가장 최근 목표시각(없으면 None).
+    """
+    entries = _load(path)
+    resolved = [e for e in entries if e["actual_temp"] is not None]
+    return {
+        "total":         len(entries),
+        "resolved":      len(resolved),
+        "pending":       len(entries) - len(resolved),
+        "latest_target": max((e["target_time"] for e in resolved), default=None),
+    }
+
+
 def stats(station: str = None, recent_n: int = 20, path: str = LOG_PATH) -> dict:
     """
     누적/최근 적중률. station=None 이면 전 관측소 합산.

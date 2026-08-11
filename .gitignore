@@ -19,7 +19,27 @@ venv/
 env/
 
 # 캐시 / 임시 데이터
-cache/
+# 디렉터리를 통째로(`cache/`) 제외하면 그 안의 개별 파일을 부정 규칙으로
+# 되살릴 수 없다(git 사양) — 배포에 필요한 3개 파일만 예외로 두기 위해
+# `cache/*` 형태로 바꾼다. 여기 없는 파일(text_embeddings.npz 460MB,
+# historical_data_1y.json 69MB 등 학습용 원본)은 계속 제외된다.
+#
+# (주의: .gitignore 는 줄 끝 인라인 주석을 지원하지 않는다 — 패턴 뒤에 `#`을
+#  붙이면 그 텍스트까지 패턴에 포함돼 부정 규칙이 조용히 안 먹는다.
+#  2026-08-11 실측으로 확인. 주석은 반드시 독립된 줄에 쓴다.)
+#
+# 배포용 경량 이력 0.6MB — build_recent_window.py 산출
+# 예보 적중률 로그 — refresh_deploy_data.py 가 갱신
+#
+# latest_weather.json 은 일부러 넣지 않는다. 12개 관측소가 공유하는 단일
+# 파일인데 _fallback() 이 복사하면서 stn 을 덮어쓰지 않아, 커밋해두면 키가
+# 없는 사용자가 서울을 골라도 그 파일에 담긴 관측소(예: 184 제주)의 stn 이
+# 그대로 딸려 들어간다 → record_to_vec 이 제주 위경도를 모델 입력으로 쓴다.
+# 커밋하지 않으면 FALLBACK_DEFAULT 경로로 가고, 그쪽은 stn 을 올바르게
+# 채운다(합성값이지만 관측소 정체성은 일치).
+cache/*
+!cache/recent_window.json
+!cache/accuracy_log.json
 *.json.bak
 *.log
 
@@ -28,10 +48,14 @@ cache/
 dawnload/
 
 # 모델 체크포인트 (용량 커서 git 제외)
-checkpoints/
+# 서빙용 현행 체크포인트 1개(236KB)만 예외 — Streamlit Community Cloud 는
+# 저장소만 보고 배포하므로 이게 없으면 app.py 가 "체크포인트가 없습니다"로
+# 멈춘다. 부정 규칙은 자기를 가리는 `*.pt` 보다 뒤에 와야 효력이 있다.
+checkpoints/*
 *.pt
 *.pth
 *.ckpt
+!checkpoints/numerical_trichef.pt
 
 # ChromaDB 로컬 저장소
 chroma_db/

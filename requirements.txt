@@ -3,18 +3,31 @@
 # 확장용)은 requirements-research.txt 에 따로 있다. Streamlit Cloud는
 # 저장소 루트의 requirements.txt 하나만 보므로, 이 파일이 배포판 기준이다.
 #
-# torch는 CPU 전용 휠을 명시한다 — 인덱스를 안 밝히면 기본 PyPI가 CUDA
-# 빌드를 받으려다 용량 초과·설치 실패로 이어질 수 있다(Dockerfile도 같은
-# 이유로 별도 --index-url 로 설치한다).
+# torch 는 CPU 전용 휠을 버전까지 고정한다. --extra-index-url 만 주고 버전을
+# 비워두면 pip 가 두 인덱스 중 "더 높은 버전"을 고르므로, PyPI 쪽에 상위
+# 버전이 올라오는 순간 CUDA 빌드(nvidia-* 의존성 포함 수 GB)를 받으려다
+# Community Cloud 빌드가 용량으로 실패한다. `+cpu` 로컬 버전을 박으면
+# CPU 인덱스에서만 해결된다. 2.6.0 은 학습 컨테이너(tri-chef-train-gpu)와
+# 같은 버전이라 체크포인트 로드 경로가 학습·서빙에서 동일하다.
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch
+torch==2.6.0+cpu
 
-streamlit>=1.32.0
+# Streamlit Cloud 는 빌드 시점의 최신 버전을 설치한다 — 상한을 두지 않는
+# 대신 코드가 최신 API를 쓰게 맞춰뒀다. width="stretch"(구 use_container_width)
+# 가 1.49 부터라 하한을 올린다. 옛 인자는 "2025-12-31 이후 제거" 예고가 붙어
+# 있어, 그대로 두면 클라우드가 상위 버전을 집는 순간 앱이 깨진다.
+streamlit>=1.49.0
 streamlit-autorefresh>=1.0.1
 plotly>=5.20.0
 numpy>=1.26.0,<2
 pandas>=2.2.0
 requests>=2.31.0
 python-dotenv>=1.0.0
-sentence-transformers>=3.0.0
-transformers>=4.40.0
+
+# sentence-transformers / transformers 는 뺐다 — 현행 체크포인트는 im_dim=12
+# (시간 경향 벡터)라 predict.py 의 MiniLM 분기(im_dim>=128)를 타지 않고,
+# SimulatedTextCollector 의 모델 로드는 lazy 라 import 조차 발생하지 않는다.
+# 남겨두면 설치 용량·빌드 시간만 늘고 런타임에 450MB MiniLM 다운로드 위험이
+# 남는다. 구버전(384차원 MiniLM) 체크포인트로 서빙할 일이 생기면 되살릴 것:
+#   sentence-transformers>=3.0.0
+#   transformers>=4.40.0

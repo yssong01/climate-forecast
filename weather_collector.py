@@ -8,6 +8,7 @@ import os
 import json
 import time
 import hashlib
+import threading
 import requests
 import numpy as np
 from datetime import datetime, timedelta
@@ -26,6 +27,66 @@ load_dotenv()
 
 # apihub.kma.go.kr ASOS 지상시간관측 (매시 정각 관측, 약 10분 후 공개)
 ASOS_URL = "https://apihub.kma.go.kr/api/typ01/url/kma_sfctm2.php"
+
+# ── API 호출 예산 ──────────────────────────────────────────────────────
+#
+# 이 키는 누적 약 9,800건 시점에 차단된 이력이 있다(CLAUDE.md 4절). 로컬
+# 실행에서는 호출량이 사람의 조작 빈도에 묶여 있어 문제가 안 됐지만, 공개
+# URL로 배포하면 "접속자 수 × 페이지 갱신 주기"로 늘어나 규모가 달라진다.
+# 그래서 프로세스 차원의 하루 상한을 둔다.
+#
+# 상한에 걸려도 예외를 던지지 않고 _fallback() 으로 내려간다 — 호출부가
+# status(FALLBACK_CACHED / FALLBACK_DEFAULT)로 감지할 수 있고, app.py 는 그
+# 상태를 화면 상단에 그대로 표시하므로 "묵은 값이 실측으로 위장"되지 않는다.
+#
+# 카운터는 프로세스 메모리에만 있다 — 재시작하면 0으로 돌아가고, 여러
+# 프로세스가 같은 키를 쓰면 합산되지 않는다. 정확한 회계가 아니라 폭주
+# 방지용 안전장치다. (정확한 누적치가 필요하면 발급처 콘솔이 원본이다.)
+DAILY_CALL_BUDGET = int(os.getenv("KMA_DAILY_CALL_BUDGET", "3000"))
+
+_budget_lock = threading.Lock()
+_call_stats = {"date": None, "count": 0, "blocked": 0}
+
+
+def _reserve_call() -> bool:
+    """호출 1건을 예산에서 차감. 남아 있으면 True, 상한 초과면 False."""
+    today = datetime.now(KST).strftime("%Y%m%d")
+    with _budget_lock:
+        if _call_stats["date"] != today:
+            _call_stats.update(date=today, count=0, blocked=0)
+        if DAILY_CALL_BUDGET > 0 and _call_stats["count"] >= DAILY_CALL_BUDGET:
+            _call_stats["blocked"] += 1
+            return False
+        _call_stats["count"] += 1
+        return True
+
+
+def api_call_stats() -> dict:
+    """
+    오늘(KST) 이 프로세스가 쓴 API 호출 수. app.py 사이드바 표시용.
+    반환: {"date","count","blocked","budget"}
+    """
+    with _budget_lock:
+        return dict(_call_stats, budget=DAILY_CALL_BUDGET)
+
+
+def _empty_retry_wait() -> float:
+    """
+    응답은 200인데 관측 레코드가 아직 비어 있을 때 재시도 전 대기 시간(초).
+
+    수집 스크립트(collect_*.py)는 60초를 기다렸다 다시 받는 게 맞다 —
+    배치라 지연을 감수할 수 있고, 한 번 못 받은 시각은 영영 구멍으로 남는다.
+    반면 대시보드는 이 대기가 치명적이다: predict() 가 관측소 12곳을 순차
+    조회하므로 최악의 경우 12 × 60초 × (재시도 2회) = 24분간 화면이 멈춘다.
+    실제로 걸릴 수 있는 구간이 있다 — _obs_time() 은 매시 10분부터 그 시각
+    관측을 요청하는데, 발표가 1~2분 늦으면 정확히 이 경로를 탄다.
+    그래서 서빙(app.py)은 KMA_EMPTY_RETRY_WAIT=0 으로 대기를 없애고 즉시
+    폴백시킨다. 호출 시점에 읽으므로 import 순서에 의존하지 않는다.
+    """
+    try:
+        return max(0.0, float(os.getenv("KMA_EMPTY_RETRY_WAIT", "60")))
+    except ValueError:
+        return 60.0
 
 # 주요 관측소 번호 참고
 STATIONS = {
@@ -60,8 +121,16 @@ class RobustWeatherCollector:
         # KMA_STN: 관측소 번호 (기본 108=서울)
         self.stn = str(stn or os.getenv("KMA_STN", "108"))
         self.cache_dir = cache_dir
-        self.cache_file = os.path.join(cache_dir, "latest_weather.json")
-        self.hash_file  = os.path.join(cache_dir, "content_hashes.json")
+        # 폴백 캐시는 관측소별로 나눈다 — 왜 그래야 하는지는
+        # _load_disk_cache() 주석 참고. hash_file 도 같은 이유로 나눈다
+        # (_is_duplicate 가 timestamp 만으로 키를 만들어, 파일을 공유하면
+        # 같은 시각의 다른 관측소 응답이 서로 중복으로 판정된다. 현재
+        # _is_duplicate 는 호출되는 곳이 없어 이 파일은 생성되지 않지만,
+        # 나중에 연결할 때 같은 함정을 밟지 않도록 지금 갈라둔다).
+        self.cache_file = os.path.join(cache_dir, f"latest_weather_{self.stn}.json")
+        self.hash_file  = os.path.join(cache_dir, f"content_hashes_{self.stn}.json")
+        # 관측소 구분이 없던 시절의 공유 파일. stn 이 일치할 때만 이어받는다.
+        self.legacy_cache_file = os.path.join(cache_dir, "latest_weather.json")
         self._memory_cache: dict | None = None
         self._content_hashes: dict = {}
 
@@ -72,12 +141,34 @@ class RobustWeatherCollector:
     # ── 캐시 관리 ─────────────────────────────────────────────────
 
     def _load_disk_cache(self):
-        if os.path.exists(self.cache_file):
+        """
+        이 관측소의 마지막 성공 응답을 읽어 폴백용으로 들고 있는다.
+
+        예전에는 관측소 구분 없이 cache/latest_weather.json 하나를 12개
+        관측소가 공유했다. 그러면 A관측소 조회가 성공해 파일을 덮어쓴 뒤
+        B관측소 조회가 실패했을 때, A의 관측값이 A의 stn 을 그대로 달고
+        B의 폴백으로 돌아온다 — 화면은 "B관측소"라고 표시하는데
+        record_to_vec(train.py:166)은 레코드의 stn 으로 위경도를 뽑으므로
+        A의 좌표가 조용히 모델 입력에 들어간다(2026-08-11 확인).
+        app.py 는 12개 관측소를 매 예보마다 순차 조회하므로 이 교차오염은
+        드문 경우가 아니라 "일부 조회 실패 = 곧바로 발생"이었다.
+
+        구 공유 파일은 stn 이 일치할 때만 이어받는다. 남의 관측값으로
+        결측을 메우지 않는다는 원칙(CLAUDE.md 4절)의 같은 적용이다.
+        """
+        self._memory_cache = None
+        for path in (self.cache_file, self.legacy_cache_file):
+            if not os.path.exists(path):
+                continue
             try:
-                with open(self.cache_file, "r", encoding="utf-8") as f:
-                    self._memory_cache = json.load(f)
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
             except Exception:
-                self._memory_cache = None
+                continue
+            if str(data.get("stn")) != self.stn:
+                continue
+            self._memory_cache = data
+            return
 
     def _save_disk_cache(self, data: dict):
         self._memory_cache = data
@@ -130,6 +221,10 @@ class RobustWeatherCollector:
         params = {"tm": tm, "stn": self.stn, "help": "1", "authKey": self.api_key}
 
         for attempt in range(1, retries + 1):
+            if not _reserve_call():
+                print(f"[WARN] 일일 API 예산({DAILY_CALL_BUDGET}건) 초과 — "
+                      f"fetch_at {tm} 은 폴백으로 처리")
+                return self._fallback(tm)
             try:
                 resp = requests.get(ASOS_URL, params=params, timeout=timeout)
                 if resp.status_code == 200:
@@ -179,6 +274,10 @@ class RobustWeatherCollector:
         }
 
         for attempt in range(1, retries + 1):
+            if not _reserve_call():
+                print(f"[WARN] 일일 API 예산({DAILY_CALL_BUDGET}건) 초과 — "
+                      f"관측소 {self.stn} 은 폴백으로 처리")
+                return self._fallback(tm)
             try:
                 resp = requests.get(ASOS_URL, params=params, timeout=timeout)
                 if resp.status_code == 200:
@@ -187,9 +286,17 @@ class RobustWeatherCollector:
                         self._save_disk_cache(parsed)
                         parsed["status"] = "SUCCESS_LIVE"
                         return parsed
-                    # 데이터가 아직 없으면 1분 후 재시도
-                    print(f"[WARN] 관측 데이터 미준비 (시도 {attempt}/{retries}), 60초 대기")
-                    time.sleep(60)
+                    # 데이터가 아직 없으면 잠시 후 재시도. 대기 시간은
+                    # _empty_retry_wait() 참고 — 서빙에서는 0으로 두어
+                    # 화면이 수 분간 멈추는 것을 막는다.
+                    wait = _empty_retry_wait()
+                    if wait <= 0:
+                        print(f"[WARN] 관측 데이터 미준비 (시도 {attempt}/{retries}) "
+                              f"— 대기 없이 폴백")
+                        return self._fallback(tm)
+                    print(f"[WARN] 관측 데이터 미준비 (시도 {attempt}/{retries}), "
+                          f"{wait:.0f}초 대기")
+                    time.sleep(wait)
                     continue
                 else:
                     print(f"[WARN] HTTP {resp.status_code}: {resp.text[:150]}")

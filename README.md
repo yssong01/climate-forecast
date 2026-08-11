@@ -80,9 +80,59 @@ docker run -p 8501:8501 \
   tri-chef-app
 ```
 
+**코드 수정이 바로 반영되게 실행** — 위 명령은 이미지에 복사된 소스를 쓰므로,
+`.py`를 고쳐도 실행 중인 컨테이너 화면은 그대로다(재빌드해야 반영된다). 화면
+문구나 로직을 고치며 확인할 때는 소스도 함께 마운트한다.
+
+```bash
+docker run --rm -p 8501:8501 \
+  -v "$(pwd):/app" \
+  --env-file .env \
+  tri-chef-app
+```
+
+이렇게 띄우면 파일을 저장할 때마다 Streamlit 우측 상단에 "Source file changed"가
+뜨고 **Rerun**을 누르면 즉시 반영된다(항상 자동 적용하려면 ⋮ → Settings →
+Run on save).
+
 CI(`.github/workflows/ci.yml`)는 push/PR마다 수치 안정성 19개 항목
 (`test_phase34.py`), 경보 게이트 36개 항목(`test_phase36.py`), Dockerfile
 빌드를 자동 검증한다.
+
+### Streamlit Community Cloud 배포
+
+저장소 루트의 `requirements.txt` 하나만 보고 빌드된다. Main file path는
+`app.py`, Python 버전은 3.12(학습 컨테이너와 동일). Secrets에 아래를 넣는다.
+
+```toml
+KMA_API_KEY = "발급받은_키"
+KMA_STN = "108"
+```
+
+배포에 필요한 데이터는 저장소에 커밋되어 있다 — 체크포인트(236KB), 최근
+관측 창(0.6MB), 적중률 로그(1.9MB). 학습용 원본(`text_embeddings.npz`
+460MB, `historical_data_1y.json` 69MB)은 `.gitignore`가 계속 막는다.
+
+**API 호출량.** 예보 1건에 15회가 든다(대상 관측소 + 이웃 11곳 + 과거
+1·3·6시간). 이 키는 누적 약 9,800건에서 차단된 이력이 있어, 앱은 예측
+결과를 **관측소·관측시각 단위로 캐시**한다 — 같은 정시 안에서는 접속자가
+몇 명이든 새로고침을 몇 번 하든 추가 호출이 0이다. 여기에 프로세스 단위
+일일 상한(`KMA_DAILY_CALL_BUDGET`, 기본 3000)을 두고, 사용량을 사이드바에
+실측으로 표시한다. 상한을 넘기면 예외 대신 폴백으로 내려가며 화면이 그
+상태를 경고로 표시한다.
+
+**데이터 갱신 — 저장소가 원본이다.** Streamlit Cloud의 컨테이너
+파일시스템은 휘발성이라 앱이 쓴 파일은 재시작 시 사라진다. 그래서 갱신
+주체를 앱이 아니라 저장소로 둔다:
+`.github/workflows/refresh-data.yml`이 6시간마다
+`refresh_deploy_data.py`를 돌려 ① 최근 관측 창을 채우고 ② 적중률 로그의
+대기 항목을 실측과 대조한 뒤, 결과를 main에 되커밋한다. Streamlit Cloud가
+그 푸시를 감지해 자동 재배포하면서 새 데이터가 반영된다. 이 워크플로에도
+`KMA_API_KEY` 시크릿이 필요하다(회당 약 72건, 하루 약 288건).
+
+**공개 범위.** Community Cloud 앱은 기본이 공개 URL이다. 기상산업진흥법상
+예보업 등록 대상이 아닌 범위로 유지하려면 앱 설정에서 뷰어 허용목록
+(Private)으로 두는 것을 권한다 — 자세한 내용은 `CLAUDE.md` 6절.
 
 ## 정직한 한계
 

@@ -1,0 +1,84 @@
+name: Refresh deploy data
+
+# Streamlit Community Cloud 의 파일시스템은 휘발성이라, 앱이 실행 중에 쓴
+# 데이터는 재시작하면 사라지고 저장소에 커밋된 내용으로 되돌아간다. 그래서
+# "앱이 자기 데이터를 유지한다"가 아니라 "저장소가 원본이고 이 워크플로가
+# 저장소를 갱신한다"로 구조를 잡는다. 여기서 커밋이 발생하면 Streamlit Cloud
+# 가 푸시를 감지해 자동 재배포하고, 그 시점에 새 데이터가 반영된다.
+#
+# 갱신 대상 2개 (refresh_deploy_data.py 참고):
+#   · cache/recent_window.json — 최근 10일 관측 (스파크라인·추이 탭 입력)
+#   · cache/accuracy_log.json  — 예보 적중률 로그의 대기 항목 해소
+#
+# API 호출량: 관측소 12곳 × 경과 시간. 6시간 주기면 회당 약 72건, 하루 약
+# 288건 — 이 키가 차단됐던 지점(누적 약 9,800건, CLAUDE.md 4절)의 3% 수준.
+
+on:
+  schedule:
+    # cron 은 UTC 기준이다. 6시간 간격이라 KST 로 옮겨도 간격은 같다.
+    - cron: "5 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "요청 건수만 계산하고 API 호출·커밋 없이 종료"
+        type: boolean
+        default: false
+
+# 앞선 실행이 아직 돌고 있으면 겹쳐 돌리지 않는다 — 같은 파일을 두
+# 실행이 동시에 쓰면 나중 것이 앞선 수집분을 덮어쓴다.
+concurrency:
+  group: refresh-deploy-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # 갱신 결과를 main 에 되커밋하기 위해 필요
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # torch·streamlit 은 필요 없다 — 이 잡은 수집과 JSON 가공만 한다.
+      - name: Install collector dependencies
+        run: pip install requests python-dotenv numpy
+
+      # 키가 없으면 RobustWeatherCollector 가 조용히 폴백으로 내려가
+      # "성공 0건"인 채로 워크플로는 초록불이 된다. 그 상태를 실패로 만든다.
+      - name: Verify API key is configured
+        env:
+          KMA_API_KEY: ${{ secrets.KMA_API_KEY }}
+        run: |
+          if [ -z "$KMA_API_KEY" ]; then
+            echo "::error::KMA_API_KEY 시크릿이 없습니다. \
+          Settings → Secrets and variables → Actions 에 추가하세요."
+            exit 1
+          fi
+
+      - name: Refresh window and resolve pending forecasts
+        env:
+          KMA_API_KEY: ${{ secrets.KMA_API_KEY }}
+          # 이 잡은 배치라 관측 미발표 시 기다렸다 다시 받는 게 맞다
+          # (기본값 60초 유지). 서빙(app.py)만 0으로 내린다.
+          KMA_DAILY_CALL_BUDGET: "1000"
+        run: |
+          python refresh_deploy_data.py \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Commit refreshed data
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cache/recent_window.json cache/accuracy_log.json
+          if git diff --cached --quiet; then
+            echo "변경 없음 — 커밋 생략 (이미 최신이거나 신규 관측 0건)"
+            exit 0
+          fi
+          git commit -m "데이터 갱신: 최근 관측 창 + 적중률 로그 대조 (자동)"
+          git push

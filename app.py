@@ -1,5 +1,5 @@
 """
-app.py — Tri-CHEF 기후 예보 Streamlit 대시보드
+app.py — Tri-CHEF 기후 모델 출력 Streamlit 대시보드
 
 학습된 3축 파이프라인(predict.py)을 실시간 관측과 연결해 보여준다.
 모델 로드는 st.cache_resource 로 한 번만 수행 — Streamlit 은 위젯 조작마다
@@ -8,7 +8,7 @@ app.py — Tri-CHEF 기후 예보 Streamlit 대시보드
 sentence-transformers 로드 자체가 없어졌다 — 캐싱할 무거운 리소스는
 모델 하나뿐이다.)
 
-화면 구성은 탭 4개로 나뉜다 — 예보 추이 / 극한기상 / 성능 검증 / 모델 구조.
+화면 구성은 탭 4개로 나뉜다 — 출력값 추이 / 극한기상 / 성능 검증 / 모델 구조.
 숫자·그래프마다 그 근거(무엇을 어떻게 측정했는지)를 캡션이나 st.metric의
 help 툴팁으로 바로 옆에 붙인다 — "이 값이 왜 이렇게 나왔는지"를 화면만
 보고 답할 수 있어야 한다는 원칙(2026-08-09 논의)을 따른다.
@@ -18,14 +18,24 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# 관측이 아직 발표되지 않았을 때 수집기가 기다렸다 재시도하는 기본 대기(60초)를
+# 서빙에서는 없앤다. predict() 가 관측소 12곳을 순차 조회하므로 그대로 두면
+# 최악의 경우 화면이 20분 넘게 멈춘다(weather_collector._empty_retry_wait
+# 참고). 프로젝트 임포트보다 먼저 설정할 필요는 없지만 — 호출 시점에 읽는다 —
+# 의도를 드러내기 위해 파일 맨 앞에 둔다. setdefault 라 배포 환경에서
+# 명시적으로 다른 값을 주면 그쪽이 우선한다.
+os.environ.setdefault("KMA_EMPTY_RETRY_WAIT", "0")
+
 import streamlit as st
 import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 
-from weather_collector import STATIONS, STATION_COORDS
-from predict import load_model, predict, CHECKPOINT, EXTREME_EVENT_THRESH
+from weather_collector import STATIONS, STATION_COORDS, api_call_stats
+from predict import (
+    load_model, predict, CHECKPOINT, EXTREME_EVENT_THRESH, PRECIP_CLIP_THRESH,
+)
 import accuracy
 
 # ASOS 타임스탬프는 tz 정보 없는 KST 벽시계 표기다. 컨테이너 기본 시간대는
@@ -45,7 +55,7 @@ def _now_kst_naive() -> datetime:
 HIST_FILES = ["./cache/recent_window.json"]
 
 st.set_page_config(
-    page_title="Tri-CHEF 기후 예보",
+    page_title="Tri-CHEF 기후 모델 출력값",
     page_icon="🌦️",
     layout="centered",
 )
@@ -56,6 +66,37 @@ st.set_page_config(
 @st.cache_resource(show_spinner="모델 로드 중...")
 def get_model():
     return load_model(CHECKPOINT)
+
+
+def obs_hour_key() -> str:
+    """
+    지금 조회하면 받게 될 ASOS 관측 시각(KST, YYYYMMDDHH00).
+
+    weather_collector.RobustWeatherCollector._obs_time() 과 같은 규칙이다
+    (매시 정각 관측, 약 10분 후 공개 → 10분 전이면 직전 시각). 예측 캐시의
+    키로 쓰기 위해 여기서도 계산한다.
+    """
+    now = datetime.now(KST)
+    if now.minute < 10:
+        now -= timedelta(hours=1)
+    return now.strftime("%Y%m%d%H00")
+
+
+# 출력값 1건을 만드는 데 API 호출 15회가 든다 — 대상 관측소 + 이웃 11곳(Re축
+# 공간보간장) + 대상 관측소의 1·3·6시간 전(Im축 경향벡터). 캐시가 없으면
+# 이 비용이 "접속자 수 × 페이지 갱신 횟수"로 곱해지는데, 이 인증키는 누적
+# 약 9,800건에서 차단된 이력이 있다(CLAUDE.md 4절).
+#
+# 캐시 키에 관측 시각을 넣어 호출량을 시계에 묶는다 — 같은 정시 안에서는
+# 몇 명이 몇 번을 새로고침하든 결과를 재사용하므로 추가 호출이 0이다.
+# 관측소당 시간당 15회가 상한이고, 이는 자동 갱신 주기와 무관하다.
+# 애초에 ASOS 는 매시 정각 관측이라 같은 시각을 다시 조회해도 같은 값이다.
+#
+# model/ckpt 는 언더스코어 접두어로 넘긴다 — Streamlit 이 해시 대상에서
+# 제외하는 규약이다(torch 모듈은 해시할 수 없다).
+@st.cache_data(ttl=3600, show_spinner="관측 조회 중... (12개 관측소)")
+def cached_predict(stn: str, obs_hour: str, _model, _ckpt) -> dict:
+    return predict(stn=stn, model=_model, ckpt=_ckpt)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -82,6 +123,34 @@ def recent_series(history: dict, stn: str, hours: int = 72) -> list:
             if s == stn and datetime.strptime(ts[:12], "%Y%m%d%H%M") >= cutoff]
     rows.sort(key=lambda r: r["timestamp"])
     return rows
+
+
+def history_age_hours(history: dict) -> float | None:
+    """
+    창(recent_window.json)에서 가장 최근 관측이 몇 시간 전 것인지.
+
+    배포판에서 이 값이 계속 커지면 갱신 경로가 끊겼다는 뜻이다 — 클라우드
+    컨테이너는 파일을 유지하지 못하므로, 창을 채우는 주체는 앱이 아니라
+    저장소를 갱신하는 GitHub Actions(refresh-data.yml)다. 화면에 그대로
+    노출해 "묵은 창"을 조용히 넘기지 않는다. 창이 비었으면 None.
+    """
+    if not history:
+        return None
+    latest = max(datetime.strptime(ts[:12], "%Y%m%d%H%M") for _, ts in history)
+    return (_now_kst_naive() - latest).total_seconds() / 3600
+
+
+@st.cache_resource(show_spinner=False)
+def accuracy_baseline() -> dict:
+    """
+    이 프로세스가 뜬 시점의 적중률 로그 상태 = 저장소에 커밋된 스냅샷.
+
+    이후 앱이 추가하는 항목(record_prediction)은 컨테이너가 살아 있는
+    동안만 존재한다 — 재시작하면 여기 담긴 상태로 되돌아간다. 그 차이를
+    화면에서 구분해 보여주기 위해 시작 시점 값을 잡아둔다.
+    cache_resource 라 세션이 아니라 프로세스 단위로 한 번만 계산된다.
+    """
+    return accuracy.log_summary()
 
 
 def render_station_map(stations: dict, selected_stn: str) -> str | None:
@@ -125,7 +194,7 @@ def render_station_map(stations: dict, selected_stn: str) -> str | None:
         paper_bgcolor="rgba(0,0,0,0)",
     )
     event = st.sidebar.plotly_chart(
-        fig, use_container_width=True, key="station_geo_map",
+        fig, width="stretch", key="station_geo_map",
         config={"scrollZoom": False, "displayModeBar": False},
         on_select="rerun", selection_mode="points",
     )
@@ -147,7 +216,7 @@ def event_gauge(label: str, prob: float | None, thresh: float, color: str):
         cliponaxis=False,   # 확률이 100%에 가까우면 라벨이 플롯 경계에서 잘리는 것 방지
     ))
     fig.add_vline(x=thresh * 100, line_dash="dot", line_color="#B0413E",
-                 annotation_text=f"경보 임계값 {thresh:.0%}", annotation_position="top")
+                 annotation_text=f"판정 임계값 {thresh:.0%}", annotation_position="top")
     fig.update_layout(
         xaxis=dict(range=[0, 100], title=None, showticklabels=True, ticksuffix="%"),
         yaxis=dict(showticklabels=False),
@@ -159,7 +228,7 @@ def event_gauge(label: str, prob: float | None, thresh: float, color: str):
         f'margin-bottom:0.2rem;">{label}</div>',
         unsafe_allow_html=True,
     )
-    st.plotly_chart(fig, use_container_width=True, config={"staticPlot": True})
+    st.plotly_chart(fig, width="stretch", config={"staticPlot": True})
 
 
 # ── 사이드바 ──────────────────────────────────────────────────────
@@ -200,6 +269,11 @@ st.sidebar.caption(
     "이 관측소의 과거 1·3·6시간 전 값을 새로 조회합니다. **모델을 다시 "
     "학습시키는 게 아니라, 그 값으로 추론만 새로 수행**합니다."
 )
+st.sidebar.caption(
+    "단, 관측은 매시 정각에 한 번뿐이고 약 10분 뒤 공개됩니다. 그래서 **같은 정시 "
+    "안에서 다시 실행하면 새로 조회하지 않고 직전 결과를 재사용**합니다 — 갱신 주기를 "
+    "짧게 잡아도 API 호출이 늘지 않고, 대신 새 값도 정시가 바뀌어야 나옵니다."
+)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**관측소 위치** — 지도에서 도시를 클릭해도 선택됩니다")
@@ -232,12 +306,25 @@ stn = st.session_state.stn
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    "ASOS 지상관측은 매시 정각 관측 후 약 10분 뒤 공개됩니다. "
-    "갱신 주기를 너무 짧게 두어도 새 데이터가 없을 수 있습니다."
+    "출력값 한 건마다 12개 관측소를 모두 조회합니다 — 선택한 관측소는 계산 입력으로, "
+    "나머지 11개는 '모델 구조' 탭에서 설명하는 공간 축(Re) 계산에 쓰입니다."
 )
+
+# API 호출량을 숨기지 않는다. 이 인증키는 누적 약 9,800건에서 차단된 적이
+# 있어(CLAUDE.md 4절) 사용량이 관리 대상이고, "얼마나 쓰고 있는지"를 추측이
+# 아니라 실측으로 보여줘야 상한 설정이 근거를 갖는다. 카운터는 프로세스
+# 메모리 기준이라 재시작하면 0으로 돌아간다 — 그 사실도 같이 적는다.
+#
+# 자리만 잡아두고 예측이 끝난 뒤에 채운다 — 사이드바는 스크립트 순서상
+# 예측보다 먼저 실행되므로, 여기서 바로 읽으면 이번 실행의 호출분이 빠진
+# "한 박자 늦은 값"이 표시된다(첫 실행에서 실시간 조회 15회를 하고도 0건으로
+# 보였다 — 2026-08-11 실측).
+st.sidebar.markdown("---")
+api_usage_slot = st.sidebar.empty()
 st.sidebar.caption(
-    "12개 관측소 모두 매 예보마다 조회됩니다 — 대상 관측소는 예측 입력으로, "
-    "나머지 11개는 아래 '모델 구조' 탭에서 설명하는 공간보간장(Re축) 계산에 쓰입니다."
+    "이 앱 프로세스가 시작된 뒤의 누적치입니다(재시작 시 0으로 초기화). "
+    "상한을 넘기면 새 조회 대신 마지막 성공값으로 내려가고, 화면 상단 배지가 "
+    "그 상태를 표시합니다."
 )
 
 
@@ -252,10 +339,18 @@ if not os.path.exists(CHECKPOINT):
 
 try:
     model, ckpt = get_model()
-    result = predict(stn=stn, model=model, ckpt=ckpt)
+    result = cached_predict(stn, obs_hour_key(), model, ckpt)
 except Exception as e:
     st.error(f"예측 실패: {e}")
     st.stop()
+
+# 이번 실행의 조회분까지 반영해 사이드바 사용량을 채운다(위 api_usage_slot 참고).
+_calls = api_call_stats()
+api_usage_slot.caption(
+    f"**API 호출** — 오늘 {_calls['count']}건"
+    + (f" / 상한 {_calls['budget']}건" if _calls["budget"] > 0 else " (상한 없음)")
+    + (f" · 상한 초과로 폴백 {_calls['blocked']}건" if _calls["blocked"] else "")
+)
 
 # 제목부터 현재 관측값(기온~기압)까지는 스크롤해도 상단에 고정된다 —
 # 탭 내용은 길어질 수 있는데, "지금 어디를 보고 있는지"(관측소·현재값)는
@@ -274,7 +369,7 @@ except Exception as e:
 st.markdown(
     """
     <style>
-    /* Streamlit 기본값은 툴바 아래 여백이 커서(약 6rem) "환경 예보" 위로
+    /* Streamlit 기본값은 툴바 아래 여백이 커서(약 6rem) "기후 모델 출력값" 위로
        빈 공간이 크게 남는다 — 줄인다. 헤더가 이 컨테이너의 자연스러운
        위치를 기준으로 접히므로, 여기를 줄이면 스크롤 유무와 상관없이
        같이 줄어든다. */
@@ -328,11 +423,46 @@ with st.container(key="status_badge"):
     else:
         st.info(f"{status} · {result['observed_at']}")
 
+# 예측 결과는 관측 시각 단위로 캐시된다(cached_predict). 그래서 조회가
+# 실패해 폴백으로 내려간 결과도 그 정시 동안 그대로 남는다 — 자동으로
+# 재시도하게 만들면 API 가 계속 죽어 있을 때 갱신 주기마다 15회씩 호출을
+# 쏟아내므로, 재시도는 사람이 누를 때만 일어나게 한다.
+if str(result.get("data_status", "")).startswith("FALLBACK"):
+    if st.button("🔄 실시간 조회 다시 시도", help="캐시된 결과를 버리고 API를 다시 호출합니다"):
+        cached_predict.clear()
+        st.rerun()
+
+# 대상 관측소 조회가 성공해도 이웃(Re축)·과거(Im축) 조회가 실패하면 출력값의
+# 근거가 얇아진다 — 그 축 입력이 중립값으로 채워지기 때문이다. 배지 하나로는
+# 드러나지 않으므로 별도로 알린다.
+_cov = result.get("input_coverage") or {}
+_cov_msgs = []
+if _cov.get("neighbors_total") and _cov["neighbors_live"] < _cov["neighbors_total"]:
+    _cov_msgs.append(
+        f"공간보간장(Re축): 이웃 관측소 {_cov['neighbors_live']}/{_cov['neighbors_total']}곳만 실측"
+        + (" — 보간 격자가 중립값(0.5)으로 채워졌습니다"
+           if _cov["neighbors_live"] == 0 else "")
+    )
+if _cov.get("lags_total") and _cov["lags_live"] < _cov["lags_total"]:
+    _cov_msgs.append(
+        f"시간경향벡터(Im축): 과거 시점 {_cov['lags_live']}/{_cov['lags_total']}개만 실측"
+        + (" — 경향이 전부 0(변화 정보 없음)으로 처리됐습니다"
+           if _cov["lags_live"] == 0 else "")
+    )
+if _cov_msgs:
+    st.warning(
+        "**보조 입력 일부가 실측으로 채워지지 않았습니다.** "
+        + " · ".join(_cov_msgs)
+        + "  \n결측을 추정값으로 메우지 않고 중립값으로 두기 때문에, 이 출력값은 "
+          "그만큼 근거가 얇습니다.",
+        icon="⚠️",
+    )
+
 with st.container(key="sticky_header"):
-    st.title("🌦️ 환경 예보")
+    st.title("🌦️ 기후 모델 출력값")
     # 반응형으로 줄바꿈되어 창 폭에 관계없이 전체 내용이 보이도록 한다
     # (2026-08-10) — 말줄임표로 자르지 않는다.
-    st.caption("3축 Tri-CHEF 파이프라인(공간보간·시간경향·수치센서) 기반 +6시간 예보")
+    st.caption("지상 관측값 3축(주변·흐름·지금)을 합쳐 +6시간 뒤 기온·강수를 계산한 값입니다 — 기상청 예보가 아닙니다")
 
     st.subheader(f"{result['station_name']} ({result['station_code']})")
 
@@ -442,14 +572,35 @@ components.html(
 )
 
 tab_trend, tab_extreme, tab_perf, tab_model = st.tabs(
-    ["📈 예보 추이", "🚨 극한 기상", "✅ 성능 검증", "🧭 모델 구조"]
+    ["📈 출력값 추이", "🚨 극한 기상", "✅ 성능 검증", "🧭 모델 구조"]
 )
 
-# ── 탭 1: 예보 추이 ──────────────────────────────────────────────
+# ── 탭 1: 출력값 추이 ──────────────────────────────────────────────
 
 with tab_trend:
     history = load_merged_history()
     series = recent_series(history, stn, hours=72)
+
+    # 관측 이력 창의 신선도를 명시한다. 배포 환경에서는 앱이 이 파일을
+    # 유지할 수 없고(컨테이너 파일시스템 휘발), 저장소를 갱신하는
+    # GitHub Actions(refresh-data.yml)가 유일한 공급자다. 그 경로가 끊기면
+    # 차트가 조용히 비어가는 대신 왜 비는지 화면에서 말하게 한다.
+    _age = history_age_hours(history)
+    if _age is None:
+        st.warning(
+            f"관측 이력 창(`{HIST_FILES[0]}`)이 비어 있습니다. "
+            "로컬에서는 `python refresh_deploy_data.py`, 배포판에서는 "
+            "GitHub Actions의 **Refresh deploy data** 워크플로가 이 파일을 채웁니다.",
+            icon="⚠️",
+        )
+    elif _age > 12:
+        st.warning(
+            f"관측 이력 창의 최신 데이터가 **{_age:.0f}시간 전** 것입니다 — "
+            "갱신 경로가 멈췄을 수 있습니다(정상은 6시간 이내). "
+            "차트의 '현재'는 위 헤더의 실시간 관측값이고, 아래 곡선은 이 창에서 "
+            "그립니다. GitHub Actions의 **Refresh deploy data** 실행 이력을 확인하세요.",
+            icon="⚠️",
+        )
 
     if len(series) < 2:
         st.caption("최근 추이를 그리기엔 로컬 캐시에 데이터가 부족합니다 "
@@ -471,7 +622,7 @@ with tab_trend:
         fig.add_trace(go.Scatter(x=xs, y=temps, mode="lines", name="실측 기온",
                                  line=dict(color="#4C78A8", width=2)), row=1, col=1)
         fig.add_trace(go.Scatter(x=[xs[-1], tgt_x], y=[temps[-1], f["temperature"]],
-                                 mode="lines+markers", name="예보",
+                                 mode="lines+markers", name="모델 출력값",
                                  line=dict(color="#E2954F", width=1.5, dash="dot"),
                                  marker=dict(size=[0, 10], symbol="star")),
                      row=1, col=1)
@@ -479,7 +630,7 @@ with tab_trend:
         fig.add_trace(go.Bar(x=xs, y=precs, name="실측 강수",
                              marker_color="#4C78A8", showlegend=False), row=1, col=2)
         fig.add_trace(go.Scatter(x=[tgt_x], y=[f["precipitation"]], mode="markers",
-                                 name="예보 강수", marker=dict(size=10, symbol="star",
+                                 name="모델 출력값(강수)", marker=dict(size=10, symbol="star",
                                  color="#E2954F"), showlegend=False), row=1, col=2)
 
         fig.add_trace(go.Scatter(x=xs, y=hums, mode="lines", name="습도",
@@ -500,25 +651,34 @@ with tab_trend:
         fig.update_yaxes(rangemode="nonnegative", row=1, col=2)   # 강수
         fig.update_yaxes(rangemode="nonnegative", row=2, col=1)   # 습도
         fig.update_yaxes(rangemode="nonnegative", row=2, col=2)   # 기압
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"최근 {len(series)}시간 실측(로컬 캐시) + 별표는 이번 +{lead}시간 예보. "
-                   "기온·강수만 예보 대상 — 습도·기압은 참고용 실측치입니다.")
+        st.plotly_chart(fig, width="stretch")
+        st.caption(
+            f"선과 막대는 **실제 관측값**입니다 — 최근 72시간 중 관측이 있는 "
+            f"{len(series)}개 시점. ★ 별표가 이번 +{lead}시간 예측값입니다. "
+            f"예측 대상은 기온·강수 둘뿐이고, 습도·기압은 상황을 읽는 데 참고하시라고 "
+            f"함께 그린 관측값입니다(예측하지 않습니다)."
+        )
 
-    st.markdown("#### +%d시간 후 예보" % lead)
+    st.markdown("#### +%d시간 뒤 모델 출력값" % lead)
     fc1, fc2 = st.columns(2)
     fc1.metric(
-        "예상 기온", f"{f['temperature']:.1f} °C",
+        "기온 출력값", f"{f['temperature']:.1f} °C",
         delta=f"{f['temperature'] - c['temperature']:+.1f} °C (현재 대비)",
-        help="회귀 헤드(MLP) 출력. 학습 시 정규화한 값을 역변환한 것으로, "
-             "아래 '성능 검증' 탭의 검증 MAE만큼의 오차가 통계적으로 기대됩니다.",
+        help="모델은 절대 기온을 바로 맞히지 않고 '현재 기온에서 얼마나 변할지'를 "
+             "계산해 더합니다. 평균적으로 '성능 검증' 탭의 기온 MAE만큼 오차가 "
+             "예상됩니다.",
     )
     fc2.metric(
-        "예상 강수", f"{f['precipitation']:.1f} mm",
+        "강수 출력값", f"{f['precipitation']:.1f} mm",
         delta=f"{f['precipitation'] - c['precipitation']:+.1f} mm (현재 대비)",
         delta_color="inverse",
-        help="Hurdle 구조: sigmoid(강수여부) × softplus(강수량)의 곱. "
-             "강수 확률이 낮으면 양이 커도 최종값이 0에 가까워지고, "
-             "0.2mm 미만은 후처리로 0에 반올림합니다(미세한 노이즈 억제).",
+        help=f"'비가 올 확률' × '온다면 몇 mm'를 곱해서 나온 값입니다(Hurdle 구조 — "
+             f"'모델 구조' 탭에 그림과 설명). 확률이 낮으면 양이 커도 최종값이 0에 "
+             f"가까워집니다. {PRECIP_CLIP_THRESH}mm 미만은 0으로 반올림합니다.",
+    )
+    st.caption(
+        "⚠️ 강수량은 이 프로젝트에서 가장 약한 부분입니다 — '성능 검증' 탭의 "
+        "강수 MAE 설명을 함께 읽어주세요."
     )
 
 # ── 탭 2: 극한기상 ───────────────────────────────────────────────
@@ -530,29 +690,60 @@ with tab_extreme:
                    "재학습된 체크포인트를 사용하면 표시됩니다.")
     else:
         st.caption(
-            "각 확률은 회귀와 별개로 학습된 이진분류 헤드(공유 임베딩 → 전용 MLP → "
-            "sigmoid)의 출력입니다. 빨간 점선은 경보 판정 임계값 — 0.5가 아니라 "
-            "검증셋을 보정용/평가용으로 나눠 F1을 최대화하는 값을 고르고, 그 값이 "
-            "평가용에서도 유지되는지 확인한 뒤 정한 것입니다(과적합 임계값이 아님, "
-            "'모델 구조' 탭에 방법론 설명)."
+            "**이 막대는 확률입니다 — 발령된 경보가 아닙니다.** 회귀(기온·강수)와 "
+            "별개로 학습된 이진분류 헤드의 출력이고, 빨간 점선은 \"이 값을 넘으면 "
+            "사건으로 친다\"는 판정선입니다."
         )
         if ev.get("heatwave") is not None:
-            event_gauge("🔥 폭염 확률 (공식 특보 기준 라벨로 학습)",
-                       ev["heatwave"], EXTREME_EVENT_THRESH["heatwave"], "#E2954F")
+            event_gauge("🔥 폭염 확률", ev["heatwave"],
+                        EXTREME_EVENT_THRESH["heatwave"], "#E2954F")
         if ev.get("coldwave") is not None:
-            event_gauge("🥶 한파 확률 (공식 특보 기준 라벨로 학습)",
-                       ev["coldwave"], EXTREME_EVENT_THRESH["coldwave"], "#4C78A8")
+            event_gauge("🥶 한파 확률", ev["coldwave"],
+                        EXTREME_EVENT_THRESH["coldwave"], "#4C78A8")
         if ev.get("dust") is not None:
-            event_gauge("🌫️ 황사 확률 (PM10≥150㎍/㎥ 라벨로 학습, 6개 관측소만 커버)",
-                       ev["dust"], EXTREME_EVENT_THRESH["dust"], "#9C8060")
-            st.caption(
-                "⚠️ 황사는 PM10 실측이 있는 관측소(서울·인천·수원 등 6곳)만 라벨이 "
-                "있어 나머지 관측소는 학습 표본이 상대적으로 적습니다 — 다른 이벤트보다 "
-                "확률의 신뢰 구간이 넓다고 해석하는 것이 정확합니다."
-            )
+            event_gauge("🌫️ 황사 확률", ev["dust"],
+                        EXTREME_EVENT_THRESH["dust"], "#9C8060")
+
+        st.markdown("##### 각 확률이 무엇을 배운 것인가")
+        st.markdown(
+            "| 사건 | 학습에 쓴 정답(라벨)의 정의 | 판정선 |\n"
+            "|---|---|---|\n"
+            "| 🔥 폭염 | **기상청이 실제로 발표한 폭염주의보 기록**(해당 날짜·관측소). "
+            "기록을 구하지 못한 구간만 예외적으로, 발표기준 수치인 33°C를 "
+            "계산 대상 시각의 기온에 적용해 근사 | "
+            f"{EXTREME_EVENT_THRESH['heatwave']:.0%} |\n"
+            "| 🥶 한파 | **실제 발표된 한파주의보 기록**. 같은 방식으로, 기록이 없으면 "
+            "발표기준 수치인 −12°C를 대상 시각 기온에 적용해 근사 | "
+            f"{EXTREME_EVENT_THRESH['coldwave']:.0%} |\n"
+            "| 🌫️ 황사 | **PM10 1시간 평균 150㎍/㎥ 이상**(대기환경지수 '매우나쁨' "
+            "등급). 공식 황사주의보 기준(400㎍/㎥ 2시간 지속)은 보유 데이터에 사례가 "
+            "거의 없어 학습이 불가능했습니다 | "
+            f"{EXTREME_EVENT_THRESH['dust']:.0%} |\n"
+        )
         st.caption(
-            "강수(호우)는 이 탭이 아니라 위 '예보 추이' 탭의 강수량 예보 자체가 "
-            "Hurdle 분류 확률을 이미 곱해 반영하고 있어 별도 게이지를 두지 않았습니다."
+            "근사 폴백에 대한 정직한 단서: 기상청 발표기준은 원래 **일 최고기온**(폭염)· "
+            "**아침 최저기온**(한파)에 적용되는 값인데, 폴백 구간에서는 같은 수치를 "
+            "시간별 기온에 그대로 적용합니다. 즉 폴백으로 만들어진 라벨은 공식 특보와 "
+            "정확히 같은 정의가 아닙니다 — 발표 기록이 있는 구간에서는 이 근사를 쓰지 "
+            "않습니다."
+        )
+        st.caption(
+            "⚠️ **황사는 12개 관측소 중 6곳(서울·수원·춘천·대구·전주·광주)에만 PM10 "
+            "관측이 있습니다.** 나머지 6곳(인천·강릉·청주·대전·부산·제주)은 정답 자체가 "
+            "없어 학습에서 제외됐습니다 — 그 지역의 황사 확률은 다른 지역에서 배운 "
+            "패턴을 옮긴 것이므로 폭염·한파보다 신뢰도가 낮다고 보는 것이 정확합니다."
+        )
+        st.caption(
+            "판정선이 0.5가 아닌 이유: 이 사건들은 '일어나지 않음'이 압도적으로 많아 "
+            "(검증셋 양성 건수는 '성능 검증' 탭 표 참고) 0.5로 자르면 균형이 맞지 "
+            "않습니다. 그래서 검증 데이터를 둘로 갈라 한쪽에서 F1이 가장 높아지는 값을 "
+            "찾고, **한 번도 보지 않은** 다른 쪽에서도 성능이 유지되는지 확인한 뒤 "
+            "채택했습니다(자세한 절차는 '성능 검증' 탭)."
+        )
+        st.caption(
+            "호우(강수)는 이 탭에 게이지가 없습니다 — '출력값 추이' 탭의 강수량 값이 "
+            "이미 비 올 확률을 곱해서 나온 값이기 때문입니다(아래 '모델 구조' 탭의 "
+            "Hurdle 설명 참고)."
         )
 
 # ── 탭 3: 성능 검증 ──────────────────────────────────────────────
@@ -561,35 +752,129 @@ with tab_perf:
     val_temp = ckpt.get("val_temp_mae")
     val_precip = ckpt.get("val_precip_mae")
     if val_temp is not None:
-        st.markdown("#### 회귀 성능 (학습 시 검증셋 측정)")
-        vc1, vc2 = st.columns(2)
-        vc1.metric("기온 MAE", f"{val_temp:.2f} °C",
-                  help="평균절대오차 — 검증셋(학습에 안 쓴 20%)에서 |예측−실측|의 평균. "
-                       "학습 손실이 아니라 별도로 떼어둔 데이터로만 측정합니다.")
-        vc2.metric("강수 MAE", f"{val_precip:.2f} mm",
-                  help="같은 방식, 강수량 기준. 대부분의 시간이 무강수(0mm)라 "
-                       "이 값만으로는 강수 예측력을 온전히 판단하기 어렵고 "
-                       "아래 극한기상 F1을 함께 봐야 합니다.")
+        st.markdown("#### 회귀 성능 — 기온·강수를 숫자로 얼마나 맞히나")
         st.caption(
-            "MAE는 이상치(집중호우 한 건)에 민감하지 않은 대신, '항상 무강수를 "
-            "예측'해도 낮게 나올 수 있는 지표입니다 — 그래서 강수는 회귀(MAE)와 "
-            "별개로 분류 헤드(F1)를 따로 두고 검증합니다."
+            "**MAE(평균절대오차)** = |예측값 − 실제값|의 평균. 0에 가까울수록 좋고, "
+            "단위는 예측 대상과 같습니다(기온 °C, 강수 mm). 아래 값은 학습에 쓰지 않고 "
+            "따로 떼어둔 검증셋(전체의 20%)에서만 측정한 것입니다."
+        )
+        # MAE 는 기준선 없이는 우열을 말할 수 없는 지표다. 특히 강수는 대부분의
+        # 시각이 0mm 라 "항상 0mm 라고 답하는" 자명한 기준선의 MAE 도 아주 낮게
+        # 나오고, 이 프로젝트의 모델은 실제로 그 기준선보다 나쁘다. 그 사실을
+        # 가리는 표현을 쓰지 않는다는 것이 프로젝트 규칙이다.
+        _naive_temp   = ckpt.get("val_temp_naive_mae")
+        _naive_precip = ckpt.get("val_precip_naive_mae")
+
+        vc1, vc2 = st.columns(2)
+        vc1.metric(
+            "기온 MAE", f"{val_temp:.2f} °C",
+            delta=(f"{(_naive_temp - val_temp) / _naive_temp:+.1%} vs 기준선"
+                   if _naive_temp else None),
+            help=f"평균적으로 실제 기온과 이만큼 차이가 난다는 뜻입니다. 기준선은 "
+                 f"\"{lead}시간 뒤에도 지금과 같은 기온\"이라고 답하는 방식(퍼시스턴스)"
+                 + (f"으로, {_naive_temp:.2f}°C 입니다." if _naive_temp else "입니다."),
+        )
+        vc2.metric(
+            "강수 MAE", f"{val_precip:.2f} mm",
+            delta=(f"{(_naive_precip - val_precip) / _naive_precip:+.1%} vs 기준선"
+                   if _naive_precip else None),
+            help="기준선은 '항상 0mm'라고 답하는 방식입니다"
+                 + (f" ({_naive_precip:.2f}mm)." if _naive_precip else ".")
+                 + " 이 숫자만으로 판단하면 안 됩니다 — 아래 설명 참고.",
+        )
+        st.caption(
+            "**기준선(baseline)** 이란 학습을 전혀 하지 않은 자명한 방법입니다. "
+            "MAE는 그 자체로는 좋고 나쁨을 말해주지 않고, 기준선보다 나은지로 "
+            "판단해야 의미가 생깁니다. 위 기준선 값은 모델과 **똑같은 검증 표본**에서 "
+            "계산한 것입니다(다른 표본과 비교하면 표본 차이만으로 개선처럼 보입니다)."
+        )
+
+        if _naive_precip and val_precip > _naive_precip:
+            st.warning(
+                f"**강수는 기준선보다 나쁩니다.** 모델 {val_precip:.3f}mm vs "
+                f"'항상 0mm' {_naive_precip:.3f}mm — 즉 이 모델의 강수량 출력은 "
+                f"아무것도 예측하지 않는 것보다 평균 오차가 큽니다. 숨기지 않고 "
+                f"그대로 표시합니다. 강수는 MAE가 아니라 '비가 올지 안 올지 맞혔나'로 "
+                f"보는 것이 실용적이며, 그 지표는 아래 '출력값 적중률'의 강수 항목입니다.",
+                icon="⚠️",
+            )
+        elif _naive_precip is None:
+            st.warning(
+                f"**강수 MAE {val_precip:.2f}mm는 '잘 맞힌다'는 뜻이 아닙니다.** "
+                "대부분의 시각은 비가 오지 않으므로, 아무 계산 없이 **항상 0mm라고 "
+                "답하기만 해도** MAE는 비슷하게 낮게 나옵니다. 이 프로젝트의 학습 로그 "
+                "기준으로 현재 모델의 강수 MAE는 그 기준선보다 **나쁩니다**. "
+                "강수는 '비가 올지 안 올지 맞혔나'로 봐야 하며, 그 지표는 아래 "
+                "'출력값 적중률'의 강수 항목입니다.",
+                icon="⚠️",
+            )
+            st.caption(
+                "이 체크포인트에는 기준선 수치가 저장돼 있지 않아 화면에서 직접 "
+                "비교하지 못합니다(학습 시 계산은 하지만 저장하지 않던 버전입니다). "
+                "다음 재학습부터는 저장되어 위 지표 옆에 증감으로 표시됩니다."
+            )
+
+    # 극한기상 헤드의 분류 성능 — 체크포인트에 저장돼 있는데도 화면에 없었다
+    # (2026-08-11 점검에서 발견: 위 문단이 "아래 극한기상 F1을 함께 봐야
+    # 합니다"라고 안내하는데 정작 그 표가 없었다).
+    _em = ckpt.get("extreme_metrics") or {}
+    if _em:
+        st.markdown("---")
+        st.markdown("#### 극한기상 분류 성능")
+        st.caption(
+            "드문 사건은 정확도(accuracy)로 재면 안 됩니다. 예를 들어 폭염인 날이 전체의 "
+            "1%뿐이라면, 아무 계산 없이 **\"항상 폭염 아님\"이라고만 답해도 정확도가 "
+            "99%**가 나옵니다 — 폭염을 한 번도 맞히지 못했는데도 말입니다. "
+            "그래서 아래 세 지표로 봅니다."
+        )
+        st.markdown(
+            "- **정밀도(Precision)** — 모델이 \"일어난다\"고 한 것 중 실제로 일어난 비율. "
+            "낮으면 잘못 잡아낸 것(오탐)이 많다는 뜻입니다.\n"
+            "- **재현율(Recall)** — 실제로 일어난 것 중 모델이 잡아낸 비율. "
+            "낮으면 놓친 사건이 많다는 뜻입니다.\n"
+            "- **F1** — 위 둘의 조화평균. 한쪽만 좋고 다른 쪽이 나쁘면 함께 낮아지므로, "
+            "두 지표를 한 숫자로 요약할 때 씁니다. 0~1이고 1이 최고입니다."
+        )
+        _label_ko = {"heatwave": "🔥 폭염", "coldwave": "🥶 한파", "dust": "🌫️ 황사"}
+        _rows = ["| 사건 | 정밀도 | 재현율 | F1 | 검증셋 실제 발생 |",
+                 "|---|---|---|---|---|"]
+        for _k in ("heatwave", "coldwave", "dust"):
+            _m = _em.get(_k)
+            if not _m:
+                continue
+            _rows.append(
+                f"| {_label_ko[_k]} | {_m['precision']:.0%} | {_m['recall']:.0%} | "
+                f"{_m['f1']:.3f} | {_m['n_pos']:,}건 |"
+            )
+        st.markdown("\n".join(_rows))
+        st.caption(
+            "**주의 — 이 표의 값은 확률 0.5를 기준으로 계산한 것**이라, '극한 기상' 탭의 "
+            "빨간 판정선(폭염 "
+            f"{EXTREME_EVENT_THRESH['heatwave']:.0%} · 한파 {EXTREME_EVENT_THRESH['coldwave']:.0%} · "
+            f"황사 {EXTREME_EVENT_THRESH['dust']:.0%})을 적용했을 때의 성능과는 다릅니다. "
+            "판정선을 올리면 오탐(정밀도↑)은 줄고 놓침(재현율↓)은 늘어납니다. "
+            "표본이 적은 사건일수록 F1의 상한이 낮다는 점도 함께 봐야 합니다 — "
+            "황사가 폭염보다 낮은 것은 모델이 특별히 못해서라기보다 배울 사례 자체가 "
+            "적기 때문입니다."
         )
 
     st.markdown("---")
-    st.markdown("#### 임계값 재보정 — 과적합 검증 방법론")
+    st.markdown("#### 판정선은 어떻게 정했나 — 과적합을 피하는 절차")
     st.caption(
-        "극한기상 확률을 0/1로 나누는 임계값(위 '극한 기상' 탭의 빨간 점선)은 이렇게 "
-        "정했습니다: ① 검증셋을 보정용/평가용으로 무작위 50/50 분할(학습/검증 분할과 "
-        "별개의 시드 사용) ② 보정용에서 F1을 최대화하는 임계값 탐색 ③ 그 값을 "
-        "**한 번도 보지 않은** 평가용에 적용해 F1이 유지되는지 확인. 보정용에서만 좋고 "
-        "평가용에서 무너지면 과적합으로 판정해 폐기합니다 — 실제로 강수 임계값 "
-        "재보정은 이 검증을 통과하지 못해(순이득 &lt;0.01) 보수적인 값을 유지했고, "
-        "폭염·한파·황사는 통과해 채택했습니다."
+        "'극한 기상' 탭의 빨간 판정선은 다음 순서로 정했습니다. ① 검증 데이터를 "
+        "**보정용 / 평가용**으로 무작위 절반씩 나눕니다(학습·검증을 나눌 때와는 다른 "
+        "난수를 씁니다). ② 보정용에서만 F1이 가장 높아지는 값을 찾습니다. ③ 그 값을 "
+        "**한 번도 보지 않은** 평가용에 적용해 성능이 유지되는지 확인합니다."
+    )
+    st.caption(
+        "이 절차가 필요한 이유: 같은 데이터에서 값을 고르고 그 데이터로 채점하면 "
+        "그 데이터에만 맞춘 값이 좋아 보이게 됩니다(과적합). 실제로 **강수** 판정선 "
+        "재보정은 이 검증을 통과하지 못해(개선폭이 0.01에 못 미침) 기존의 보수적인 "
+        "값을 유지했고, 폭염·한파·황사만 통과해 새 값을 채택했습니다."
     )
 
     st.markdown("---")
-    st.markdown("#### 예보 적중률 (실측과 사후 대조)")
+    st.markdown("#### 출력값 적중률 (실측과 사후 대조)")
     st.caption(
         f"기온: 오차 ±{accuracy.HIT_TEMP_TOL}°C 이내면 적중 · "
         f"강수: {accuracy.PRECIP_THRESH}mm 기준 비/무비 판정 일치 시 적중"
@@ -606,7 +891,7 @@ with tab_perf:
 
     acc = accuracy.stats(station=stn)
     if acc["cum_n"] == 0:
-        st.caption("아직 실측과 대조된 예보가 없습니다 — "
+        st.caption("아직 실측과 대조된 출력값이 없습니다 — "
                    "`python backtest_accuracy.py`로 과거 데이터를 먼저 채울 수 있습니다.")
     else:
         a1, a2, a3, a4 = st.columns(4)
@@ -620,17 +905,40 @@ with tab_perf:
                  f"{acc['recent_precip']:.0%}" if acc["recent_precip"] is not None else "—")
         st.caption(f"누적 표본 {acc['cum_n']}건 ({result['station_name']} 기준). "
                    "이 지표는 검증셋 MAE와 다릅니다 — 실제 운영 시각에 실제로 조회 가능했던 "
-                   "데이터로만 만든 예보를, 그 시점 이후 확정된 실측과 대조한 것입니다.")
+                   "데이터로만 만든 출력값을, 그 시점 이후 확정된 실측과 대조한 것입니다.")
+
+    # 로그가 어디까지 영구인지 밝힌다. 배포 컨테이너의 파일시스템은
+    # 휘발성이라 앱이 방금 추가한 항목은 재시작하면 사라지고, 저장소에
+    # 커밋된 스냅샷만 남는다. 두 숫자를 합쳐 하나로 보여주면 "쌓이고 있다"는
+    # 인상을 주는데 실제로는 아니므로 나눠서 표시한다.
+    _base = accuracy_baseline()
+    _now_log = accuracy.log_summary()
+    _added = _now_log["total"] - _base["total"]
+    _snapshot_at = _base["latest_target"]
+    st.caption(
+        f"로그 구성 — 저장소 스냅샷 {_base['total']}건"
+        + (f"(최근 대조 {_snapshot_at[:4]}-{_snapshot_at[4:6]}-{_snapshot_at[6:8]} "
+           f"{_snapshot_at[8:10]}시)" if _snapshot_at else "")
+        + f" + 이 앱 실행 중 추가 {_added}건 · 대조 대기 {_now_log['pending']}건"
+    )
+    st.caption(
+        "실행 중 추가분은 이 프로세스가 살아 있는 동안만 남습니다 — 배포 환경의 "
+        "컨테이너 파일시스템은 재시작 시 저장소 상태로 되돌아갑니다. 영구 누적은 "
+        "GitHub Actions의 **Refresh deploy data** 워크플로가 담당합니다: 새 관측을 "
+        "받아 대기 항목을 실측과 대조한 뒤 결과를 저장소에 되커밋합니다."
+    )
 
 # ── 탭 4: 모델 구조 ──────────────────────────────────────────────
 
 with tab_model:
     gw = result["gate_weights"]
     if gw:
-        st.markdown("#### 축 배분 (동적 게이팅)")
+        st.markdown("#### 축 배분 — 이번 출력값에서 어느 축을 얼마나 봤나")
         st.caption(
-            "입력 조건에 따라 세 모달리티의 기여도를 매 예보마다 새로 계산합니다 "
-            "(고정 가중치가 아님). 합은 항상 100%입니다."
+            "세 축의 기여도는 고정값이 아니라 **값을 낼 때마다 입력을 보고 다시 계산**됩니다. "
+            "작은 신경망이 세 숫자를 내놓고 softmax(합이 1이 되도록 만드는 함수)를 "
+            "거치므로 합은 항상 100%입니다. 아래 '세 축을 하나로 합치는 식'에 나오는 "
+            "`w`가 바로 이 값입니다."
         )
         axes = ["수치 센서 (Z)", "시간경향벡터 (Im)", "공간보간장 (Re)"]
         values = [gw.get("w_z", 0) * 100, gw.get("w_im", 0) * 100, gw.get("w_re", 0) * 100]
@@ -644,30 +952,193 @@ with tab_model:
             xaxis=dict(range=[0, 100], title="배분 비율 (%)"),
             height=210, margin=dict(l=10, r=40, t=10, b=10),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.caption(f"정적 축 가중치 — {gw}")
 
     st.markdown("---")
     st.markdown("#### 3축이 각각 무엇을 보는가")
     st.markdown(
-        "- **Re축 (공간)** — 이 관측소를 뺀 나머지 11개 관측소의 실측값을 "
-        "거리가중(IDW)으로 보간한 공간장. *\"주변 지역은 지금 어떠한가?\"*\n"
-        "- **Im축 (시간)** — 같은 관측소의 1·3·6시간 전 대비 변화율(경향벡터). "
-        "*\"이 지점은 최근 어느 방향으로 움직이고 있는가?\"*\n"
-        "- **Z축 (현재)** — 이번 시각의 수치 스냅샷(기온·습도·기압·풍속 등). "
-        "*\"지금 이 순간 상태는 어떤가?\"*\n\n"
-        "세 축을 `s = √(A² + (αB)² + (φC)²)`로 융합해(논문 Eq.1) 회귀 헤드"
-        "(기온·강수)와 이진분류 헤드(폭염·한파·황사) 4갈래로 분기합니다."
+        "이 모델은 값을 하나 낼 때 **서로 다른 세 가지 질문**을 던지고, 그 답 셋을 "
+        "하나로 합칩니다. 세 질문은 이렇습니다."
+    )
+    st.markdown(
+        "| 축 | 던지는 질문 | 실제로 넣는 데이터 |\n"
+        "|---|---|---|\n"
+        "| **Z축** — 지금 여기 | *\"이 관측소는 지금 어떤 상태인가?\"* | "
+        "이번 시각 이 관측소의 관측값 그대로 — 기온·강수·습도·풍속·풍향·기압 등 "
+        "숫자 12개 |\n"
+        "| **Re축** — 주변 | *\"주변 지역은 지금 어떤가?\"* | 나머지 11개 관측소의 "
+        "**같은 시각** 관측값. 가까운 관측소일수록 크게 반영해 주변 상황을 지도처럼 "
+        "펼칩니다(거리가중 보간) |\n"
+        "| **Im축** — 흐름 | *\"어느 쪽으로 움직이는 중인가?\"* | 같은 관측소의 "
+        "**1·3·6시간 전과 비교한 변화량**. 기압이 떨어지는 중인지 오르는 중인지 같은 "
+        "정보 |\n"
     )
     st.caption(
-        "Re·Im 두 축은 원래 논문의 위성 이미지·기상 문서 자리였지만, 이 프로젝트의 "
-        "관측망(12개 지상 관측소, 위성·텍스트 데이터 없음)에는 그대로 적용할 수 "
-        "없었습니다. 실측으로 검증해보니(축 하나를 꺼서 출력이 그대로인지 비교) "
-        "원래 자리를 채웠던 대체 데이터가 정보량이 0이었다는 걸 확인했고, 이후 "
-        "'단일 시점 스냅샷(Z축)에서 유도할 수 없는 정보만 새 축에 담는다'는 "
-        "기준으로 위와 같이 재설계했습니다 — 공간(주변)과 시간(경향) 모두 "
-        "그 시점 하나만 봐서는 알 수 없는 정보라는 점이 Z축과의 수학적 독립성 근거입니다."
+        "**왜 Re·Im·Z라는 이름인가** — 아래에서 설명할 원 논문이 세 축을 복소수"
+        "(complex number)에 빗대어 배치했고, 그 이름을 그대로 물려받았습니다. "
+        "Re는 실수부(**Re**al), Im은 허수부(**Im**aginary)에서 온 말입니다. 복소수에서 "
+        "이 둘은 서로 **직각 방향**이라, \"세 축이 서로 겹치지 않는 정보를 담는다\"는 "
+        "설계 의도를 이름으로 드러낸 것입니다. 이름일 뿐이고 실제로 복소수 연산을 하지는 "
+        "않습니다 — 아래 식을 보면 전부 실수 계산입니다."
+    )
+    st.caption(
+        "세 질문이 서로 다른 것이 핵심입니다. 주변 관측소의 값(Re)과 몇 시간 전 대비 "
+        "변화량(Im)은 **이번 시각 이 관측소의 관측값(Z)만 봐서는 절대 계산해낼 수 "
+        "없는 정보**입니다. 그래서 축을 추가한 만큼 실제로 새 정보가 들어옵니다."
+    )
+    st.caption(
+        "Re·Im 두 축은 원래 논문에서 위성 이미지·기상 문서가 들어가던 자리입니다. "
+        "이 프로젝트의 관측망(지상 관측소 12곳, 위성·텍스트 없음)에는 그대로 옮길 수 "
+        "없어 대체 데이터를 넣었는데, 축 하나를 꺼도 출력이 전혀 바뀌지 않는 것을 "
+        "확인하고 **그 데이터가 아무 정보도 주지 않았다**는 결론을 냈습니다. 이후 "
+        "'이번 시각 하나만 봐서는 알아낼 수 없는 정보만 새 축에 담는다'는 기준으로 "
+        "다시 설계한 것이 지금의 공간·시간 축입니다 — 주변 관측소의 값과 몇 시간 전 "
+        "대비 변화량은 원리적으로 현재 시각의 스냅샷에서 계산해낼 수 없습니다."
+    )
+    _diag = ckpt.get("diagnostics") or {}
+    if _diag.get("cos_re_z_post") is not None:
+        st.caption(
+            "다만 '입력이 독립'인 것과 '모델이 배운 표현이 독립'인 것은 다릅니다. "
+            "학습 후 세 축 벡터가 이루는 각도를 코사인 유사도로 재보면 "
+            f"Re–Z {_diag['cos_re_z_post']:.2f} · Re–Im {_diag['cos_re_im_post']:.2f} · "
+            f"Im–Z {_diag['cos_im_z_post']:.2f} 입니다(0이면 완전히 다른 방향, 1이면 "
+            "같은 방향). 0은 아니지만 낮은 편으로, 축들이 서로 상당히 다른 것을 보고 "
+            "있다는 뜻입니다."
+        )
+
+    st.markdown("---")
+    st.markdown("#### 세 축을 하나로 합치는 식 (논문 Eq.1)")
+    st.caption(
+        "세 축은 각각 숫자 여러 개가 늘어선 **벡터**로 바뀐 뒤 아래 식으로 합쳐집니다. "
+        "기호가 낯설어 보이지만 하는 일은 단순합니다 — 아래에서 하나씩 풉니다."
+    )
+    st.latex(
+        r"s_i \;=\; \sqrt{\;(w_{Re}\,\cdot\,Re_i)^2 \;+\; (w_{Im}\,\cdot\,Im_i)^2"
+        r"\;+\; (w_{Z}\,\cdot\,Z_i)^2\;}"
+    )
+
+    _embed_dim = ckpt.get("embed_dim", 64)
+    _w_re, _w_im, _w_z = gw.get("w_re"), gw.get("w_im"), gw.get("w_z")
+    _fmt = (lambda v: f"{v:.3f}" if isinstance(v, (int, float)) else "—")
+    st.markdown(
+        "**기호 하나씩 읽기**\n\n"
+        "| 기호 | 읽는 법 | 무엇인가 | 이번 출력의 값 |\n"
+        "|---|---|---|---|\n"
+        f"| `Re`, `Im`, `Z` | 리 · 아이엠 · 제트 | 세 축을 각각 인공신경망에 통과시켜 "
+        f"얻은 **숫자 {_embed_dim}개짜리 목록**(벡터) | 축마다 {_embed_dim}개 |\n"
+        f"| `i` | 아이 | 그 목록에서 몇 번째 숫자인지 가리키는 번호 | "
+        f"1 ~ {_embed_dim} |\n"
+        f"| `w` | 더블유 (weight, 가중치) | 각 축을 **얼마나 믿을지**. 셋을 더하면 "
+        f"1이 됩니다 | Re {_fmt(_w_re)} · Im {_fmt(_w_im)} · Z {_fmt(_w_z)} |\n"
+        f"| `s` | 에스 | 합쳐진 결과. 이것도 숫자 {_embed_dim}개짜리 목록이고, "
+        f"이 목록 하나를 5개 예측이 나눠 씁니다 | {_embed_dim}개 |\n"
+        "| √ | 제곱근(루트) | 제곱을 되돌리는 연산 | — |\n"
+    )
+    st.markdown(
+        "**식이 하는 일을 순서대로**\n\n"
+        "1. **곱하기** — 각 축의 값에 그 축의 가중치를 곱합니다. 이번에 덜 믿기로 한 "
+        "축은 여기서 작아집니다.\n"
+        "2. **제곱** — 부호(＋/−)를 없애고 크기만 남깁니다. 두 축이 서로 반대 부호라서 "
+        "더할 때 상쇄돼 사라지는 일을 막습니다.\n"
+        "3. **더한 뒤 제곱근** — 직각삼각형의 빗변 길이를 구하는 계산과 같습니다 "
+        "(가로 3, 세로 4면 빗변 5). 세 축을 서로 직각인 방향으로 놓고 그 합성 크기를 "
+        "재는 것이라, 한 축이 커지면 결과도 커지되 다른 축이 이를 완전히 지우지는 "
+        "못합니다.\n\n"
+        f"이 3단계는 목록의 **각 자리마다 따로** 적용됩니다. 그래서 결과 `s`도 숫자 "
+        f"하나가 아니라 {_embed_dim}개짜리 목록입니다."
+    )
+    st.caption(
+        "각 축 벡터는 합쳐지기 전에 길이가 1이 되도록 맞춰집니다(정규화). 그래서 "
+        "어느 축이 원래 큰 숫자를 갖고 있었는지는 영향을 주지 않고, **패턴의 방향과 "
+        "가중치만으로** 결과가 정해집니다."
+    )
+
+    with st.expander("이 식은 어디서 왔나 — 원 논문과의 관계"):
+        st.markdown(
+            "이 프로젝트는 아래 논문의 **합치는 방식만** 빌려와 완전히 다른 분야에 "
+            "적용해 본 것입니다.\n\n"
+            "> **Tri-CHEF: Complex-Hermitian Embedding Fusion for Korean Multimodal "
+            "Retrieval**  \n"
+            "> Zenodo 프리프린트 (2026년 5월) · DOI [10.5281/zenodo.20034370]"
+            "(https://doi.org/10.5281/zenodo.20034370) · CC BY 4.0"
+        )
+        st.markdown(
+            "**원 논문은 날씨와 무관합니다.** 한국어 **검색(retrieval)** 시스템에 "
+            "관한 논문입니다 — 문서·이미지·영상·음성을 한 번에 검색할 때, 종류가 다른 "
+            "세 개의 AI 인코더가 내놓은 결과를 어떻게 하나의 점수로 합칠 것인가를 "
+            "다룹니다.\n\n"
+            "가장 흔한 방법은 **가중합**(각 점수에 가중치를 곱해 그냥 더하기)인데, "
+            "이러면 한 채널의 점수가 유난히 크면 그 채널이 최종 점수를 사실상 "
+            "독점해버립니다. 논문이 제안한 대안이 위에서 본 **제곱→합→제곱근** 형태이고, "
+            "이것이 논문에서 **식 1번(Eq.1)**입니다. 각 축을 제곱해서 더하므로 한 축이 "
+            "다른 축을 상쇄해 지워버리지 못하고, 세 축의 근거가 모두 최종 값에 남습니다."
+        )
+        st.markdown(
+            "**이 프로젝트가 바꾼 것**\n\n"
+            "| | 원 논문 | 이 프로젝트 |\n"
+            "|---|---|---|\n"
+            "| 하는 일 | 검색 (질의에 맞는 문서·이미지 찾기) | 기후 예측 (+"
+            f"{lead}시간 뒤 기온·강수) |\n"
+            "| 세 축에 넣는 것 | 사전학습 인코더 3종의 출력 | 지금 여기(Z) · 주변(Re) · "
+            "흐름(Im) 관측값 |\n"
+            "| 축 가중치 | 학습으로 정해 고정 | 값을 낼 때마다 입력을 보고 다시 계산 |\n"
+            "| 식의 출력 | 검색 순위를 매기는 점수 | 5가지 예측의 공통 입력 |\n"
+        )
+        st.markdown(
+            "논문의 원래 표기는 `s = √(A² + (αB)² + (φC)²)` 입니다. A·B·C가 각각 "
+            "Re·Im·Z축이고, α(알파)·φ(파이)는 **A(Re축)를 1로 놓았을 때 나머지 두 축의 "
+            "상대적 비중**입니다. 위쪽 식은 셋을 대등하게 `w`로 적었을 뿐 같은 식이며, "
+            "`α = w(Im) ÷ w(Re)`, `φ = w(Z) ÷ w(Re)` 로 서로 환산됩니다"
+            + (f" — 이번 출력에서는 α={gw['alpha']:.3f}, φ={gw['phi']:.3f} 입니다."
+               if isinstance(gw.get("alpha"), (int, float)) else ".")
+        )
+        st.caption(
+            "원 논문에서 α·φ는 학습이 끝나면 고정되는 상수입니다. 이 프로젝트에서는 "
+            "그렇게 뒀더니 **정보가 없는 축의 가중치가 오히려 커지는** 문제가 있어, "
+            "값을 낼 때마다 다시 계산하는 방식으로 바꿨습니다(위 '축 배분' 그래프가 그 "
+            "결과입니다). 논문을 그대로 따르지 않고 바꾼 지점이며, 바꾼 이유는 실측에서 "
+            "나왔습니다."
+        )
+
+    st.markdown("---")
+    st.markdown("#### 합쳐진 값에서 5가지 예측이 갈라져 나옵니다")
+    st.markdown(
+        f"위에서 만든 숫자 {_embed_dim}개짜리 목록 `s`는 **여기까지가 공통 과정**입니다. "
+        "이제 이 목록 하나를 6개의 작은 신경망이 각자 읽어서 5가지 예측을 만듭니다. "
+        "이렇게 공통 부분 뒤에 붙는 작은 신경망을 흔히 **헤드(head)** 라고 부릅니다 — "
+        "몸통 하나에 머리 여럿이 달린 모양이라 붙은 이름입니다.\n\n"
+        f"- **기온** — \"지금 기온에서 얼마나 변할지\"(변화량)를 구해 현재 기온에 "
+        f"더합니다. 기온 자체를 통째로 맞히려 하지 않는 이유는, +{lead}시간 정도면 "
+        f"\"지금과 비슷할 것\"이라는 답이 이미 상당히 정확하기 때문입니다. 그 위에 "
+        f"**얼마나 달라질지만** 학습하는 편이 유리합니다.\n"
+        "- **강수** — 헤드 두 개를 곱해서 만듭니다(바로 아래 설명).\n"
+        "- **폭염 · 한파 · 황사** — 각각 \"일어날 확률\" 하나씩. '극한 기상' 탭의 "
+        "막대가 이 값입니다."
+    )
+    st.caption(
+        "기온·강수처럼 **숫자 값**을 맞히는 것을 회귀(regression), 폭염·한파·황사처럼 "
+        "**일어난다/아니다**를 맞히는 것을 이진분류(binary classification)라고 부릅니다. "
+        "둘은 학습 방식이 달라서 헤드를 따로 둡니다."
+    )
+    st.markdown("**강수의 Hurdle 구조 — 왜 두 갈래를 곱하나**")
+    st.latex(r"\hat{y}_{precip} \;=\; \sigma(z_1)\;\times\;\mathrm{softplus}(z_2)")
+    st.markdown(
+        "- **ŷ**(와이햇, `y_precip`) — 최종 강수량 예측값. 모자(^)는 \"실제값이 아니라 "
+        "모델이 추정한 값\"이라는 관례 표기입니다.\n"
+        "- **z₁, z₂**(제트) — 위에서 만든 `s` 목록을 각각 다른 작은 신경망에 통과시켜 "
+        "나온 중간 숫자입니다. 아직 확률도 mm도 아닌 날것의 값이라, 아래 두 함수로 "
+        "각각 의미 있는 범위로 바꿔줍니다.\n"
+        "- **σ**(시그마 / 시그모이드) — 어떤 실수든 **0~1 사이**로 눌러 담는 함수. "
+        "그래서 `σ(z₁)`은 \"비가 올 확률\"로 읽습니다.\n"
+        "- **softplus**(소프트플러스) — 결과를 **항상 0보다 크게** 만드는 함수. "
+        "강수량은 음수가 될 수 없어서 씁니다. 더 단순한 방법(음수를 그냥 0으로 자르기)은 "
+        "잘린 구간에서 학습 신호가 끊겨버려 쓰지 않았습니다.\n"
+        "- **곱하는 이유** — 비가 올 확률이 0에 가까우면 예상량이 아무리 커도 최종값이 "
+        "0에 가까워집니다. \"올까 안 올까\"와 \"온다면 얼마나\"를 한 식에 담는 구조이고, "
+        "무강수가 대부분인 데이터에서 정확한 0을 내기 위한 장치입니다.\n"
+        f"- 마지막으로 {PRECIP_CLIP_THRESH}mm 미만은 0으로 반올림합니다(미세 노이즈 억제)."
     )
 
     st.markdown("---")
@@ -678,7 +1149,7 @@ with tab_model:
         f"1. **추론 입력** — 지금 이 순간의 관측값(+ 이웃 11개 관측소 + 과거 "
         f"1h/3h/6h)을 모델에 넣어 +{lead}시간 후를 예측합니다. 가중치는 건드리지 "
         f"않습니다.\n"
-        f"2. **적중률 기록(모니터링)** — 예보를 로그에 남겨두고 +{lead}시간 뒤 "
+        f"2. **적중률 기록(모니터링)** — 출력값을 로그에 남겨두고 +{lead}시간 뒤 "
         f"실제값이 들어오면 대조해 위 '성능 검증' 탭의 누적 적중률에 반영합니다. "
         f"**이 대조 결과는 모델을 바꾸지 않습니다** — 순수 사후 기록입니다.\n\n"
         f"모델을 갱신하려면(파인튜닝) 사람이 `train.py`를 다시 실행해 그동안 "
@@ -704,7 +1175,13 @@ with tab_model:
 
 st.markdown("---")
 st.caption(
-    "Tri-CHEF: 논문 Eq.1 s=√(A²+(αB)²+(φC)²) 기반 3축 기후 예보 파이프라인. "
-    "Re축은 12관측소 실측 공간보간장, Im축은 같은 관측소의 시간경향벡터 — "
-    "둘 다 실측 데이터에서 유도되며 시뮬레이션/합성 데이터가 아닙니다."
+    "Tri-CHEF — 공간(Re)·시간(Im)·현재상태(Z) 세 축을 논문 Eq.1로 합쳐 예측하는 "
+    "파이프라인입니다(식과 기호 설명은 '모델 구조' 탭). Re축은 12개 관측소의 실측 "
+    "공간보간장, Im축은 같은 관측소의 시간 변화율이며, 둘 다 실제 관측에서 나온 "
+    "값입니다 — 시뮬레이션이나 합성 데이터가 아닙니다."
+)
+st.caption(
+    "⚠️ **이 화면의 숫자는 모델 출력값이며 기상청의 공식 예보·특보가 아닙니다.** "
+    "연구·포트폴리오 목적으로 만든 것으로, 실제 방재 판단의 근거로 사용해서는 "
+    "안 됩니다. 공식 정보는 기상청(weather.go.kr)을 확인하세요."
 )

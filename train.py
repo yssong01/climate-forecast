@@ -812,6 +812,13 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "phi_learned":    w["phi"],
                 "diagnostics":    dict(model.last_diagnostics),
                 "extreme_metrics": extreme_metrics,
+                # 기준선을 체크포인트에 같이 넣는다 — MAE 는 기준선 없이는
+                # 우열을 말할 수 없는 지표인데, 지금까지는 학습 로그에만 찍고
+                # 저장하지 않아 app.py 가 "잘 맞힌 값"처럼 보이는 강수 MAE 를
+                # 비교 대상 없이 띄우고 있었다(2026-08-11 점검에서 발견).
+                # 두 값 모두 검증셋과 동일 표본에서 계산된 것이다.
+                "val_temp_naive_mae":   temp_naive,    # T(t+L) ≈ T(t) 퍼시스턴스
+                "val_precip_naive_mae": precip_naive,  # 상시 0mm 예측
             }
             torch.save({
                 **best_stats,
