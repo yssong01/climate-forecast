@@ -63,8 +63,29 @@ st.set_page_config(
 
 # ── 캐시된 리소스 — 세션당 한 번만 로드 ──────────────────────────────
 
+def ckpt_fingerprint() -> str:
+    """
+    체크포인트 파일의 신원(수정시각·크기). 캐시 키에 넣어 파일이 바뀌면
+    자동으로 새로 로드되게 한다.
+
+    왜 필요한가 — get_model() 을 인수 없이 @st.cache_resource 로 감싸면
+    캐시 키가 항상 같아서, 체크포인트를 새로 학습해 배포해도 **살아 있는
+    프로세스는 옛 모델을 계속 재사용**한다. 2026-08-11 재학습 배포에서
+    실제로 발생했다: 저장소에는 새 체크포인트가 올라갔는데 화면은 옛
+    수치(기온 1.27 / 폭염 F1 0.822)를 그대로 보여줬고, 기준선 증감도
+    "저장돼 있지 않다"로 표시됐다. cache_resource 는 스크립트 재실행은
+    물론 코드 갱신 후에도 같은 프로세스면 살아남기 때문이다.
+    """
+    try:
+        st_ = os.stat(CHECKPOINT)
+        return f"{st_.st_mtime_ns}:{st_.st_size}"
+    except OSError:
+        return "missing"
+
+
 @st.cache_resource(show_spinner="모델 로드 중...")
-def get_model():
+def get_model(fingerprint: str):
+    """fingerprint 는 캐시 무효화 전용 — 값 자체는 쓰지 않는다."""
     return load_model(CHECKPOINT)
 
 
@@ -276,7 +297,7 @@ st.sidebar.caption(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("**관측소 위치** — 지도에서 도시를 클릭해도 선택됩니다")
+st.sidebar.markdown("**관측소 위치** — 지도에서 도시 선택 가능")
 
 
 def _sync_stn_from_selectbox():
@@ -338,7 +359,7 @@ if not os.path.exists(CHECKPOINT):
     st.stop()
 
 try:
-    model, ckpt = get_model()
+    model, ckpt = get_model(ckpt_fingerprint())
     result = cached_predict(stn, obs_hour_key(), model, ckpt)
 except Exception as e:
     st.error(f"예측 실패: {e}")
@@ -839,9 +860,13 @@ with tab_perf:
         st.markdown("---")
         st.markdown("#### 극한기상 분류 성능")
         st.caption(
+            # 닫는 ** 뒤에 조사가 바로 붙으면(…99%**가) 마크다운이 강조를
+            # 닫지 못해 별표가 화면에 그대로 노출된다(2026-08-11 배포본에서
+            # '***항상'으로 깨져 보임). 강조 구간을 문장 끝까지 늘려 닫는
+            # ** 뒤에 공백이 오게 한다.
             "드문 사건은 정확도(accuracy)로 재면 안 됩니다. 예를 들어 폭염인 날이 전체의 "
-            "1%뿐이라면, 아무 계산 없이 **\"항상 폭염 아님\"이라고만 답해도 정확도가 "
-            "99%**가 나옵니다 — 폭염을 한 번도 맞히지 못했는데도 말입니다. "
+            "1%뿐이라면, 아무 계산 없이 **'항상 폭염 아님'이라고만 답해도 정확도가 99%가 "
+            "나옵니다** — 폭염을 한 번도 맞히지 못했는데도 말입니다. "
             "그래서 아래 세 지표로 봅니다."
         )
         st.markdown(
@@ -950,7 +975,7 @@ with tab_perf:
 with tab_model:
     gw = result["gate_weights"]
     if gw:
-        st.markdown("#### 축 배분 — 이번 출력값에서 어느 축을 얼마나 봤나")
+        st.markdown("#### 축 배분 — 이번 출력값에 대한 각 축의 기여도")
         st.caption(
             "세 축의 기여도는 고정값이 아니라 **값을 낼 때마다 입력을 보고 다시 계산**됩니다. "
             "작은 신경망이 세 숫자를 내놓고 softmax(합이 1이 되도록 만드는 함수)를 "
