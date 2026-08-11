@@ -765,21 +765,33 @@ with tab_perf:
         _naive_temp   = ckpt.get("val_temp_naive_mae")
         _naive_precip = ckpt.get("val_precip_naive_mae")
 
+        def _baseline_delta(model_mae, naive_mae):
+            """
+            기준선 대비 증감 문구. 부호만 붙이면 "-0.9% vs 기준선"이 "0.9%
+            더 좋다"로 읽힐 수 있다 — MAE 는 낮을수록 좋은 지표라 방향이
+            직관과 반대이기 때문이다. 그래서 숫자 뒤에 판정을 말로 붙인다.
+            부호는 유지해 Streamlit 이 색(초록/빨강)으로도 구분하게 둔다.
+            """
+            if not naive_mae:
+                return None
+            r = (naive_mae - model_mae) / naive_mae
+            return f"{r:+.1%} · " + ("기준선보다 정확" if r > 0 else "기준선 미달")
+
         vc1, vc2 = st.columns(2)
         vc1.metric(
             "기온 MAE", f"{val_temp:.2f} °C",
-            delta=(f"{(_naive_temp - val_temp) / _naive_temp:+.1%} vs 기준선"
-                   if _naive_temp else None),
+            delta=_baseline_delta(val_temp, _naive_temp),
             help=f"평균적으로 실제 기온과 이만큼 차이가 난다는 뜻입니다. 기준선은 "
                  f"\"{lead}시간 뒤에도 지금과 같은 기온\"이라고 답하는 방식(퍼시스턴스)"
                  + (f"으로, {_naive_temp:.2f}°C 입니다." if _naive_temp else "입니다."),
         )
         vc2.metric(
-            "강수 MAE", f"{val_precip:.2f} mm",
-            delta=(f"{(_naive_precip - val_precip) / _naive_precip:+.1%} vs 기준선"
-                   if _naive_precip else None),
+            # 강수는 0.17 vs 0.168 처럼 소수점 둘째 자리에서 같아 보인다 —
+            # 기준선과의 차이가 작을수록 자릿수를 늘려야 비교가 성립한다.
+            "강수 MAE", f"{val_precip:.3f} mm",
+            delta=_baseline_delta(val_precip, _naive_precip),
             help="기준선은 '항상 0mm'라고 답하는 방식입니다"
-                 + (f" ({_naive_precip:.2f}mm)." if _naive_precip else ".")
+                 + (f" ({_naive_precip:.3f}mm)." if _naive_precip else ".")
                  + " 이 숫자만으로 판단하면 안 됩니다 — 아래 설명 참고.",
         )
         st.caption(
@@ -790,12 +802,17 @@ with tab_perf:
         )
 
         if _naive_precip and val_precip > _naive_precip:
+            _gap = (val_precip - _naive_precip) / _naive_precip
             st.warning(
-                f"**강수는 기준선보다 나쁩니다.** 모델 {val_precip:.3f}mm vs "
-                f"'항상 0mm' {_naive_precip:.3f}mm — 즉 이 모델의 강수량 출력은 "
-                f"아무것도 예측하지 않는 것보다 평균 오차가 큽니다. 숨기지 않고 "
-                f"그대로 표시합니다. 강수는 MAE가 아니라 '비가 올지 안 올지 맞혔나'로 "
-                f"보는 것이 실용적이며, 그 지표는 아래 '출력값 적중률'의 강수 항목입니다.",
+                f"**강수는 아직 기준선을 넘지 못했습니다.** 모델 {val_precip:.4f}mm vs "
+                f"'항상 0mm' {_naive_precip:.4f}mm — 차이는 {_gap:.1%}입니다. 즉 이 모델의 "
+                f"강수량 출력은 아무것도 예측하지 않는 것보다 평균 오차가 (근소하게) 큽니다. "
+                f"숨기지 않고 그대로 표시합니다.\n\n"
+                f"원인은 구조적으로 추적됐습니다 — 극한기상 헤드가 3개로 늘면서 헤드들이 공유 "
+                f"표현을 두고 경쟁해 무강수 억제력이 약해졌습니다(초기 −25.6%). 가중치 하향과 "
+                f"데이터 확장(3.6년)으로 현재 수준까지 좁혔습니다. 강수는 MAE가 아니라 "
+                f"'비가 올지 안 올지 맞혔나'로 보는 것이 실용적이며, 그 지표는 아래 "
+                f"'출력값 적중률'의 강수 항목입니다.",
                 icon="⚠️",
             )
         elif _naive_precip is None:
