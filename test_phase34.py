@@ -103,7 +103,24 @@ num = torch.randn(4, 12)
 img = torch.rand(4, 4, 32, 32)
 txt = torch.randn(4, 384)
 pred = model(num, img, txt, collect_diagnostics=True)
-pred.sum().backward()
+
+# 손실은 train.py 의 실제 구성을 따라야 한다 — forward() 의 반환값 pred 에는
+# 회귀 출력(기온·강수)만 담기고, 극한기상 3종은 별도 BCE 항으로 학습된다
+# (train.py: EXTREME_BCE_WEIGHT). pred.sum() 만 역전파하면 극한 헤드 12개
+# 파라미터가 gradient 를 받지 못해 "모든 파라미터가 gradient 수신" 검사가
+# 실패한다 — 모델 결함이 아니라 이 테스트가 Phase 3-8/3-9 헤드 추가 이전
+# 기준에 머물러 있던 것이다(2026-08-11 확인, CI 적색의 원인).
+# extreme_event_probs() 는 @torch.no_grad() 가 붙은 서빙용 조회 메서드이므로
+# 학습 그래프에 연결되지 않는다. train.py 가 실제로 쓰는 것과 동일하게
+# _last_*_logit 원시 텐서를 손실에 더한다.
+_logits = [model._last_heatwave_logit, model._last_coldwave_logit,
+           model._last_dust_logit, model._last_rain_logit]
+n_extreme = sum(1 for t in _logits if t is not None and t.requires_grad)
+loss = pred.sum() + sum(t.sum() for t in _logits if t is not None)
+loss.backward()
+
+check("분류 헤드 logit 이 학습 그래프에 연결됨 (폭염·한파·황사·강수)",
+      n_extreme == 4, f"연결된 헤드 {n_extreme}개")
 
 bad = [n for n, p in model.named_parameters()
        if p.grad is not None and not torch.isfinite(p.grad).all()]
