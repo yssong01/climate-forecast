@@ -174,6 +174,22 @@ def accuracy_baseline() -> dict:
     return accuracy.log_summary()
 
 
+# 지도 지형색 — 어느 테마에서도 그대로 쓰는 반투명 회색.
+#
+# 예전엔 어두운 테마 기준의 불투명 색(#242830 등)을 박아 넣었다. 그래서 Light
+# 로 바꾸면 사이드바는 흰데 지도만 검은 판으로 남았다(2026-08-11 사용자 실측
+# 스크린샷). st.context.theme 로 테마를 읽어 색을 고르는 방법도 재봤는데,
+# 테마 전환은 rerun 을 일으키지 않아(실측: 전환 직후에도 st.context.theme.type
+# 이 여전히 dark, 수동 rerun 후에야 light) 다음 자동 갱신까지 지도가 어긋난
+# 채 남는다.
+# 반투명이면 뒤의 사이드바 배경이 그대로 비쳐 어느 테마든 즉시 맞는다 —
+# 파이썬이 테마를 알 필요가 없어진다.
+_MAP_LAND = "rgba(128, 140, 158, 0.28)"
+_MAP_OCEAN = "rgba(128, 140, 158, 0.08)"
+_MAP_LINE = "rgba(128, 140, 158, 0.85)"
+_MAP_MARKER_EDGE = "rgba(128, 140, 158, 0.9)"
+
+
 def render_station_map(stations: dict, selected_stn: str) -> str | None:
     """
     설정창(사이드바)에 넣는 간략화된 대한민국 지도 — 관측소 위치 표시 +
@@ -194,19 +210,22 @@ def render_station_map(stations: dict, selected_stn: str) -> str | None:
 
     fig = go.Figure(go.Scattergeo(
         lat=lats, lon=lons, mode="markers+text",
-        marker=dict(size=sizes, color=colors, line=dict(width=0.5, color="#0E1117")),
+        marker=dict(size=sizes, color=colors,
+                    line=dict(width=0.5, color=_MAP_MARKER_EDGE)),
         text=names, textposition="middle right",
-        textfont=dict(size=10, color="#C9D1D9"),
+        # 관측소 이름의 글자색은 지정하지 않는다 — Streamlit 이 차트에 입히는
+        # 테마 템플릿의 글자색을 그대로 물려받아야 Light/Dark 를 따라간다.
+        textfont=dict(size=10),
         customdata=codes,
         hovertext=names, hoverinfo="text",
     ))
     fig.update_geos(
         resolution=50,
         lataxis_range=[33, 39], lonaxis_range=[124.2, 130.2],   # 한반도만 딱 맞게
-        showland=True, landcolor="#242830",
-        showocean=True, oceancolor="#12151b",
-        showcountries=True, countrycolor="#3a4048",
-        showcoastlines=True, coastlinecolor="#3a4048",
+        showland=True, landcolor=_MAP_LAND,
+        showocean=True, oceancolor=_MAP_OCEAN,
+        showcountries=True, countrycolor=_MAP_LINE,
+        showcoastlines=True, coastlinecolor=_MAP_LINE,
         showframe=False, projection_type="mercator",
         bgcolor="rgba(0,0,0,0)",
     )
@@ -244,8 +263,10 @@ def event_gauge(label: str, prob: float | None, thresh: float, color: str):
         height=110, margin=dict(l=10, r=50, t=28, b=10),
         showlegend=False,
     )
+    # 글자색은 지정하지 않는다 — 지정하면(예전엔 #FFFFFF 고정) Light 테마에서
+    # 흰 배경에 흰 글씨가 된다. 상속받으면 Streamlit 테마 색을 그대로 쓴다.
     st.markdown(
-        f'<div style="font-size:1.05rem; font-weight:700; color:#FFFFFF; '
+        f'<div style="font-size:1.05rem; font-weight:700; '
         f'margin-bottom:0.2rem;">{label}</div>',
         unsafe_allow_html=True,
     )
@@ -397,8 +418,14 @@ st.markdown(
     [data-testid="stMainBlockContainer"] {
         padding-top: 1rem !important;
     }
+    /* 배경색은 여기서 정하지 않는다. 예전엔 var(--background-color, #0e1117)
+       였는데 Streamlit 이 그 변수를 내주지 않아 항상 폴백인 어두운 색이
+       쓰였고, Light 테마로 바꿔도 헤더만 검게 남았다(2026-08-11 실측).
+       아래 JS 가 실제 앱 배경(getComputedStyle)을 읽어 그대로 입힌다 —
+       테마 전환이 rerun 없이 일어나도 따라간다. 헤더가 아직 정상 흐름에
+       있는 동안(=JS 실행 전)에는 투명이 오히려 맞다. */
     .st-key-sticky_header {
-        background-color: var(--background-color, #0e1117);
+        background-color: transparent;
         padding-top: 0.3rem;
         padding-bottom: 0.3rem;
     }
@@ -510,9 +537,24 @@ components.html(
         if (!header || !mainEl || !blockEl) { setTimeout(poll, 300); return; }
 
         const wrapper = header.parentElement;   // fixed로 빠지며 생기는 공백을 되돌려줄 대상
+        const appEl = doc.querySelector('[data-testid="stApp"]') || doc.body;
 
         function toolbarBottom() {
             return toolbarEl ? toolbarEl.getBoundingClientRect().bottom : 0;
+        }
+
+        // 고정된 헤더는 본문 위에 떠 있으므로 불투명한 배경이 있어야 아래
+        // 내용이 비쳐 보이지 않는다. 그 색을 상수로 박으면 테마를 바꿨을 때
+        // 헤더만 반대 색으로 남는다(Light 전환 시 검은 띠 — 2026-08-11 실측).
+        // 앱 배경을 실제로 읽어서 그대로 쓰면 Light/Dark/System 어느 쪽이든
+        // 자동으로 맞고, 테마 전환이 rerun 없이 일어나도 따라간다.
+        function syncBackground() {
+            const bg = getComputedStyle(appEl).backgroundColor;
+            // 투명(rgba(...,0))이면 덮어쓰지 않는다 — 그대로 두면 그 아래
+            // 실제 배경이 비치므로 검은 띠가 생기는 것보다 낫다.
+            if (bg && !/,\\s*0\\s*\\)$/.test(bg) && bg !== 'transparent') {
+                header.style.backgroundColor = bg;
+            }
         }
 
         // 상태 배지("실시간 관측 데이터")를 Deploy 버튼이 있는 툴바 줄로
@@ -557,6 +599,7 @@ components.html(
             header.style.width = (blockRect.width - padL - padR) + 'px';
             header.style.zIndex = '999';
             header.style.boxSizing = 'border-box';
+            syncBackground();
         }
 
         // header.dataset 플래그로 중복 초기화를 막는다 — Streamlit이 rerun마다
