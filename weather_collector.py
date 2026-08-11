@@ -8,12 +8,20 @@ import os
 import json
 import time
 import hashlib
+import functools
 import threading
 import requests
 import numpy as np
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+
+# 이 모듈의 [WARN]/[ERROR] 진단 메시지는 컨테이너 배포 환경(Streamlit
+# Community Cloud 등)에서 표준출력이 완전 버퍼링되면 로그 화면에 한참
+# 지연되거나(버퍼가 다 찰 때까지) 아예 안 보일 수 있다 — 2026-08-11
+# 실측: API 실패가 42건 쌓였는데도 로그 검색에 "WARN"이 전혀 안 잡힘.
+# 이 모듈의 print() 만 즉시 flush 하도록 재정의해 진단 지연을 없앤다.
+print = functools.partial(print, flush=True)
 
 # ASOS 관측 시각은 KST 기준이다. datetime.now()는 시스템 로컬 시간대를
 # 따르는데, Docker 컨테이너는 기본값이 UTC라 이 저장소를 컨테이너에서
