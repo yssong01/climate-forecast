@@ -29,11 +29,20 @@ collect_incremental.py 가 채울 때까지 "대기" 상태로 남는다.
 """
 import json
 import os
+import tempfile
+import threading
 from datetime import datetime
 
 HIT_TEMP_TOL   = 1.5    # °C
 PRECIP_THRESH  = 0.1    # mm — 이 이상이면 "비"로 판정 (train.py 이벤트 정의와 동일)
 LOG_PATH       = "./cache/accuracy_log.json"
+
+# _save 자체는 이제 원자적이지만, record_prediction/resolve_pending은
+# 읽기→수정→쓰기 세 단계로 나뉘어 있어 둘 사이에는 여전히 경합이 남는다 —
+# 두 세션이 거의 동시에 읽으면 나중에 쓰는 쪽이 앞선 쪽의 수정을 덮어써
+# 로그 항목이 조용히 사라질 수 있다(크래시는 아니고 유실). 이 락으로 두
+# 함수의 읽기→수정→쓰기 구간 전체를 하나의 원자적 단위로 묶는다.
+_lock = threading.Lock()
 
 
 def _load(path: str = LOG_PATH) -> list:
@@ -44,11 +53,22 @@ def _load(path: str = LOG_PATH) -> list:
 
 
 def _save(entries: list, path: str = LOG_PATH) -> None:
-    tmp = path + ".tmp"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(entries, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    """
+    Streamlit Cloud는 세션(탭)마다 스레드를 띄우고 자동 갱신 때마다 이 함수가
+    거의 동시에 호출된다. tmp 이름이 고정이면 두 스레드가 같은 tmp를 쓰다가
+    한쪽이 os.replace 직전에 다른 쪽이 이미 옮겨간 tmp를 찾지 못해
+    FileNotFoundError가 난다(2026-08-13 실측) — 호출마다 고유한 tmp로 회피.
+    """
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory or ".", prefix=os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except BaseException:
+        os.remove(tmp)
+        raise
 
 
 def _hit(pred_temp, pred_precip, actual_temp, actual_precip):
@@ -65,23 +85,24 @@ def record_prediction(station: str, made_at: str, target_time: str,
     건너뛴다 — 대시보드가 자동 갱신될 때마다 같은 +6h 목표시각을 다시
     예측해도 로그가 중복으로 쌓이지 않도록.
     """
-    entries = _load(path)
-    key = (station, target_time, source)
-    if any((e["station"], e["target_time"], e["source"]) == key for e in entries):
-        return
-    entries.append({
-        "station": station,
-        "made_at": made_at,
-        "target_time": target_time,
-        "pred_temp": round(float(pred_temp), 3),
-        "pred_precip": round(float(pred_precip), 3),
-        "actual_temp": None,
-        "actual_precip": None,
-        "hit_temp": None,
-        "hit_precip": None,
-        "source": source,
-    })
-    _save(entries, path)
+    with _lock:
+        entries = _load(path)
+        key = (station, target_time, source)
+        if any((e["station"], e["target_time"], e["source"]) == key for e in entries):
+            return
+        entries.append({
+            "station": station,
+            "made_at": made_at,
+            "target_time": target_time,
+            "pred_temp": round(float(pred_temp), 3),
+            "pred_precip": round(float(pred_precip), 3),
+            "actual_temp": None,
+            "actual_precip": None,
+            "hit_temp": None,
+            "hit_precip": None,
+            "source": source,
+        })
+        _save(entries, path)
 
 
 def resolve_pending(lookup: dict, path: str = LOG_PATH) -> int:
@@ -93,23 +114,24 @@ def resolve_pending(lookup: dict, path: str = LOG_PATH) -> int:
 
     반환: 새로 해소된 항목 수.
     """
-    entries = _load(path)
-    resolved = 0
-    for e in entries:
-        if e["actual_temp"] is not None:
-            continue
-        rec = lookup.get((e["station"], e["target_time"]))
-        if rec is None:
-            continue
-        e["actual_temp"] = round(float(rec["temperature"]), 3)
-        e["actual_precip"] = round(float(rec["precipitation"]), 3)
-        e["hit_temp"], e["hit_precip"] = _hit(
-            e["pred_temp"], e["pred_precip"], e["actual_temp"], e["actual_precip"]
-        )
-        resolved += 1
-    if resolved:
-        _save(entries, path)
-    return resolved
+    with _lock:
+        entries = _load(path)
+        resolved = 0
+        for e in entries:
+            if e["actual_temp"] is not None:
+                continue
+            rec = lookup.get((e["station"], e["target_time"]))
+            if rec is None:
+                continue
+            e["actual_temp"] = round(float(rec["temperature"]), 3)
+            e["actual_precip"] = round(float(rec["precipitation"]), 3)
+            e["hit_temp"], e["hit_precip"] = _hit(
+                e["pred_temp"], e["pred_precip"], e["actual_temp"], e["actual_precip"]
+            )
+            resolved += 1
+        if resolved:
+            _save(entries, path)
+        return resolved
 
 
 def log_summary(path: str = LOG_PATH) -> dict:

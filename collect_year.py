@@ -53,6 +53,7 @@ import argparse
 import json
 import os
 import signal
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -102,10 +103,24 @@ def load_existing(path: str) -> dict:
 
 
 def atomic_save(path: str, records: list) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    """
+    이 스크립트의 atomic_save 호출은 현재 전부 메인 스레드에서 순차 실행된다
+    (SIGTERM/SIGINT 핸들러는 플래그만 세팅하고 저장은 하지 않는다) — 그래서
+    지금은 동시 호출 경로가 없다. 다만 같은 tmp 이름 패턴이 accuracy.py에서
+    실제 FileNotFoundError를 냈다(2026-08-13, 세션마다 스레드가 붙는 Streamlit
+    쪽 호출부). 재사용되는 유틸리티라 호출부가 늘면 같은 사고가 날 수 있어
+    선제적으로 맞췄다 — 호출마다 고유한 tmp를 쓰면 애초에 경합이 성립하지
+    않는다.
+    """
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory or ".", prefix=os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except BaseException:
+        os.remove(tmp)
+        raise
 
 
 def build_targets(days: int, stations: list) -> list:
