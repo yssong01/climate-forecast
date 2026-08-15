@@ -51,7 +51,7 @@ def main():
         for b in range(0, len(val_idx), BATCH):
             idx = val_idx[b:b + BATCH]
             pred = model(num_x=ds.X_num[idx].to(DEVICE),
-                        img_x=ds.X_img[idx].to(DEVICE),
+                        img_x=ds.X_img[idx].to(DEVICE).float(),
                         txt_x=ds.X_txt[idx].to(DEVICE)).cpu()
             preds.append(pred[:, 1].numpy())
             actuals.append(ds.y[idx, 1].numpy())

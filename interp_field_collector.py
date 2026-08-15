@@ -90,4 +90,12 @@ class InterpolatedFieldCollector:
         return np.stack(channels, axis=0)   # (4, 32, 32)
 
     def get_batch(self, records: list) -> np.ndarray:
-        return np.stack([self.get_image(r) for r in records], axis=0)
+        """float16으로 직접 채운다 — records 개수가 많을 때(13년치, 130만+)
+        'float32 리스트 전체 + np.stack 결과'가 동시에 메모리에 떠서 최종
+        크기의 2배를 순간적으로 잡아먹는 걸 피하기 위함이다(2026-08-15
+        OOM 실측 원인 중 하나). 학습 루프에서 모델에 넣기 직전 다시
+        float32로 캐스팅한다."""
+        out = np.empty((len(records), N_BANDS, IMG_SIZE, IMG_SIZE), dtype=np.float16)
+        for i, r in enumerate(records):
+            out[i] = self.get_image(r)
+        return out

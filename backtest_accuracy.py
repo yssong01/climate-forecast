@@ -58,7 +58,7 @@ def main():
             sl = slice(b, b + BATCH)
             pred = model(
                 num_x=ds.X_num[sl].to(DEVICE),
-                img_x=ds.X_img[sl].to(DEVICE) if ds.X_img is not None else None,
+                img_x=ds.X_img[sl].to(DEVICE).float() if ds.X_img is not None else None,
                 txt_x=ds.X_txt[sl].to(DEVICE) if ds.X_txt is not None else None,
             )
             preds.append(pred.cpu().numpy())

@@ -91,7 +91,7 @@ def main():
         for b in range(0, len(val_idx), BATCH):
             idx = val_idx[b:b + BATCH].tolist()
             model(num_x=ds.X_num[idx].to(DEVICE),
-                  img_x=ds.X_img[idx].to(DEVICE),
+                  img_x=ds.X_img[idx].to(DEVICE).float(),
                   txt_x=ds.X_txt[idx].to(DEVICE))
             rain_p.append(torch.sigmoid(model._last_rain_logit).squeeze(-1).cpu().numpy())
             heat_p.append(torch.sigmoid(model._last_heatwave_logit).squeeze(-1).cpu().numpy())

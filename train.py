@@ -345,8 +345,12 @@ class WeatherDataset(Dataset):
         self.X_num = torch.tensor((vecs - self.mean) / self.std, dtype=torch.float32)
 
         # ── Re축 / Im축 ──────────────────────────────────────────
+        # float16 저장 — 13년치(약 130만 표본)에서 float32 그대로 두면
+        # (4,32,32) 이미지만 약 22GB에 달해 WSL2/Docker 메모리 한도(31GB)를
+        # 넘겨 OOM-kill 당한다(2026-08-15 실측, exit 137). 모델에 넣기
+        # 직전(train.py 학습 루프)에서 다시 float32로 캐스팅한다.
         self.X_img = (torch.tensor(sat_collector.get_batch(src_records),
-                                   dtype=torch.float32)
+                                   dtype=torch.float16)
                       if sat_collector is not None else None)
         self.X_txt = (torch.tensor(txt_collector.get_batch(src_records),
                                    dtype=torch.float32)
@@ -668,7 +672,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             cold_b = cold_b.to(DEVICE).unsqueeze(-1)
             dust_b = dust_b.to(DEVICE).unsqueeze(-1)
             dmask_b = dmask_b.to(DEVICE).unsqueeze(-1)
-            x_img = x_img.to(DEVICE) if use_re else None
+            x_img = x_img.to(DEVICE).float() if use_re else None
             x_txt = x_txt.to(DEVICE) if use_im else None
 
             optimizer.zero_grad()
@@ -730,7 +734,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         with torch.no_grad():
             for i, (x_num, x_img, x_txt, y_b, heat_b, cold_b, dust_b, dmask_b) in enumerate(val_loader):
                 x_num, y_b = x_num.to(DEVICE), y_b.to(DEVICE)
-                x_img = x_img.to(DEVICE) if use_re else None
+                x_img = x_img.to(DEVICE).float() if use_re else None
                 x_txt = x_txt.to(DEVICE) if use_im else None
                 pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt,
                              collect_diagnostics=(i == 0))

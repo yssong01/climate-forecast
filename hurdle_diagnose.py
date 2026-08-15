@@ -91,7 +91,7 @@ def main():
         for b in range(0, len(val_idx), BATCH):
             idx = val_idx[b:b + BATCH].tolist()
             x_num = ds.X_num[idx].to(DEVICE)
-            x_img = ds.X_img[idx].to(DEVICE)
+            x_img = ds.X_img[idx].to(DEVICE).float()
             x_txt = ds.X_txt[idx].to(DEVICE)
             pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt)
 
