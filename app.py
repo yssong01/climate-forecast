@@ -1109,7 +1109,7 @@ with tab_model:
     _fmt = (lambda v: f"{v:.3f}" if isinstance(v, (int, float)) else "—")
     st.markdown(
         "**기호 정리표**\n\n"
-        "| 기호 | 무엇인가 | 이번 출력의 값 |\n"
+        "| 기호 | 설명 | 출력값 |\n"
         "|---|---|---|\n"
         f"| `Re`, `Im`, `Z` | 세 축을 각각 인공신경망에 통과시켜 "
         f"얻은 **숫자 {_embed_dim}개짜리 목록**(벡터) | 축마다 {_embed_dim}개 |\n"
