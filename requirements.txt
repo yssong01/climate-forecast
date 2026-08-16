@@ -3,14 +3,19 @@
 # 확장용)은 requirements-research.txt 에 따로 있다. Streamlit Cloud는
 # 저장소 루트의 requirements.txt 하나만 보므로, 이 파일이 배포판 기준이다.
 #
-# torch 는 CPU 전용 휠을 버전까지 고정한다. --extra-index-url 만 주고 버전을
-# 비워두면 pip 가 두 인덱스 중 "더 높은 버전"을 고르므로, PyPI 쪽에 상위
-# 버전이 올라오는 순간 CUDA 빌드(nvidia-* 의존성 포함 수 GB)를 받으려다
-# Community Cloud 빌드가 용량으로 실패한다. `+cpu` 로컬 버전을 박으면
-# CPU 인덱스에서만 해결된다. 2.6.0 은 학습 컨테이너(tri-chef-train-gpu)와
-# 같은 버전이라 체크포인트 로드 경로가 학습·서빙에서 동일하다.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.6.0+cpu
+# torch 는 CPU 전용 휠을 정확한 파일 URL로 고정한다(2026-08-16 수정).
+# 예전엔 `--extra-index-url` + `torch==2.6.0+cpu` 조합을 썼는데,
+# `--extra-index-url`은 requirements.txt 안의 모든 패키지 해석에 전역으로
+# 적용된다 — torch만이 아니라 streamlit·numpy 등도 이 인덱스를 함께
+# 조회한다. pytorch 인덱스가 막히면 관계없는 패키지 해석까지 실패해 배포가
+# 깨진 적이 있다(2026-08-13 실측, 캐시된 venv 폴백으로 우연히 생존).
+# PEP 508 직접 URL(`이름 @ URL`)로 바꾸면 `--extra-index-url` 자체가
+# 필요 없어진다 — pip는 torch만 이 URL에서 받고 나머지는 PyPI만 본다.
+# URL은 https://download.pytorch.org/whl/cpu/ 목록에서 Python 3.12·
+# linux_x86_64용 정확한 파일명을 확인해 박았다(2.6.0 — 학습 컨테이너
+# tri-chef-train-gpu와 같은 버전이라 체크포인트 로드 경로가 학습·서빙에서
+# 동일하다). 버전을 올릴 때는 같은 방식으로 새 파일명을 다시 확인할 것.
+torch @ https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp312-cp312-linux_x86_64.whl
 
 # Streamlit Cloud 는 빌드 시점의 최신 버전을 설치한다 — 상한을 두지 않는
 # 대신 코드가 최신 API를 쓰게 맞춰뒀다. width="stretch"(구 use_container_width)
