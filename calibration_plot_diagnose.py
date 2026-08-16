@@ -13,10 +13,18 @@ calibration_plot_diagnose.py — 관측소별 재현율×정밀도 신뢰도 플
 표본 수에서 바로 계산되는 실측 불확실성이다. 표본이 적은 관측소일수록
 에러바가 커진다(=신뢰도가 낮다는 뜻을 그대로 반영).
 
+한글 라벨(2026-08-16 추가): 컨테이너 기본 이미지엔 한글 글리프가 있는
+폰트가 전혀 없다(fc-list 0건 실측) — 라벨을 한글로 쓰면 네모(tofu)로
+깨진다. 이 스크립트가 실행 시점에 `fonts-nanum`을 직접 설치하고
+matplotlib 폰트로 등록한다(매번 재설치 — 이미지에 굽지 않고 컨테이너는
+`--rm`으로 매번 새로 뜨므로).
+
 실행: python calibration_plot_diagnose.py [--out calibration.png]
 """
 import argparse
 import math
+import subprocess
+import sys
 
 import numpy as np
 import torch
@@ -29,6 +37,25 @@ from predict import load_model
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH = 1024
+
+_NANUM_PATH = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
+
+
+def _ensure_korean_font():
+    """matplotlib 라벨용 한글 폰트를 확보한다. 없으면 설치 시도, 실패하면 None."""
+    import os
+    if os.path.exists(_NANUM_PATH):
+        return _NANUM_PATH
+    try:
+        subprocess.run(["apt-get", "update", "-qq"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["apt-get", "install", "-y", "-qq", "fonts-nanum"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
+    except Exception as e:
+        print(f"폰트 설치 실패({e}) — root 권한·네트워크 필요", file=sys.stderr)
+        return None
+    return _NANUM_PATH if os.path.exists(_NANUM_PATH) else None
 
 
 def wilson_ci(k: int, n: int, z: float = 1.96):
@@ -124,15 +151,22 @@ def main():
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import matplotlib.font_manager as fm
     except ImportError:
         print("\nmatplotlib 없음 — 표만 출력하고 종료(플롯 생략)")
         return
 
-    # 한글 글리프가 없는 기본 폰트(DejaVu Sans)로 저장하면 라벨이 네모로 깨진다
-    # (2026-08-16 실측). 관측소 코드(숫자)만 쓰면 폰트 의존성 없이 항상 보인다.
+    korean_font = _ensure_korean_font()
+    if korean_font:
+        fm.fontManager.addfont(korean_font)
+        plt.rcParams["font.family"] = fm.FontProperties(fname=korean_font).get_name()
+        plt.rcParams["axes.unicode_minus"] = False  # 한글 폰트는 유니코드 마이너스 글리프가 없다
+    else:
+        print("\n한글 폰트 설치 실패 — 관측소 코드만 라벨로 사용")
+
     fig, axes = plt.subplots(1, 2, figsize=(13, 6))
     colors = {"heatwave": "#E2954F", "coldwave": "#4C78A8"}
-    labels_en = {"heatwave": "Heatwave", "coldwave": "Coldwave"}
+    labels_ko = {"heatwave": "폭염", "coldwave": "한파"}
     for ax, name in zip(axes, ["heatwave", "coldwave"]):
         rows = results[name]
         for r in rows:
@@ -143,12 +177,12 @@ def main():
             ax.errorbar(x, y, xerr=xerr, yerr=yerr, fmt="+",
                         color=colors[name], markersize=size / 5,
                         markeredgewidth=2, capsize=4, elinewidth=1.5, alpha=0.85)
-            ax.annotate(r["code"], (x, y), textcoords="offset points",
+            label = f"{r['station']}({r['code']})" if korean_font else r["code"]
+            ax.annotate(label, (x, y), textcoords="offset points",
                        xytext=(6, 6), fontsize=8)
-        ax.set_xlabel("Recall")
-        ax.set_ylabel("Precision")
-        ax.set_title(f"{labels_en[name]} by station (cross = Wilson 95% CI, "
-                     f"label = station code)")
+        ax.set_xlabel("재현율 (Recall)")
+        ax.set_ylabel("정밀도 (Precision)")
+        ax.set_title(f"{labels_ko[name]} — 관측소별 (십자 = Wilson 95% 신뢰구간)")
         ax.set_xlim(-0.05, 1.05)
         ax.set_ylim(-0.05, 1.05)
         ax.grid(alpha=0.3)
