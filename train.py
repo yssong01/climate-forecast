@@ -17,7 +17,7 @@ import json
 import time
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset, WeightedRandomSampler
 import numpy as np
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -33,13 +33,54 @@ load_dotenv()
 # ── 설정 ──────────────────────────────────────────────────────────
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 EMBED_DIM  = 64
-BATCH_SIZE = 32
-EPOCHS     = 150
-LR         = 1e-3
+
+# 배치 크기 32 → 1024 (2026-08-15 perf_profile.py 실측).
+# 데이터가 13년치(표본 138만)로 늘어난 뒤 학습 1회가 4시간 20분이 걸렸는데,
+# 그동안 GPU 사용률은 31%, VRAM 은 8GB 중 747MiB 였다. 병목은 GPU 연산이
+# 아니라 에폭당 34,524회 반복되는 파이썬 스텝 오버헤드였다. 실측 처리량:
+#     batch   32 + workers  0 :  3,822 표본/초  (에폭 4.82분)  ← 종전
+#     batch  512 + workers  8 : 45,426 표본/초  (에폭 0.41분)
+#     batch 1024 + workers  8 : 74,956 표본/초  (에폭 0.25분)  ← 채택, 19.6배
+# num_workers 만 늘리는 것으로는 오히려 느려진다(batch 32 에서 0.84배) —
+# 배치가 작아 워커 통신 비용이 이득을 넘기 때문이다. 배치를 키우는 것이
+# 본질적인 해법이다.
+#
+# 배치 크기는 학습 동역학을 바꾸므로 그냥 못 바꾼다. 이 모델에서 안전한
+# 근거: 정규화 계층이 전부 LayerNorm 이라(pipeline_model.py) 배치 통계에
+# 의존하지 않는다. BatchNorm 이 있었다면 배치 크기가 정규화 자체를 바꿨을
+# 것이다. 게이트 워밍업도 에폭이 아니라 스텝 수에서 역산하도록 되어 있어
+# (_REFERENCE_WARMUP_STEPS) 자동으로 따라간다.
+#
+# 다만 속도를 얻는 대신 정확도를 잃을 수 있다(2026-08-15 batch 1024 실행에서
+# 기온 1.2033→1.2591, 강수 기준선 대비 −7.1%→−22.0%). 배치 크기 자체를
+# 실험 변수로 다뤄야 하므로 환경변수로 빼둔다 — 코드를 고치지 않고
+# BATCH_SIZE=256 처럼 지정해 대조 실행을 돌리기 위한 것이다.
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1024"))
+_REFERENCE_BATCH = 32     # LR 스케일링 기준점 — 종전 배치 크기
+
+# DataLoader 워커 수. 배치가 커진 뒤에야 이득이 나온다(위 실측 참고).
+# 도커에서는 --shm-size 를 키워야 워커가 죽지 않는다(기본 64MB 로는 부족).
+NUM_WORKERS = 8
+
+EPOCHS     = 400    # 배치가 32배 커져 에폭당 스텝 수가 그만큼 줄었다.
+                    # 같은 학습량을 확보하려면 에폭 수를 늘려야 한다.
+                    # 에폭당 0.25분이라 400에폭도 100분이면 끝난다.
+
+# AdamW 에서 배치를 k배 키울 때는 학습률을 √k 배 하는 것이 통용되는 규칙이다
+# (SGD 의 선형 스케일링과 달리 Adam 계열은 제곱근 쪽이 안정적이다).
+# 32 → 1024 이면 √32 ≈ 5.66배.
+#
+# 이 규칙이 이 모델에 맞는지는 아직 미검증이다 — batch 1024 + √32 스케일링
+# 실행에서 LR 이 80에폭 만에 5.7e-3 → 4.4e-5 로 급락했는데, 최적화기가
+# 헤맸다는 신호로 읽힌다. 스케일링이 과했는지 배치 크기 자체가 문제인지
+# 가르려면 LR 을 배치와 독립적으로 지정할 수 있어야 한다. TRAIN_LR 로
+# 직접 주면 스케일링을 건너뛴다.
+LR         = float(os.getenv("TRAIN_LR",
+                             1e-3 * (BATCH_SIZE / _REFERENCE_BATCH) ** 0.5))
 ALPHA_INIT = 0.4    # Im 축(텍스트) 가중치 초기값 — 학습 중 자동 조정
 PHI_INIT   = 0.2    # Z  축(수치)  가중치 초기값 — 학습 중 자동 조정
 N_HOURS    = 720    # 관측소당 수집 기간: 30일 × 24시간 (장마철 포함 확보)
-PATIENCE   = 20     # Early stopping
+PATIENCE   = 40     # Early stopping — 에폭당 스텝 수가 줄어든 만큼 늘린다
 VAL_RATIO  = 0.2
 
 # 데이터 확장 — 서울 단일 관측소(표본 572개)는 이번 세션 대부분의 이상 현상
@@ -122,7 +163,10 @@ COLDWAVE_THRESH = -12.0       # °C
 # 곧 표현 경쟁으로 번진 것으로 보인다. 0.3 으로 낮춰 극한기상 쪽 압력을
 # 줄이고 강수가 회복되는지 실측한다(가설 검증용 실험치, 결과 보고 추가
 # 튜닝 예정).
-EXTREME_BCE_WEIGHT = 0.3
+# 13년 재학습(그룹 분할) 이후에도 강수는 기준선 대비 -17.9% 미달로 남아
+# 있어 추가 재조정을 실험 중이다. EXTREME_BCE_WT 환경변수로 코드 수정 없이
+# 값을 바꿔 돌릴 수 있다(BATCH_SIZE/TRAIN_LR 과 같은 패턴, 2026-08-16).
+EXTREME_BCE_WEIGHT = float(os.getenv("EXTREME_BCE_WT", "0.3"))
 
 # Phase 3-9 황사 헤드 + 폭염·한파 라벨 소스 교체 — import_weather_issues.py
 # 가 만든 기상청 "날씨 이슈별 데이터"(공식 폭염특보/한파특보/황사관측여부)
@@ -131,6 +175,38 @@ EXTREME_BCE_WEIGHT = 0.3
 # 전부 마스크 제외로 조용히 폴백한다 — import_weather_issues.py 를 먼저
 # 실행하지 않아도 학습 자체는 깨지지 않는다.
 WEATHER_ISSUE_LABELS = "./cache/weather_issue_labels.json"
+
+# 폭염·한파에서 공식 라벨이 없는 표본을 어떻게 다룰지.
+#   True  (기본) — 마스크로 손실·채점 양쪽에서 제외한다. 황사가 원래 쓰던 방식.
+#   False (대조군) — 종전처럼 임계값 근사로 채워 넣는다. 배치 크기 변경 같은
+#                    다른 조건을 바꾼 상태에서 "마스킹만의 효과"를 분리해
+#                    재려면 같은 조건의 대조군이 필요하다.
+# 환경변수 EXTREME_LABEL_MASKING=0 으로 끌 수 있다 — 코드를 고치지 않고
+# 대조군을 돌리기 위한 것이다.
+EXTREME_LABEL_MASKING = os.getenv("EXTREME_LABEL_MASKING", "1") != "0"
+
+# 학습/검증 분할 방식 — make_split() 참고. 무작위 분할이 일 단위 극한기상
+# 라벨을 100% 누수시킨다는 것이 실측되어(2026-08-15) 모드를 추가했다.
+#   random   — 시각 단위 무작위. 종전 방식. 비교용으로만 남긴다.
+#   group    — 날짜 단위. 하루를 통째로 한쪽에 배정해 일 단위 라벨 누수를
+#              없앤다. 사계절이 양쪽에 다 들어가 분산이 작아 개발용에 적합.
+#   temporal — 과거로 배워 미래를 예측. 실제 운영과 같은 구조라 보고용.
+SPLIT_MODE = os.getenv("SPLIT_MODE", "random")
+# temporal 모드 경계. 사이 하루(2024-01-01)는 완충으로 비운다 — Im축이
+# 6시간 전을 보고 타깃이 +6시간이라 경계 표본은 양쪽에 걸친다.
+TEMPORAL_TRAIN_END = os.getenv("TEMPORAL_TRAIN_END", "20231231")
+TEMPORAL_VAL_START = os.getenv("TEMPORAL_VAL_START", "20240102")
+
+# Crop 표본 재가중 — 곰팡이 진단 프로젝트의 "곰팡이 영역만 먼저 집중
+# 학습"(2단계 사전학습) 아이디어를 여기서는 먼저 더 단순한 형태로
+# 시험한다: 아키텍처·학습 단계를 그대로 두고, 사건 표본(강수·폭염·한파·
+# 황사 중 하나라도 양성)이 배치에 더 자주 뽑히도록 WeightedRandomSampler로
+# 재가중만 한다. crop_headroom_diagnose.py 실측(2026-08-15): 사건 표본은
+# 전체의 14.1%인데 그 안에서 강수·폭염·한파·황사 양성률이 3~9배로 뛴다.
+# 이 재가중만으로 개선되면 2단계 사전학습(재앙적 망각 위험이 있는 더
+# 복잡한 방법)은 필요 없다 — 더 단순한 대안을 먼저 배제하는 것이 원칙이다.
+# 1.0 = 끔(기존 동작과 동일, 균등 샘플링).
+CROP_OVERSAMPLE = float(os.getenv("CROP_OVERSAMPLE", "1.0"))
 
 CHECKPOINT  = "./checkpoints/numerical_trichef.pt"
 # historical_data.json(원본 30일)이 아니라 historical_data_1y.json 을 쓴다.
@@ -379,16 +455,29 @@ class WeatherDataset(Dataset):
 
         # ── Phase 3-9 공식 라벨(폭염·한파·황사 특보) ────────────────
         # import_weather_issues.py 가 만든 (관측소,날짜)→기상청 공식판정
-        # 조회표. 있으면 그 순간 임계값 근사 대신 실제 발표된 특보를 쓴다
-        # (2026-08-09 구조점검에서 지적한 "라벨 정의 근사 오차" 해소).
-        # 조회 실패(관측소/날짜 갭)시 폭염·한파는 기존 임계값 근사로 폴백하고,
-        # 황사는 대체할 신뢰 가능한 라벨이 없어 마스크로 손실 계산에서 뺀다.
+        # 조회표. 세 사건 모두 공식 기록이 있는 표본만 학습에 쓰고, 없는
+        # 표본은 마스크로 손실에서 뺀다.
+        #
+        # 폭염·한파도 마스킹으로 바꾼 이유(2026-08-15 실측) — 예전에는 공식
+        # 기록이 없으면 임계값 근사(그 시각 기온 ≥33°C / ≤−12°C)로 폴백했다.
+        # 그런데 이 둘은 정의가 아예 다르다: 공식 특보는 "그 날 하루" 단위라
+        # 24개 표본이 전부 양성이 되고(양성률 15~36%), 근사는 오후 몇 시간만
+        # 양성이 된다(양성률 0.25~2.02%). 같은 현상에 50배 다른 양성률의
+        # 라벨이 붙는 셈이다. 3.6년(2023~) 데이터에서는 공식 기록이 45%를
+        # 덮어 영향이 제한적이었으나, 13년(2013~)으로 늘리자 공식 기록이
+        # 없는 2013~2018년 63만 표본이 전부 근사 쪽으로 떨어지면서 정밀도가
+        # 무너졌다(폭염 F1 0.842→0.665, 근사 구간만 보면 0.195).
+        # 모델 입력에 연도가 없어(record_to_vec) 두 정의를 구분할 방법이
+        # 원리적으로 없으므로, 황사가 이미 쓰던 마스킹 방식으로 통일한다.
+        # 근사 라벨을 버려도 공식 라벨 표본 수는 오히려 늘어난다
+        # (폭염 15만→33만, 한파 17만→29만 — 13년치 기준).
         issue_labels = {}
         if os.path.exists(WEATHER_ISSUE_LABELS):
             with open(WEATHER_ISSUE_LABELS, "r", encoding="utf-8") as f:
                 issue_labels = json.load(f)
 
-        heat_list, cold_list, dust_list, dust_mask_list = [], [], [], []
+        heat_list, cold_list, dust_list = [], [], []
+        heat_mask_list, cold_mask_list, dust_mask_list = [], [], []
         n_heat_off = n_cold_off = n_dust_off = 0
         for i, r in enumerate(tgt_records):
             ts = str(r["timestamp"])
@@ -396,14 +485,18 @@ class WeatherDataset(Dataset):
             day = issue_labels.get(str(r.get("stn")), {}).get(date_str, {})
 
             if "heatwave_advisory" in day:
-                heat_list.append(day["heatwave_advisory"]); n_heat_off += 1
-            else:
-                heat_list.append(int(temp_tgt[i] >= HEATWAVE_THRESH))
+                heat_list.append(day["heatwave_advisory"]); heat_mask_list.append(1); n_heat_off += 1
+            elif EXTREME_LABEL_MASKING:
+                heat_list.append(0); heat_mask_list.append(0)
+            else:   # 대조군 — 종전처럼 임계값 근사로 채우고 손실에도 넣는다
+                heat_list.append(int(temp_tgt[i] >= HEATWAVE_THRESH)); heat_mask_list.append(1)
 
             if "coldwave_advisory" in day:
-                cold_list.append(day["coldwave_advisory"]); n_cold_off += 1
+                cold_list.append(day["coldwave_advisory"]); cold_mask_list.append(1); n_cold_off += 1
+            elif EXTREME_LABEL_MASKING:
+                cold_list.append(0); cold_mask_list.append(0)
             else:
-                cold_list.append(int(temp_tgt[i] <= COLDWAVE_THRESH))
+                cold_list.append(int(temp_tgt[i] <= COLDWAVE_THRESH)); cold_mask_list.append(1)
 
             if "dust_observed" in day:
                 dust_list.append(day["dust_observed"]); dust_mask_list.append(1); n_dust_off += 1
@@ -413,6 +506,8 @@ class WeatherDataset(Dataset):
         self.y_heatwave = torch.tensor(heat_list, dtype=torch.float32)
         self.y_coldwave = torch.tensor(cold_list, dtype=torch.float32)
         self.y_dust     = torch.tensor(dust_list, dtype=torch.float32)
+        self.heat_mask  = torch.tensor(heat_mask_list, dtype=torch.float32)
+        self.cold_mask  = torch.tensor(cold_mask_list, dtype=torch.float32)
         self.dust_mask  = torch.tensor(dust_mask_list, dtype=torch.float32)
         self.n_heat_official = n_heat_off
         self.n_cold_official = n_cold_off
@@ -423,8 +518,84 @@ class WeatherDataset(Dataset):
 
     def __getitem__(self, idx):
         return (self.X_num[idx], self.X_img[idx], self.X_txt[idx], self.y[idx],
-                self.y_heatwave[idx], self.y_coldwave[idx],
-                self.y_dust[idx], self.dust_mask[idx])
+                self.y_heatwave[idx], self.y_coldwave[idx], self.y_dust[idx],
+                self.heat_mask[idx], self.cold_mask[idx], self.dust_mask[idx])
+
+
+# ── 3-b. 학습/검증 분할 ───────────────────────────────────────────
+
+def make_split(full_ds, mode: str, verbose: bool = True):
+    """
+    학습/검증 분할. mode 는 SPLIT_MODE 참고.
+
+    왜 무작위 말고 다른 모드가 필요한가(2026-08-15 split_leakage_check.py 실측)
+    ─ 폭염·한파·황사 라벨은 (관측소, 날짜) 단위다. 특보가 발효된 날은 그날
+    24개 시각 표본이 전부 같은 라벨을 받는다. 그런데 시각 단위로 무작위
+    분할하면 같은 날의 표본이 학습셋과 검증셋에 쪼개진다 — 하루 표본이
+    평균 23.9개이므로 한쪽으로 몰릴 확률은 0.8^24 ≈ 0.5% 에 불과하다.
+    실측 결과 판정 가능한 검증 표본의 100.00% 가, 양성만 따져도 100.00% 가
+    학습셋에 같은 날 짝을 갖고 있었다(폭염 15,916/15,916 · 한파 3,852/3,852 ·
+    황사 3,498/3,498). 모델은 학습 중에 그 관측소·그 날짜의 정답을 이미 봤고
+    검증에서는 같은 날 다른 시각을 묻는 셈이라, 일반화가 아니라 "같은 날
+    다른 시각 맞히기"를 채점해 왔다. 회귀(기온)는 같은 날 안에서도 값이
+    평균 8.41°C 벌어지므로 이 문제에서 상대적으로 자유롭다.
+
+    그룹 단위를 (관측소, 날짜)가 아니라 날짜로만 잡는 이유 ─ Re축은 설계상
+    같은 시각 다른 11개 관측소의 실측값을 입력으로 쓴다(interp_field_
+    collector.py). 관측소별로 쪼개면 서울 8/1은 학습, 대구 8/1은 검증으로
+    갈릴 수 있는데 대구 표본의 Re축 입력 안에 이미 서울 관측이 들어 있어
+    입력을 통한 누수가 남는다. 날짜 단위로 12개 관측소를 통째로 묶어야 막힌다.
+    """
+    n = len(full_ds)
+    # 라벨 기준 날짜 = 타깃 시각의 날짜 (라벨이 붙는 단위와 일치시킨다)
+    dates = np.array([str(ts)[:8] for ts in full_ds.tgt_timestamps])
+
+    if mode == "random":
+        n_val = max(2, int(n * VAL_RATIO))
+        g = torch.Generator().manual_seed(SEED)
+        perm = torch.randperm(n, generator=g).tolist()
+        # random_split 과 같은 순서 — 앞에서부터 학습, 뒤가 검증.
+        # 종전 체크포인트와 분할이 일치해야 비교가 성립한다.
+        train_idx, val_idx = perm[:n - n_val], perm[n - n_val:]
+
+    elif mode == "group":
+        uniq = np.unique(dates)
+        g = torch.Generator().manual_seed(SEED)
+        order = torch.randperm(len(uniq), generator=g).tolist()
+        n_val_days = max(1, int(len(uniq) * VAL_RATIO))
+        val_days = {uniq[k] for k in order[:n_val_days]}
+        is_val = np.array([d in val_days for d in dates])
+        train_idx = np.flatnonzero(~is_val).tolist()
+        val_idx = np.flatnonzero(is_val).tolist()
+
+    elif mode == "temporal":
+        # 과거로 배워 미래를 예측하는 실제 운영 구조. 경계에 완충 하루를
+        # 비운다 — Im축이 6시간 전을 보고 타깃이 +6시간이라 경계 표본은
+        # 양쪽 구간에 걸친다.
+        is_train = dates <= TEMPORAL_TRAIN_END
+        is_val = dates >= TEMPORAL_VAL_START
+        train_idx = np.flatnonzero(is_train).tolist()
+        val_idx = np.flatnonzero(is_val).tolist()
+
+    else:
+        raise ValueError(f"알 수 없는 SPLIT_MODE: {mode}")
+
+    if verbose:
+        # numpy 문자열 배열은 min/max 유니버설 함수가 없다 — 파이썬 set 으로 센다
+        s_tr = set(dates[train_idx].tolist())
+        s_va = set(dates[val_idx].tolist())
+        print(f"분할 방식: {mode}")
+        print(f"  학습 {len(train_idx):,}개 ({min(s_tr)}~{max(s_tr)}) / "
+              f"검증 {len(val_idx):,}개 ({min(s_va)}~{max(s_va)})")
+        shared = len(s_tr & s_va)
+        print(f"  학습·검증이 공유하는 날짜 {shared:,}개"
+              + ("  ← 일 단위 라벨 누수 경로" if shared else "  (누수 없음)"))
+        for nm, t in (("폭염", full_ds.heat_mask), ("한파", full_ds.cold_mask),
+                      ("황사", full_ds.dust_mask)):
+            n_j = int(t[val_idx].sum().item())
+            print(f"    검증셋 {nm} 판정가능 {n_j:,}개")
+
+    return Subset(full_ds, train_idx), Subset(full_ds, val_idx)
 
 
 # ── 4. 모델: pipeline_model.py의 TriCHEFPipeline 사용 ─────────────
@@ -474,6 +645,13 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         print(f"{'='*70}")
         print(f" Tri-CHEF Phase 3-4 — 예보 시계 +{lead_hours}시간 | 활성 축: {axes}")
         print(f" 디바이스: {DEVICE} | embed_dim: {EMBED_DIM}")
+        print(f" 배치 {BATCH_SIZE} | LR {LR:.2e} | 워커 {NUM_WORKERS} | "
+              f"극한기상 라벨 마스킹: {'ON' if EXTREME_LABEL_MASKING else 'OFF(대조군)'}")
+        print(f" EXTREME_BCE_WEIGHT: {EXTREME_BCE_WEIGHT} | "
+              f"CROP_OVERSAMPLE: {CROP_OVERSAMPLE}")
+        print(f" 분할 방식: {SPLIT_MODE}"
+              + (f" (학습 ~{TEMPORAL_TRAIN_END} / 검증 {TEMPORAL_VAL_START}~)"
+                 if SPLIT_MODE == "temporal" else ""))
         print(f" Gram-Schmidt 직교화: {'ON' if orthogonalize else 'OFF'}"
               f" | 기온 Δ 예측: {'ON' if persistence_residual else 'OFF'}")
         gdesc = (f"동적 게이트 (균등 초기화, λ={gate_entropy_weight}, "
@@ -505,8 +683,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                              sat_collector=sat_collector,
                              txt_collector=txt_collector,
                              lead_hours=lead_hours)
-    n_val   = max(2, int(len(full_ds) * VAL_RATIO))
-    n_train = len(full_ds) - n_val
+    train_ds, val_ds = make_split(full_ds, SPLIT_MODE, verbose=verbose)
+    n_train, n_val = len(train_ds), len(val_ds)
 
     # 게이트 워밍업 — Phase 3-5 캘리브레이션 스텝 수를 현재 데이터 규모에서
     # 재현하는 에폭 수로 역산 (위 _REFERENCE_WARMUP_STEPS 주석 참고).
@@ -519,14 +697,28 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
               f"{steps_per_epoch*gate_warmup_epochs:,}스텝, 기준 "
               f"{_REFERENCE_WARMUP_STEPS:,}스텝)")
 
-    # SEED 고정 → 직교화 ON/OFF 비교 시 동일한 분할 사용
-    train_ds, val_ds = random_split(
-        full_ds, [n_train, n_val],
-        generator=torch.Generator().manual_seed(SEED)
-    )
-
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False)
+    # persistent_workers — 에폭마다 워커를 새로 띄우면 그 기동 비용이
+    # 에폭당 0.25분짜리 학습에서는 무시할 수 없다.
+    _dl = dict(num_workers=NUM_WORKERS, pin_memory=(DEVICE == "cuda"),
+               persistent_workers=(NUM_WORKERS > 0))
+    if CROP_OVERSAMPLE > 1.0:
+        is_wet = full_ds.y[:, 1] >= WET_THRESH
+        is_event = (full_ds.y_heatwave.bool() | full_ds.y_coldwave.bool()
+                   | full_ds.y_dust.bool() | is_wet)
+        train_indices = torch.as_tensor(train_ds.indices)
+        train_event = is_event[train_indices]
+        sample_weights = torch.where(
+            train_event, torch.tensor(CROP_OVERSAMPLE), torch.tensor(1.0))
+        sampler = WeightedRandomSampler(
+            sample_weights.double(), num_samples=n_train, replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, **_dl)
+        if verbose:
+            n_event = int(train_event.sum())
+            print(f"Crop 재가중 ON — 학습셋 사건 표본 {n_event:,}개"
+                  f"({100*n_event/n_train:.1f}%)를 {CROP_OVERSAMPLE:.1f}배 오버샘플링")
+    else:
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, **_dl)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, **_dl)
 
     # baseline 은 반드시 검증셋과 동일한 표본에서 계산한다.
     # 전체 평균과 비교하면 표본 차이만으로 '개선'처럼 보일 수 있다.
@@ -554,42 +746,34 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         print(f"Hurdle 헤드 — 학습셋 강수 비율 {wet_prior:.4f} "
               f"({n_wet}/{len(train_precip)}), BCE pos_weight={rain_pos_weight.item():.2f}")
 
-    # Phase 3-8/3-9 극한기상 헤드 사전확률·클래스 불균형 가중치 — 폭염·한파
-    # 임계값(위 상수)은 고정 규정값이지만, 실제 쓰이는 라벨은 WeatherDataset
-    # 이 이미 계산해둔 y_heatwave/y_coldwave(공식 특보 있으면 그것, 없으면
-    # 임계값 근사 폴백)다. 그 라벨 기준으로 학습셋 내 비율을 실측한다.
-    train_heat = full_ds.y_heatwave[train_ds.indices]
-    n_heat = int(train_heat.sum().item())
-    heatwave_prior = n_heat / len(train_heat)
-    heatwave_pos_weight = torch.tensor(
-        [(len(train_heat) - n_heat) / max(n_heat, 1)], device=DEVICE)
+    # Phase 3-8/3-9 극한기상 헤드 사전확률·클래스 불균형 가중치.
+    # 세 사건 모두 기상청 공식 라벨이 있는 표본에서만 비율을 잰다 — 마스크=0인
+    # 표본은 "사건 없음으로 확인됨"이 아니라 "판정 불가"라 분모에서도 뺀다
+    # (WeatherDataset 라벨 구성 주석 참고).
+    def _masked_prior(labels, mask):
+        m = mask[train_ds.indices].bool()
+        y = labels[train_ds.indices][m]
+        n_pos = int(y.sum().item())
+        n_tot = max(len(y), 1)
+        prior = n_pos / n_tot
+        pw = torch.tensor([(n_tot - n_pos) / max(n_pos, 1)], device=DEVICE)
+        return prior, pw, n_pos, n_tot
 
-    train_cold = full_ds.y_coldwave[train_ds.indices]
-    n_cold = int(train_cold.sum().item())
-    coldwave_prior = n_cold / len(train_cold)
-    coldwave_pos_weight = torch.tensor(
-        [(len(train_cold) - n_cold) / max(n_cold, 1)], device=DEVICE)
-
-    # 황사 — 기상청 공식 라벨이 있는 표본에서만 비율을 잰다(마스크=0인 표본은
-    # "무황사로 확인됨"이 아니라 "판정 불가"라 분모에서도 뺀다).
-    train_dust_mask = full_ds.dust_mask[train_ds.indices].bool()
-    train_dust = full_ds.y_dust[train_ds.indices][train_dust_mask]
-    n_dust = int(train_dust.sum().item())
-    n_dust_total = max(len(train_dust), 1)
-    dust_prior = n_dust / n_dust_total
-    dust_pos_weight = torch.tensor(
-        [(n_dust_total - n_dust) / max(n_dust, 1)], device=DEVICE)
+    heatwave_prior, heatwave_pos_weight, n_heat, n_heat_total = _masked_prior(
+        full_ds.y_heatwave, full_ds.heat_mask)
+    coldwave_prior, coldwave_pos_weight, n_cold, n_cold_total = _masked_prior(
+        full_ds.y_coldwave, full_ds.cold_mask)
+    dust_prior, dust_pos_weight, n_dust, n_dust_total = _masked_prior(
+        full_ds.y_dust, full_ds.dust_mask)
 
     if verbose:
-        print(f"극한기상 헤드 — 학습셋 폭염 비율 {heatwave_prior:.4f} "
-              f"({n_heat}/{len(train_heat)}, 공식라벨 {full_ds.n_heat_official}일), "
-              f"pos_weight={heatwave_pos_weight.item():.2f}")
+        print(f"극한기상 헤드 — 전부 공식 라벨 표본만 사용(판정 불가 표본은 손실에서 제외)")
+        print(f"              학습셋 폭염 비율 {heatwave_prior:.4f} "
+              f"({n_heat}/{n_heat_total}), pos_weight={heatwave_pos_weight.item():.2f}")
         print(f"              학습셋 한파 비율 {coldwave_prior:.4f} "
-              f"({n_cold}/{len(train_cold)}, 공식라벨 {full_ds.n_cold_official}일), "
-              f"pos_weight={coldwave_pos_weight.item():.2f}")
+              f"({n_cold}/{n_cold_total}), pos_weight={coldwave_pos_weight.item():.2f}")
         print(f"              학습셋 황사 비율 {dust_prior:.4f} "
-              f"({n_dust}/{n_dust_total}, 전부 공식라벨 — 판정 가능 표본만), "
-              f"pos_weight={dust_pos_weight.item():.2f}")
+              f"({n_dust}/{n_dust_total}), pos_weight={dust_pos_weight.item():.2f}")
 
     # 모델 — 타깃 평균을 헤드 편향에 주입해 편향 학습 낭비 제거
     model = TriCHEFPipeline(
@@ -666,14 +850,20 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
 
         model.train()
         train_loss = 0.0
-        for x_num, x_img, x_txt, y_b, heat_b, cold_b, dust_b, dmask_b in train_loader:
-            x_num, y_b = x_num.to(DEVICE), y_b.to(DEVICE)
-            heat_b = heat_b.to(DEVICE).unsqueeze(-1)
-            cold_b = cold_b.to(DEVICE).unsqueeze(-1)
-            dust_b = dust_b.to(DEVICE).unsqueeze(-1)
-            dmask_b = dmask_b.to(DEVICE).unsqueeze(-1)
-            x_img = x_img.to(DEVICE).float() if use_re else None
-            x_txt = x_txt.to(DEVICE) if use_im else None
+        for (x_num, x_img, x_txt, y_b, heat_b, cold_b, dust_b,
+             hmask_b, cmask_b, dmask_b) in train_loader:
+            # non_blocking — pin_memory 로 고정한 페이지에서만 실제로 비동기
+            # 전송이 일어난다. 둘은 짝으로 써야 의미가 있다.
+            _nb = dict(non_blocking=True)
+            x_num, y_b = x_num.to(DEVICE, **_nb), y_b.to(DEVICE, **_nb)
+            heat_b = heat_b.to(DEVICE, **_nb).unsqueeze(-1)
+            cold_b = cold_b.to(DEVICE, **_nb).unsqueeze(-1)
+            dust_b = dust_b.to(DEVICE, **_nb).unsqueeze(-1)
+            hmask_b = hmask_b.to(DEVICE, **_nb).unsqueeze(-1)
+            cmask_b = cmask_b.to(DEVICE, **_nb).unsqueeze(-1)
+            dmask_b = dmask_b.to(DEVICE, **_nb).unsqueeze(-1)
+            x_img = x_img.to(DEVICE, **_nb).float() if use_re else None
+            x_txt = x_txt.to(DEVICE, **_nb) if use_im else None
 
             optimizer.zero_grad()
             pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt)
@@ -692,29 +882,24 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             # Phase 3-8/3-9 극한기상 BCE — 회귀 손실(기온 MSE)만으로는 폭염·한파
             # 같은 꼬리 사건에 직접 그래디언트가 가지 않는다(전체 평균오차에
             # 묻힘). head_rain 과 같은 이유로 이진분류를 별도 항으로 둔다.
-            # heat_b/cold_b 는 WeatherDataset 이 이미 계산해둔 라벨(기상청
-            # 공식 특보 있으면 그것, 없으면 임계값 근사 폴백)이라 여기서는
-            # 그대로 쓰기만 한다.
-            if hasattr(model, "head_heatwave"):
-                heat_bce = nn.functional.binary_cross_entropy_with_logits(
-                    model._last_heatwave_logit, heat_b, pos_weight=heatwave_pos_weight
-                )
-                loss = loss + EXTREME_BCE_WEIGHT * heat_bce
-            if hasattr(model, "head_coldwave"):
-                cold_bce = nn.functional.binary_cross_entropy_with_logits(
-                    model._last_coldwave_logit, cold_b, pos_weight=coldwave_pos_weight
-                )
-                loss = loss + EXTREME_BCE_WEIGHT * cold_bce
-            # 황사 BCE — dmask_b=0(공식 라벨 없음)인 표본은 손실에서 뺀다.
-            # 그 표본들의 dust_b=0 은 "무황사 확정"이 아니라 "판정 불가"라
+            #
+            # 세 사건 모두 마스크=0(기상청 공식 라벨 없음)인 표본을 손실에서
+            # 뺀다. 그 표본의 라벨 0 은 "사건 없음 확정"이 아니라 "판정 불가"라
             # 그대로 넣으면 근거 없는 음성 라벨을 학습시키게 된다.
+            def _masked_bce(logit, target, mask, pos_weight):
+                raw = nn.functional.binary_cross_entropy_with_logits(
+                    logit, target, pos_weight=pos_weight, reduction="none")
+                return (raw * mask).sum() / mask.sum()
+
+            if hasattr(model, "head_heatwave") and hmask_b.sum() > 0:
+                loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
+                    model._last_heatwave_logit, heat_b, hmask_b, heatwave_pos_weight)
+            if hasattr(model, "head_coldwave") and cmask_b.sum() > 0:
+                loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
+                    model._last_coldwave_logit, cold_b, cmask_b, coldwave_pos_weight)
             if hasattr(model, "head_dust") and dmask_b.sum() > 0:
-                dust_bce_raw = nn.functional.binary_cross_entropy_with_logits(
-                    model._last_dust_logit, dust_b, pos_weight=dust_pos_weight,
-                    reduction="none"
-                )
-                dust_bce = (dust_bce_raw * dmask_b).sum() / dmask_b.sum()
-                loss = loss + EXTREME_BCE_WEIGHT * dust_bce
+                loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
+                    model._last_dust_logit, dust_b, dmask_b, dust_pos_weight)
             # 게이트 엔트로피 정규화 — 가중치를 소수 축에 집중시키는 압력.
             # 이 항이 없으면 게이트도 정적 α/φ 와 마찬가지로 무용 축의
             # 가중치를 키우는 방향으로 학습된다(Phase 3-4 실측).
@@ -730,9 +915,11 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         model.eval()
         temp_abs, precip_abs, precip_preds, deltas = [], [], [], []
         heat_probs, cold_probs, dust_probs = [], [], []
-        heat_true, cold_true, dust_true, dust_mask_all = [], [], [], []
+        heat_true, cold_true, dust_true = [], [], []
+        heat_mask_all, cold_mask_all, dust_mask_all = [], [], []
         with torch.no_grad():
-            for i, (x_num, x_img, x_txt, y_b, heat_b, cold_b, dust_b, dmask_b) in enumerate(val_loader):
+            for i, (x_num, x_img, x_txt, y_b, heat_b, cold_b, dust_b,
+                    hmask_b, cmask_b, dmask_b) in enumerate(val_loader):
                 x_num, y_b = x_num.to(DEVICE), y_b.to(DEVICE)
                 x_img = x_img.to(DEVICE).float() if use_re else None
                 x_txt = x_txt.to(DEVICE) if use_im else None
@@ -746,7 +933,9 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                     t_now = x_num[:, 0] * model.feat_std[0] + model.feat_mean[0]
                     deltas.append((pred[:, 0] - t_now).abs())
                 heat_true.append(heat_b); cold_true.append(cold_b)
-                dust_true.append(dust_b); dust_mask_all.append(dmask_b)
+                dust_true.append(dust_b)
+                heat_mask_all.append(hmask_b); cold_mask_all.append(cmask_b)
+                dust_mask_all.append(dmask_b)
                 if hasattr(model, "head_heatwave"):
                     heat_probs.append(torch.sigmoid(model._last_heatwave_logit).squeeze(-1).cpu())
                 if hasattr(model, "head_coldwave"):
@@ -760,18 +949,19 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         precip_std     = torch.cat(precip_preds).std().item()
         delta_mag      = torch.cat(deltas).mean().item() if deltas else 0.0
 
+        # 세 사건 모두 공식 라벨이 있는 표본에서만 채점한다 — 학습에서 뺀
+        # 표본을 채점에 넣으면 "판정 불가"가 음성으로 둔갑해 수치가 부풀려진다.
         extreme_metrics = {}
-        if heat_probs:
-            extreme_metrics["heatwave"] = _prf_metrics(
-                torch.cat(heat_probs), torch.cat(heat_true))
-        if cold_probs:
-            extreme_metrics["coldwave"] = _prf_metrics(
-                torch.cat(cold_probs), torch.cat(cold_true))
-        if dust_probs:
-            dmask_cat = torch.cat(dust_mask_all).bool()
-            if dmask_cat.sum() > 0:
-                extreme_metrics["dust"] = _prf_metrics(
-                    torch.cat(dust_probs)[dmask_cat], torch.cat(dust_true)[dmask_cat])
+        for _key, _probs, _true, _masks in (
+                ("heatwave", heat_probs, heat_true, heat_mask_all),
+                ("coldwave", cold_probs, cold_true, cold_mask_all),
+                ("dust",     dust_probs, dust_true, dust_mask_all)):
+            if not _probs:
+                continue
+            _m = torch.cat(_masks).bool()
+            if _m.sum() > 0:
+                extreme_metrics[_key] = _prf_metrics(
+                    torch.cat(_probs)[_m], torch.cat(_true)[_m])
 
         # 조기 종료 기준: 두 baseline 대비 상대 오차의 합 (skill score)
         # 1.0 미만이면 해당 지표가 baseline 을 이긴 것.
@@ -845,6 +1035,15 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "std":          full_ds.std.tolist(),
                 "temp_mean":    full_ds.temp_mean,
                 "precip_mean":  full_ds.precip_mean,
+                # 이 체크포인트가 어떤 분할로 학습됐는지 — 진단 스크립트가
+                # 같은 검증셋에서 채점하려면 필요하다. 없으면(구버전)
+                # "random" 으로 읽는다.
+                "split_mode":   SPLIT_MODE,
+                "batch_size":   BATCH_SIZE,
+                "lr":           LR,
+                "extreme_label_masking": EXTREME_LABEL_MASKING,
+                "extreme_bce_weight": EXTREME_BCE_WEIGHT,
+                "crop_oversample": CROP_OVERSAMPLE,
             }, checkpoint)
         else:
             no_improve += 1
@@ -873,10 +1072,26 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
               f"{'ON' if orthogonalize else 'OFF'}"
               f" | 기온Δ {'ON' if persistence_residual else 'OFF'})")
         print(f"{'-'*70}")
-        print(f" 기온 MAE : {best_temp_only:.4f} °C  vs 퍼시스턴스 "
-              f"{temp_naive:.4f} °C  → {result['temp_gain_pct']:+.1f}%")
-        print(f" 강수 MAE : {best_precip_only:.4f} mm  vs 상시0예측 "
-              f"{precip_naive:.4f} mm  → {result['precip_gain_pct']:+.1f}%")
+        # 체크포인트에 실제로 저장된 값(= best_stats, 결합 val_score 최저
+        # 에폭 기준)을 보고한다. best_temp_only/best_precip_only 는 그와
+        # 다르다 — 두 지표가 각각 독립적으로 가장 좋았던(서로 다른 수 있는)
+        # 에폭의 값이라, 어느 체크포인트도 실제로 동시에 내지 못한 조합일
+        # 수 있다(2026-08-16 실측: 13년 재학습에서 기온 1.3290°C로
+        # 찍혔지만 저장된 체크포인트는 1.3551°C — 결합 최적 에폭이 달랐다).
+        # 화면·문서에 옮겨 적는 숫자가 실제 배포되는 체크포인트와 다르면
+        # 안 되므로 여기서 헷갈릴 여지를 없앤다.
+        temp_mae_deployed   = best_stats["val_temp_mae"]
+        precip_mae_deployed = best_stats["val_precip_mae"]
+        temp_gain   = (1 - temp_mae_deployed   / temp_naive)   * 100
+        precip_gain = (1 - precip_mae_deployed / precip_naive) * 100
+        print(f" 기온 MAE : {temp_mae_deployed:.4f} °C  vs 퍼시스턴스 "
+              f"{temp_naive:.4f} °C  → {temp_gain:+.1f}%")
+        print(f" 강수 MAE : {precip_mae_deployed:.4f} mm  vs 상시0예측 "
+              f"{precip_naive:.4f} mm  → {precip_gain:+.1f}%")
+        if abs(best_temp_only - temp_mae_deployed) > 1e-4 or \
+           abs(best_precip_only - precip_mae_deployed) > 1e-4:
+            print(f" (참고 — 지표별 독립 최저치, 체크포인트 값과 다름: "
+                  f"기온 {best_temp_only:.4f}°C / 강수 {best_precip_only:.4f}mm)")
         print(f" 학습 에폭: {epoch}  (조기종료 {'ON' if early_stop else 'OFF'})")
         print(f" 강수 예측 표준편차: {best_stats['precip_pred_std']:.4f} mm  "
               f"({'정상 — 입력에 반응함' if best_stats['precip_pred_std'] > 1e-3 else '⚠ 붕괴 — 상수 출력'})")
@@ -905,8 +1120,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         if em:
             print(f"{'-'*70}")
             print(f" 극한기상 헤드 (판정 임계 0.5, precision/recall/F1 — 양성희박이라 accuracy 무의미)")
-            print(f"   라벨 소스 — 폭염·한파: 기상청 공식 특보(있으면)+임계값 근사(없으면) 폴백"
-                  f" / 황사: 공식 라벨만(판정 불가 표본 제외)")
+            print(f"   라벨 소스 — 폭염·한파·황사 모두 기상청 공식 라벨만 사용"
+                  f"(판정 불가 표본은 학습·채점 양쪽에서 제외)")
             for name, m in (("폭염", em.get("heatwave")),
                             ("한파", em.get("coldwave")),
                             ("황사", em.get("dust"))):

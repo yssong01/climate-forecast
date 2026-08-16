@@ -40,9 +40,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import stats
-from torch.utils.data import random_split
 
-from train import collect_historical, WeatherDataset, VAL_RATIO, SEED
+from train import collect_historical, WeatherDataset, VAL_RATIO, SEED, make_split
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
 from weather_collector import STATION_COORDS
@@ -103,10 +102,7 @@ def main():
     )
     # 학습 때와 동일한 시드로 분할해 검증셋만 뽑는다 — 학습에 쓰인 표본을
     # 분포 진단에 섞으면 과적합된 부분까지 "정상"으로 보게 된다.
-    n_val = max(2, int(len(ds) * VAL_RATIO))
-    n_train = len(ds) - n_val
-    _, val_ds = random_split(ds, [n_train, n_val],
-                             generator=torch.Generator().manual_seed(SEED))
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False)
     val_idx = val_ds.indices
     print(f"검증 표본: {len(val_idx)}개")
 

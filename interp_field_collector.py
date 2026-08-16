@@ -17,6 +17,9 @@ interp_field_collector.py — Re축을 "가짜 위성"에서 "12개 관측소 �
 채널 설계(SimulatedSatelliteCollector와 동일 4채널, 물리량만 다름):
   채널 0: 기온   채널 1: 습도   채널 2: 기압   채널 3: 풍속
 """
+import os
+import multiprocessing as mp
+
 import numpy as np
 
 IMG_SIZE = 32
@@ -36,6 +39,22 @@ _CHANNEL_SPEC = [
     ("pressure",    _norm_pres),
     ("wind_speed",  _norm_wind),
 ]
+
+
+# get_batch() 의 프로세스 풀 워커용 — fork 자식 프로세스에서만 채워진다.
+# 모듈 전역인 이유: Pool.imap 에 넘길 함수가 최상위(top-level)여야 pickling
+# 없이 fork 로 전달된다(바운드 메서드를 직접 넘기면 인스턴스 전체를 매
+# 태스크마다 pickle 하려 든다).
+_WORKER_COLLECTOR = None
+
+
+def _init_worker(collector):
+    global _WORKER_COLLECTOR
+    _WORKER_COLLECTOR = collector
+
+
+def _get_image_worker(record):
+    return _WORKER_COLLECTOR.get_image(record)
 
 
 class InterpolatedFieldCollector:
@@ -89,13 +108,36 @@ class InterpolatedFieldCollector:
 
         return np.stack(channels, axis=0)   # (4, 32, 32)
 
-    def get_batch(self, records: list) -> np.ndarray:
+    def get_batch(self, records: list, n_workers: int = None) -> np.ndarray:
         """float16으로 직접 채운다 — records 개수가 많을 때(13년치, 130만+)
         'float32 리스트 전체 + np.stack 결과'가 동시에 메모리에 떠서 최종
         크기의 2배를 순간적으로 잡아먹는 걸 피하기 위함이다(2026-08-15
         OOM 실측 원인 중 하나). 학습 루프에서 모델에 넣기 직전 다시
-        float32로 캐스팅한다."""
-        out = np.empty((len(records), N_BANDS, IMG_SIZE, IMG_SIZE), dtype=np.float16)
-        for i, r in enumerate(records):
-            out[i] = self.get_image(r)
+        float32로 캐스팅한다.
+
+        표본 138만 개 기준 단일 스레드로 약 8분 걸린다(perf_profile.py
+        실측, 32코어 중 1개만 사용). 레코드별로 독립적인 계산(같은 시각
+        스냅샷 조회 + IDW)이라 프로세스 풀로 병렬화한다. self.by_time
+        (레코드 전체의 시각 인덱스)은 fork 시 COW로 워커에 그대로 공유되므로
+        다시 만들거나 프로세스 간에 옮길 필요가 없고, 오가는 건 record
+        하나(작은 dict)뿐이다. 표본이 적으면(스모크 테스트 등) 병렬화
+        오버헤드가 이득보다 커 단일 스레드로 그대로 처리한다.
+        """
+        n = len(records)
+        if n_workers is None:
+            # 8/16/24/30 워커 실측(2026-08-16, 20만 표본): 8→3.9배, 16→4.3배,
+            # 그 이상은 거의 안 늘었다(24·30도 16과 오차범위 내). 코어를
+            # 더 얹어도 안 빨라지는 지점부터는 다른 프로세스(다른 실험 등)에
+            # 코어를 남겨주는 게 낫다.
+            n_workers = min(16, max(1, (os.cpu_count() or 4) - 2))
+        out = np.empty((n, N_BANDS, IMG_SIZE, IMG_SIZE), dtype=np.float16)
+        if n_workers <= 1 or n < 20_000:
+            for i, r in enumerate(records):
+                out[i] = self.get_image(r)
+            return out
+        chunksize = max(1, n // (n_workers * 8))
+        ctx = mp.get_context("fork")
+        with ctx.Pool(n_workers, initializer=_init_worker, initargs=(self,)) as pool:
+            for i, img in enumerate(pool.imap(_get_image_worker, records, chunksize=chunksize)):
+                out[i] = img
         return out

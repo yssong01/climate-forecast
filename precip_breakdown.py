@@ -12,9 +12,8 @@ precip_breakdown.py — 강수 MAE가 baseline(상시 0예측)에 지는 이유�
 """
 import numpy as np
 import torch
-from torch.utils.data import random_split
 
-from train import collect_historical, WeatherDataset, VAL_RATIO, SEED
+from train import collect_historical, WeatherDataset, VAL_RATIO, SEED, make_split
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
 from weather_collector import STATION_COORDS
@@ -39,10 +38,7 @@ def main():
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )
-    n_val = max(2, int(len(ds) * VAL_RATIO))
-    n_train = len(ds) - n_val
-    _, val_ds = random_split(ds, [n_train, n_val],
-                             generator=torch.Generator().manual_seed(SEED))
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False)
     val_idx = val_ds.indices
 
     preds, actuals = [], []

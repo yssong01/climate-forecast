@@ -28,9 +28,8 @@ threshold_validation.py — 임계값 재보정이 진짜 개선인지, 검증�
 """
 import numpy as np
 import torch
-from torch.utils.data import random_split
 
-from train import collect_historical, WeatherDataset, VAL_RATIO, SEED, WET_THRESH
+from train import collect_historical, WeatherDataset, VAL_RATIO, SEED, WET_THRESH, make_split
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
 from weather_collector import STATION_COORDS
@@ -81,9 +80,7 @@ def main():
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )
-    n_val = max(2, int(len(ds) * VAL_RATIO))
-    _, val_ds = random_split(ds, [len(ds) - n_val, n_val],
-                             generator=torch.Generator().manual_seed(SEED))
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False)
     val_idx = np.array(val_ds.indices)
 
     rain_p, heat_p, cold_p, dust_p = [], [], [], []
@@ -99,11 +96,17 @@ def main():
             if hasattr(model, "head_dust"):
                 dust_p.append(torch.sigmoid(model._last_dust_logit).squeeze(-1).cpu().numpy())
 
+    # 폭염·한파·황사는 전부 공식 라벨이 있는 표본에서만 채점한다 — 마스크=0인
+    # 표본의 라벨 0 은 "사건 없음"이 아니라 "판정 불가"다(train.py 참고).
     precip_a = ds.y[val_idx, 1].numpy()
+    hmask = ds.heat_mask[val_idx].numpy().astype(bool)
+    cmask = ds.cold_mask[val_idx].numpy().astype(bool)
     heads = [
         ("강수", np.concatenate(rain_p), (precip_a >= WET_THRESH).astype(int)),
-        ("폭염", np.concatenate(heat_p), ds.y_heatwave[val_idx].numpy().astype(int)),
-        ("한파", np.concatenate(cold_p), ds.y_coldwave[val_idx].numpy().astype(int)),
+        ("폭염", np.concatenate(heat_p)[hmask],
+         ds.y_heatwave[val_idx].numpy().astype(int)[hmask]),
+        ("한파", np.concatenate(cold_p)[cmask],
+         ds.y_coldwave[val_idx].numpy().astype(int)[cmask]),
     ]
     if dust_p:
         dmask = ds.dust_mask[val_idx].numpy().astype(bool)

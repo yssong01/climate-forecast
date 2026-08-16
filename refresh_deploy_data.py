@@ -42,6 +42,7 @@ CLAUDE.md 4절)의 3% 수준이고, collect_incremental.py 가 안전하다고 �
 import argparse
 import json
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
@@ -56,6 +57,14 @@ WINDOW_DAYS = 10          # build_recent_window.py 와 동일 — 72시간 + 여
 MAX_GAP_HOURS = 72        # 장기 미실행 시 한 번에 채울 상한 (관측소당)
 SEED_HOURS = 24           # 창에 아예 없는 관측소를 새로 채울 때의 초기 분량
 CONCURRENCY = 6
+
+# 신선도 감시 임계값 — 이 갱신이 끝난 뒤에도 가장 뒤처진 관측소가 기준
+# 시각보다 이만큼 이상 묵었으면 실행을 실패로 표시한다(2026-08-16 실측:
+# 워크플로가 6~7시간 주기로 "성공"을 계속 찍었는데도 실제 데이터는
+# 03:00 KST 에서 멈춰 화면에 12시간 전 데이터가 떴다 — API 실패를 개수만
+# 세고 넘어갈 뿐 아무도 알아채지 못하게 설계돼 있었다). 정상 실행이면
+# ASOS 발표 지연을 감안해도 이 안에 들어와야 한다.
+MAX_STALE_HOURS = int(os.getenv("MAX_STALE_HOURS", "3"))
 
 
 def _obs_hour_ceiling() -> datetime:
@@ -197,6 +206,25 @@ def main():
     calls = api_call_stats()
     print(f"API 호출: {calls['count']}건 (예산 {calls['budget']}건, "
           f"차단 {calls['blocked']}건)")
+
+    # ── 신선도 게이트 — 조용한 실패를 CI 빨간불로 바꾼다 ─────────────────
+    # 지금까지는 성공/실패 개수를 출력만 하고 종료 코드는 항상 0이었다.
+    # "그 시각 관측이 아직 발표 안 됨"과 "API·네트워크가 진짜 막힘"이
+    # 화면상 똑같이 "실패"로 찍혀 구분이 안 됐고, 후자가 반복돼도 워크플로는
+    # 계속 초록불이었다(2026-08-16, 배포 화면에 12시간 전 데이터 노출로 발견).
+    # 최신 관측이 기준 시각보다 MAX_STALE_HOURS 이상 뒤처진 관측소가 있으면
+    # 실행 자체를 실패로 표시해 GitHub 알림·빨간불로 드러낸다.
+    latest_after = _latest_per_station(records)
+    stale = {station_names.get(s, s): (ceiling - dt).total_seconds() / 3600
+            for s, dt in latest_after.items()}
+    worst_name, worst_gap = (max(stale.items(), key=lambda kv: kv[1])
+                             if stale else (None, 0.0))
+    if worst_gap > MAX_STALE_HOURS:
+        print(f"::error::신선도 게이트 실패 — {worst_name} 관측이 기준 시각보다 "
+              f"{worst_gap:.1f}시간 뒤처졌습니다(허용 {MAX_STALE_HOURS}시간). "
+              f"API 실패가 조용히 누적됐을 수 있습니다 — 위 '실패·미발표' 건수를 "
+              f"확인하세요.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

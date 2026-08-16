@@ -7,6 +7,11 @@ accuracy.py 의 live 경로는 예보를 만들고 +6시간을 기다려야 1건
 동일한 전처리 경로(train.WeatherDataset)로 모델을 한 번 더 통과시켜
 "만약 이 시점에 이 모델로 예보했다면"을 그대로 재구성한다.
 
+체크포인트가 학습된 분할(split_mode)의 **검증 인덱스만** 시딩한다
+(2026-08-16 수정 — 예전에는 전체 표본을 썼는데, 그러면 학습에 쓴 표본
+으로도 적중률을 계산하게 돼 화면 설명("실제 운영 시각에 실제로 조회
+가능했던 데이터로 낸 값")과 어긋났다).
+
 새 API 호출은 하지 않는다 — train.collect_historical() 은 캐시가 이미
 조건을 만족하면 그대로 반환한다.
 
@@ -16,7 +21,7 @@ accuracy.py 의 live 경로는 예보를 만들고 +6시간을 기다려야 1건
 import numpy as np
 import torch
 
-from train import collect_historical, WeatherDataset
+from train import collect_historical, WeatherDataset, make_split
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
 from weather_collector import STATION_COORDS
@@ -49,32 +54,44 @@ def main():
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )
-    n = len(ds)
-    print(f"백테스트 대상: {n}개 (t, t+{ckpt['lead_hours']}h) 쌍")
+
+    # 검증셋에만 시딩한다 — 예전에는 records 전체(학습에 쓴 표본 포함)로
+    # 적중률을 채웠는데, 그러면 "실제 운영 시각에 실제로 조회 가능했던
+    # 데이터로 낸 값"이라는 화면 설명과 달리 모델이 이미 학습 중에 본 표본
+    # 으로도 적중률을 계산하게 된다 — 오늘 확인한 검증 누수와 같은 종류의
+    # 문제다(2026-08-16 배포 전 점검에서 발견). 체크포인트가 실제로 학습된
+    # 분할(split_mode)을 그대로 재현해 그 검증 인덱스만 쓴다.
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False)
+    val_idx = list(val_ds.indices)
+    n = len(val_idx)
+    print(f"백테스트 대상: {n}개 (t, t+{ckpt['lead_hours']}h) 쌍 "
+          f"— 검증셋만(split_mode={ckpt.get('split_mode', 'random')})")
 
     preds = []
     with torch.no_grad():
         for b in range(0, n, BATCH):
-            sl = slice(b, b + BATCH)
+            idx = val_idx[b:b + BATCH]
             pred = model(
-                num_x=ds.X_num[sl].to(DEVICE),
-                img_x=ds.X_img[sl].to(DEVICE).float() if ds.X_img is not None else None,
-                txt_x=ds.X_txt[sl].to(DEVICE) if ds.X_txt is not None else None,
+                num_x=ds.X_num[idx].to(DEVICE),
+                img_x=ds.X_img[idx].to(DEVICE).float() if ds.X_img is not None else None,
+                txt_x=ds.X_txt[idx].to(DEVICE) if ds.X_txt is not None else None,
             )
             preds.append(pred.cpu().numpy())
     preds = np.concatenate(preds, axis=0)
 
+    model_id = accuracy.model_fingerprint(CHECKPOINT)
     entries = []
-    for i in range(n):
+    for k, i in enumerate(val_idx):
         entries.append({
             "station": ds.stns[i],
             "made_at": ds.src_timestamps[i],
             "target_time": ds.tgt_timestamps[i],
-            "pred_temp": round(float(preds[i, 0]), 3),
-            "pred_precip": round(float(max(0.0, preds[i, 1])), 3),
+            "pred_temp": round(float(preds[k, 0]), 3),
+            "pred_precip": round(float(max(0.0, preds[k, 1])), 3),
             "actual_temp": round(float(ds.y[i, 0].item()), 3),
             "actual_precip": round(float(ds.y[i, 1].item()), 3),
             "source": "backtest",
+            "model_id": model_id,
         })
 
     # accuracy.py 의 스키마·적중 판정과 일치시켜 하나로 합쳐 쓸 수 있게 한다.
@@ -89,7 +106,7 @@ def main():
     live_only = [e for e in existing if e["source"] != "backtest"]
     accuracy._save(live_only + entries)
 
-    s = accuracy.stats()
+    s = accuracy.stats(model_id=model_id)
     print(f"\n시딩 완료 — 누적 {s['cum_n']}건 | "
           f"기온 적중률 {s['cum_temp']:.1%} | 강수 적중률 {s['cum_precip']:.1%}")
     print(f"(기온 허용오차 ±{accuracy.HIT_TEMP_TOL}°C, "

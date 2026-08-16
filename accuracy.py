@@ -45,6 +45,17 @@ LOG_PATH       = "./cache/accuracy_log.json"
 _lock = threading.Lock()
 
 
+def model_fingerprint(checkpoint_path: str) -> str:
+    """체크포인트 파일의 신원(수정시각·크기) — 그 체크포인트가 만든 예측을
+    구분하는 model_id 로 쓴다. app.py 의 캐시 무효화 키(ckpt_fingerprint)와
+    같은 방식이라 여기로 모아 하나만 유지한다."""
+    try:
+        st_ = os.stat(checkpoint_path)
+        return f"{st_.st_mtime_ns}:{st_.st_size}"
+    except OSError:
+        return "missing"
+
+
 def _load(path: str = LOG_PATH) -> list:
     if not os.path.exists(path):
         return []
@@ -79,11 +90,18 @@ def _hit(pred_temp, pred_precip, actual_temp, actual_precip):
 
 def record_prediction(station: str, made_at: str, target_time: str,
                       pred_temp: float, pred_precip: float,
-                      source: str = "live", path: str = LOG_PATH) -> None:
+                      source: str = "live", path: str = LOG_PATH,
+                      model_id: str = None) -> None:
     """
     새 예보 1건을 로그에 추가. (station, target_time, source) 가 이미 있으면
     건너뛴다 — 대시보드가 자동 갱신될 때마다 같은 +6h 목표시각을 다시
     예측해도 로그가 중복으로 쌓이지 않도록.
+
+    model_id — 이 예측을 만든 체크포인트의 식별자(model_fingerprint() 참고).
+    체크포인트를 교체하면 같은 로그에 서로 다른 모델의 기록이 쌓이는데,
+    구분이 없으면 화면의 "누적 적중률"이 어느 모델도 아닌 혼합값이 된다
+    (2026-08-16 배포 전 점검에서 발견). 옛 항목에는 이 필드가 없으므로
+    stats() 는 그런 항목을 "legacy" 로 취급한다.
     """
     with _lock:
         entries = _load(path)
@@ -101,6 +119,7 @@ def record_prediction(station: str, made_at: str, target_time: str,
             "hit_temp": None,
             "hit_precip": None,
             "source": source,
+            "model_id": model_id,
         })
         _save(entries, path)
 
@@ -155,13 +174,22 @@ def log_summary(path: str = LOG_PATH) -> dict:
     }
 
 
-def stats(station: str = None, recent_n: int = 20, path: str = LOG_PATH) -> dict:
+def stats(station: str = None, recent_n: int = 20, path: str = LOG_PATH,
+          model_id: str = None) -> dict:
     """
     누적/최근 적중률. station=None 이면 전 관측소 합산.
     반환: {"cum_n","cum_temp","cum_precip","recent_n","recent_temp","recent_precip"}
     값이 없으면 해당 항목은 None.
+
+    model_id — 지정하면 그 모델(model_fingerprint 값)이 만든 예측만 집계한다.
+    체크포인트를 바꾸면 같은 로그에 다른 모델의 기록이 섞이는데, 필터링 없이
+    합산하면 "누적 적중률"이 어느 모델의 성능도 아닌 값이 된다(2026-08-16
+    배포 전 점검에서 발견 — 지금까지는 이 구분 없이 전부 합산했다). 지정하지
+    않으면 예전처럼 전부 합산한다(레거시 호출부 호환용 기본값).
     """
     entries = [e for e in _load(path) if e["actual_temp"] is not None]
+    if model_id is not None:
+        entries = [e for e in entries if e.get("model_id") == model_id]
     if station:
         entries = [e for e in entries if e["station"] == station]
     entries.sort(key=lambda e: e["target_time"])
