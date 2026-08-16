@@ -734,6 +734,8 @@ with tab_trend:
         )
 
     st.markdown("#### +%d시간 뒤 모델 출력값" % lead)
+    _val_temp_mae = ckpt.get("val_temp_mae")
+    _val_precip_mae = ckpt.get("val_precip_mae")
     fc1, fc2 = st.columns(2)
     fc1.metric(
         "기온 출력값", f"{f['temperature']:.1f} °C",
@@ -742,6 +744,12 @@ with tab_trend:
              "계산해 더합니다. 평균적으로 '성능 검증' 탭의 기온 MAE만큼 오차가 "
              "예상됩니다.",
     )
+    if _val_temp_mae is not None:
+        fc1.markdown(
+            f"<span style='font-size:0.8em; color:gray;'>(오차범위 ±{_val_temp_mae:.2f} °C "
+            f"— 검증셋 평균오차, 이 예측 하나의 신뢰구간이 아님)</span>",
+            unsafe_allow_html=True,
+        )
     fc2.metric(
         "강수 출력값", f"{f['precipitation']:.1f} mm",
         delta=f"{f['precipitation'] - c['precipitation']:+.1f} mm (현재 대비)",
@@ -750,6 +758,12 @@ with tab_trend:
              f"'모델 구조' 탭에 그림과 설명). 확률이 낮으면 양이 커도 최종값이 0에 "
              f"가까워집니다. {PRECIP_CLIP_THRESH}mm 미만은 0으로 반올림합니다.",
     )
+    if _val_precip_mae is not None:
+        fc2.markdown(
+            f"<span style='font-size:0.8em; color:gray;'>(오차범위 ±{_val_precip_mae:.3f} mm "
+            f"— 검증셋 평균오차, 이 예측 하나의 신뢰구간이 아님)</span>",
+            unsafe_allow_html=True,
+        )
     st.caption(
         "⚠️ 강수량은 이 프로젝트에서 가장 약한 부분입니다 — '성능 검증' 탭의 "
         "강수 MAE 설명을 함께 읽어주세요."
@@ -949,6 +963,31 @@ with tab_perf:
                 f"🌫️ 황사는 이 표에서 뺐습니다 — 정밀도 {_dust_m['precision']:.0%}"
                 f"(F1 {_dust_m['f1']:.3f})로 재보정해도 실용 수준이 못 됩니다. "
                 "'극한 기상' 탭에서 이유를 자세히 설명합니다."
+            )
+
+        st.markdown("---")
+        st.markdown("#### 관측소별 성능 — 어디서 더 믿을 수 있나?")
+        st.caption(
+            "위 표는 12개 관측소를 합친 평균입니다. 관측소마다 흩어보면 다릅니다. "
+            "가로축 재현율·세로축 정밀도에 관측소 하나당 점 하나, 십자 모양이 "
+            "그 관측소 표본으로 계산한 95% 신뢰구간(Wilson score)입니다 — "
+            "표본이 적을수록 십자가 커집니다(신뢰도가 낮다는 뜻을 그대로 보여줍니다). "
+            "정확도(accuracy) 대신 재현율·정밀도를 쓴 이유는 위와 같습니다(양성 희박)."
+        )
+        _calib_path = "./docs/images/calibration_plot.png"
+        if os.path.exists(_calib_path):
+            st.image(_calib_path, width="stretch")
+            st.caption(
+                "폭염은 대부분 관측소가 한 덩어리로 모여 있는데 부산(159)만 뚝 떨어져 "
+                "있습니다(재현율 71%·정밀도 47%, 다른 관측소와 신뢰구간이 안 겹침) — "
+                "부산만 따로 볼 만합니다. 한파는 표본이 적은 남부·해안 관측소(제주·부산·"
+                "광주·전주, 검증셋 양성 24~192건)가 십자가 아주 크고 값도 0에 가까워 — "
+                "'못 맞힌다'가 아니라 '판단할 만큼 사건이 없었다'로 읽어야 합니다."
+            )
+        else:
+            st.caption(
+                "관측소별 플롯이 아직 없습니다 — `calibration_plot_diagnose.py`를 "
+                "실행하면 생성됩니다(재학습 때마다 갱신 필요)."
             )
 
     st.markdown("---")
