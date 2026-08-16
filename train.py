@@ -133,6 +133,11 @@ _MIN_WARMUP_EPOCHS = 3   # 극단적으로 큰 데이터셋에서도 최소한�
 COMPACT_SATELLITE = True
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
 SEED          = 42     # 학습/검증 분할 고정 → ablation 비교 가능
+# 모델 초기화·학습 stochasticity(가중치 초기값, DataLoader 셔플 순서)만
+# 따로 흔들고 싶을 때 쓴다 — SEED(분할)는 그대로 두고 이것만 바꾸면 같은
+# train/val 분할에서 "이번 결과가 이 재학습 런의 우연인지, 재현되는
+# 구조적 현상인지"를 가릴 수 있다(2026-08-16, A안 롤백 원인 조사).
+INIT_SEED     = int(os.getenv("INIT_SEED", str(SEED)))
 
 # Phase 3-7 hurdle 헤드 — precip_breakdown.py 실측(2026-08-07): 검증셋의
 # 93.3%가 무강수인데 softplus 단독 강수 헤드는 정확히 0을 못 내, 그 미세한
@@ -679,8 +684,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         print(f" 위성 인코더: {'소형 CNN' if COMPACT_SATELLITE else 'ResNet18'}")
         print(f"{'='*70}\n")
 
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
+    torch.manual_seed(INIT_SEED)
+    np.random.seed(INIT_SEED)
 
     records = collect_historical()
     if len(records) < 20:
