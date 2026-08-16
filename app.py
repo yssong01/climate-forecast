@@ -34,7 +34,7 @@ from streamlit_autorefresh import st_autorefresh
 
 from weather_collector import STATIONS, STATION_COORDS, api_call_stats
 from predict import (
-    load_model, predict, CHECKPOINT, EXTREME_EVENT_THRESH, PRECIP_CLIP_THRESH,
+    load_model, predict, CHECKPOINT, event_threshold, PRECIP_CLIP_THRESH,
 )
 import accuracy
 
@@ -786,10 +786,10 @@ with tab_extreme:
         )
         if ev.get("heatwave") is not None:
             event_gauge("🔥 폭염 확률", ev["heatwave"],
-                        EXTREME_EVENT_THRESH["heatwave"], "#E2954F")
+                        event_threshold("heatwave", stn), "#E2954F")
         if ev.get("coldwave") is not None:
             event_gauge("🥶 한파 확률", ev["coldwave"],
-                        EXTREME_EVENT_THRESH["coldwave"], "#4C78A8")
+                        event_threshold("coldwave", stn), "#4C78A8")
 
         st.caption(
             "⚠️ 황사 확률은 이 화면에서 뺐습니다. 재보정 후에도 정밀도가 0.117"
@@ -807,10 +807,10 @@ with tab_extreme:
                 "|---|---|---|\n"
                 "| 🔥 폭염 | 기상청이 실제로 발표한 폭염주의보 기록(해당 날짜·관측소). "
                 "기록이 없는 표본은 학습·채점 양쪽에서 제외 | "
-                f"{EXTREME_EVENT_THRESH['heatwave']:.0%} |\n"
+                f"{event_threshold('heatwave', stn):.0%} |\n"
                 "| 🥶 한파 | 실제 발표된 한파주의보 기록. 같은 방식으로 기록이 없는 "
                 "표본은 제외 | "
-                f"{EXTREME_EVENT_THRESH['coldwave']:.0%} |\n"
+                f"{event_threshold('coldwave', stn):.0%} |\n"
             )
         st.caption(
             "이전에는 공식 기록이 없는 표본을 순간 기온 임계값(폭염 33°C 이상· "
@@ -822,8 +822,11 @@ with tab_extreme:
         st.caption(
             "판정선이 항상 0.5는 아닌 이유: 사건이 드물어 0.5가 최선이 아닐 수 있어, "
             "검증셋을 둘로 나눠 재보정을 시도합니다(절차는 '성능 검증' 탭 참고). "
-            "폭염·한파는 이번 재보정의 이득이 통계적으로 유의하지 않아(순이득 각각 "
-            "0.005·0.009 — 채택 기준 0.01에 못 미침) 기본값 0.5를 그대로 씁니다."
+            "전체 관측소를 합쳐 보면 폭염·한파는 재보정 이득이 통계적으로 유의하지 "
+            "않아서(순이득 각각 0.005·0.009 — 채택 기준 0.01에 못 미침) 기본값 0.5를 "
+            "그대로 씁니다. 다만 부산은 예외입니다 — 관측소별로 쪼개보니 부산 폭염만 "
+            "정밀도가 확연히 낮았고(아래 '관측소별 성능' 참고), 부산만 따로 재보정한 "
+            "결과 순이득 +0.039로 유의해 부산 판정선만 0.33으로 낮췄습니다."
         )
         st.caption(
             "호우(강수)는 이 탭에 게이지가 없습니다 — '출력값 추이' 탭의 강수량 값이 "
@@ -953,7 +956,7 @@ with tab_perf:
         st.caption(
             "주의 — 이 표의 값은 확률 0.5를 기준으로 계산한 것이라, '극한 기상' 탭의 "
             "빨간 판정선(폭염 "
-            f"{EXTREME_EVENT_THRESH['heatwave']:.0%} · 한파 {EXTREME_EVENT_THRESH['coldwave']:.0%})"
+            f"{event_threshold('heatwave', stn):.0%} · 한파 {event_threshold('coldwave', stn):.0%})"
             "을 적용했을 때의 성능과는 다릅니다. "
             "판정선을 올리면 오탐(정밀도↑)은 줄고 놓침(재현율↓)은 늘어납니다."
         )

@@ -62,6 +62,24 @@ EXTREME_EVENT_THRESH = {
     "dust":     0.81,
 }
 
+# 관측소별 임계값 재보정(2026-08-16, station_threshold_check.py) — 부산은
+# calibration_plot_diagnose.py에서 폭염 정밀도만 확연히 낮게(47%) 나왔고,
+# station_anomaly_investigate.py로 원인도 확인했다(부산은 오탐일 때 기온이
+# 부산 자신의 실제 폭염일 평균보다 높다 — 공식 기준 자체가 다른데 모델은
+# 전체 관측소 공통 임계값을 씀). 보정용/평가용 분리 검증에서 순이득 +0.039로
+# 채택 기준(0.01)을 크게 넘어 채택. 다른 관측소는 순이득이 기준 미달이거나
+# 아직 검증하지 않아 전역 임계값을 그대로 쓴다 — 검증 없이 관측소마다
+# 따로 고르면 과적합이라는 규약(threshold_validation.py)은 관측소 단위에도
+# 똑같이 적용된다.
+STATION_EVENT_THRESH_OVERRIDES = {
+    ("159", "heatwave"): 0.33,   # 부산 — 순이득 +0.039, t±0.02 F1 폭 0.0051(안정)
+}
+
+
+def event_threshold(event: str, stn: str) -> float:
+    """관측소별 재보정값이 있으면 그걸, 없으면 전역 기본값을 반환한다."""
+    return STATION_EVENT_THRESH_OVERRIDES.get((stn, event), EXTREME_EVENT_THRESH[event])
+
 
 def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
     """체크포인트에서 모델 아키텍처와 가중치를 복원한다."""
