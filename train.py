@@ -219,6 +219,13 @@ TEMPORAL_VAL_START = os.getenv("TEMPORAL_VAL_START", "20240102")
 # 1.0 = 끔(기존 동작과 동일, 균등 샘플링).
 CROP_OVERSAMPLE = float(os.getenv("CROP_OVERSAMPLE", "1.0"))
 
+# 극한기상 헤드에 부호 있는 표현(v_z)을 함께 넣을지 여부(2026-08-16).
+# Eq.1 융합이 제곱으로 부호를 없애 헤드가 |편차|만 보게 되고, 그 결과 실제
+# 관측에서 한겨울에 폭염 확률이 올라갔다(v9: −15°C 이하 85.7%가 0.5 초과).
+# 상세 진단은 seasonal_falsealarm_check.py 참고. 환경변수로 빼둔 이유는
+# 대조군(끈 상태)과 나란히 돌려 이 변경만의 효과를 분리하기 위함이다.
+SIGNED_HEAD_INPUT = os.getenv("SIGNED_HEAD_INPUT", "1") != "0"
+
 # 저장 경로도 환경변수로 뺀다(2026-08-16) — 기본값은 배포가 읽는 경로다.
 # seed를 바꿔가며 재현성을 확인하는 대조 실행은 서로 다른 경로에 저장해야
 # 한다. 안 그러면 ① 동시에 돌린 두 실행이 같은 파일을 덮어쓰고 ② 검증도
@@ -853,6 +860,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         wet_prior=wet_prior,
         heatwave_prior=heatwave_prior, coldwave_prior=coldwave_prior,
         dust_prior=dust_prior,
+        signed_head_input=SIGNED_HEAD_INPUT,
         im_dim=TENDENCY_DIM,   # Phase 3-11 — 384(MiniLM) 대신 12(경향벡터)
     ).to(DEVICE)
 
@@ -1093,6 +1101,10 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "dynamic_gate": dynamic_gate,
                 "compact_satellite": COMPACT_SATELLITE,
                 "im_dim":       TENDENCY_DIM,   # Im축 인코더 종류 복원용(384 vs 12)
+                # 극한기상 헤드 입력 폭 복원용 — True면 헤드가 embed_dim*2를
+                # 받는다. 없으면 False(구버전)로 읽혀 기존 체크포인트가 그대로
+                # 로드된다.
+                "signed_head_input": SIGNED_HEAD_INPUT,
                 "lead_hours":   lead_hours,
                 "num_features": NUM_FEATURES,
                 "alpha_init":   ALPHA_INIT,

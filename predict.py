@@ -36,44 +36,38 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 줄인다.
 PRECIP_CLIP_THRESH = 0.2  # mm — 이 미만 예측은 0으로 반올림
 
-# 극한기상 헤드 판정 임계값 — threshold_validation.py 재실측(2026-08-16,
-# v9 체크포인트 — 13년·그룹분할·12차원·한파 디커플링, A안 롤백 후 기준).
-#
-# 왜 A안(14차원, 연중 시각 특징)에서 롤백했는가: A안 재학습 직후 한파 헤드가
-# 기온에 거꾸로 반응하는 버그가 발견됐다(15°C→33°C로 올릴수록 한파확률이
-# 0.14→0.97로 상승, coldwave_sensitivity_check.py 실측). 디커플링 전(A안
-# 재학습 직후)부터 이미 나타난 문제라 원인은 디커플링이 아니라 A안 재학습
-# 자체다. 근본 원인 미파악 상태라 우선 A안 이전 체크포인트(v9)로 롤백했다
-# (README '정직한 한계' 참고). 임계값도 v9 기준으로 다시 쟀다.
+# 극한기상 헤드 판정 임계값 — threshold_validation.py 재실측(2026-08-17,
+# signed seed7 체크포인트 기준: 13년·그룹분할·14차원·극한기상 헤드에 부호
+# 표현 추가). 아래 값은 **확률 보정 전(원본) 공간**의 값이다 —
+# event_threshold() 가 체크포인트의 보정 곡선으로 옮겨서 돌려준다.
 #
 # 채택 기준: 보정용/평가용 분할에서 t=0.5 대비 순이득이 0.01을 넘는 것만
 # 재보정값을 쓴다(threshold_validation.py 자체 기준).
-#   강수    — 순이득 +0.099 → 재보정값(0.81) 채택, F1 0.500 (t=0.5는 0.402)
-#   폭염    — 순이득 +0.005 → 기준 미달, t=0.5 유지 (F1 0.812, 이미 근접 최적)
-#   한파    — 순이득 +0.009 → 기준 미달(0.01 문턱 근소 미달), t=0.5 유지
-#   황사    — 순이득 +0.028 → 재보정값(0.81) 채택. 다만 재보정해도 정밀도가
-#            낮아 화면에서는 제외했다. 헤드 자체는 유지한다(내부적으로는
-#            여전히 계산됨) — EXTREME_EVENT_THRESH 에 값을 남겨 predict()가
-#            확률은 계속 반환하되, app.py 가 표시하지 않는다.
+#   강수    — 순이득 +0.101 → 재보정값(0.83) 채택, F1 0.498 (t=0.5는 0.397)
+#   폭염    — 순이득 +0.004 → 기준 미달, t=0.5 유지 (F1 0.819)
+#   한파    — 순이득 +0.005 → 기준 미달, t=0.5 유지 (F1 0.454)
+#   황사    — 순이득 +0.002 → 기준 미달, t=0.5 유지. v9에서는 0.81을 채택
+#            했었으나 이 모델에서는 이득이 사라졌다. 어차피 정밀도가 낮아
+#            화면에서는 제외하지만, 헤드 자체는 유지되어 값은 계속 계산된다.
 EXTREME_EVENT_THRESH = {
-    "rain":     0.81,
+    "rain":     0.83,
     "heatwave": 0.50,
     "coldwave": 0.50,
-    "dust":     0.81,
+    "dust":     0.50,
 }
 
-# 관측소별 임계값 재보정(2026-08-16, station_threshold_check.py) — 부산은
-# calibration_plot_diagnose.py에서 폭염 정밀도만 확연히 낮게(47%) 나왔고,
-# station_anomaly_investigate.py로 원인도 확인했다(부산은 오탐일 때 기온이
-# 부산 자신의 실제 폭염일 평균보다 높다 — 공식 기준 자체가 다른데 모델은
-# 전체 관측소 공통 임계값을 씀). 보정용/평가용 분리 검증에서 순이득 +0.039로
-# 채택 기준(0.01)을 크게 넘어 채택. 다른 관측소는 순이득이 기준 미달이거나
-# 아직 검증하지 않아 전역 임계값을 그대로 쓴다 — 검증 없이 관측소마다
-# 따로 고르면 과적합이라는 규약(threshold_validation.py)은 관측소 단위에도
-# 똑같이 적용된다.
-STATION_EVENT_THRESH_OVERRIDES = {
-    ("159", "heatwave"): 0.33,   # 부산 — 순이득 +0.039, t±0.02 F1 폭 0.0051(안정)
-}
+# 관측소별 임계값 예외 — 현재 없음(2026-08-17 재검증).
+#
+# v9에서는 부산 폭염에 0.33을 적용했다. 부산만 정밀도가 확연히 낮았고
+# (47%), 원인도 확인했다 — 부산은 오탐일 때 기온이 부산 자신의 실제 폭염일
+# 평균보다 높아 공식 판정 기준 자체가 다른데 모델은 공통 기준으로 학습됐다.
+#
+# 그런데 극한기상 헤드에 부호 표현을 넣은 이 모델에서는 그 예외가 더 이상
+# 정당화되지 않는다: station_threshold_check.py 재실측 결과 부산 전용
+# 임계값(0.40)의 순이득이 **−0.0033** 으로 오히려 전역 0.5보다 나빴다
+# (부산 F1도 0.574로 올라왔다). 검증을 통과하지 못한 예외는 두지 않는다는
+# 규약(threshold_validation.py)에 따라 제거한다.
+STATION_EVENT_THRESH_OVERRIDES: dict = {}
 
 
 def raw_event_threshold(event: str, stn: str) -> float:
@@ -129,6 +123,9 @@ def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
         dynamic_gate=ckpt.get("dynamic_gate", True),
         compact_satellite=ckpt.get("compact_satellite", True),
         im_dim=ckpt.get("im_dim", 384),   # 384=MiniLM(구버전), 12=경향벡터
+        # 없으면 False — 이 플래그 도입 이전 체크포인트는 헤드 입력이
+        # embed_dim 이므로 그대로 복원해야 state_dict 이 맞는다.
+        signed_head_input=ckpt.get("signed_head_input", False),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

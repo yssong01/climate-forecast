@@ -287,7 +287,8 @@ class TriCHEFPipeline(nn.Module):
                  wet_prior: float = 0.067,
                  heatwave_prior: float = 0.01,
                  coldwave_prior: float = 0.003,
-                 dust_prior: float = 0.05):
+                 dust_prior: float = 0.05,
+                 signed_head_input: bool = False):
         """
         orthogonalize        : Gram-Schmidt 직교화 on/off (ablation 스위치)
         gs_eps               : 소프트 정규화 ε — gradient 상한 1/ε
@@ -382,12 +383,31 @@ class TriCHEFPipeline(nn.Module):
         #   한파주의보: 아침 최저기온 -12°C 이하
         # 강풍(≥14m/s)은 실측 빈도가 학습셋 환산 약 300표본(0.1%)으로
         # 지나치게 희박해 이번 확장에서 제외했다(정량 확인, 2026-08-07).
-        self.head_heatwave = _binary_head(embed_dim, heatwave_prior)
-        self.head_coldwave = _binary_head(embed_dim, coldwave_prior)
+        #
+        # signed_head_input (2026-08-16) — 극한기상 헤드에만 부호 있는 표현을
+        # 함께 넣는다. Eq.1 융합 `s=√((w·v)²)`는 제곱을 거치며 부호를 없애므로
+        # 헤드는 |편차|만 볼 뿐 "위로 벗어났는지 아래로 벗어났는지"를 모른다.
+        # 그 결과 극단적 저온과 극단적 고온이 비슷한 크기로 들어와, 실제
+        # 관측에서 한겨울에 폭염 확률이 올라갔다(v9 실측: −15°C 이하 809건 중
+        # 85.7%가 0.5 초과, seasonal_falsealarm_check.py). 회귀 기온 헤드가
+        # 퍼시스턴스 잔차 구조를 쓰는 이유와 정확히 같은 문제이며, 분류
+        # 헤드에서도 같은 원인이 작동한다는 것을 그동안 놓쳤다.
+        #
+        # v_z(정규화된 Z축 임베딩)는 제곱을 거치지 않아 부호가 살아 있다.
+        # 원본 num_x를 직접 넣지 않는 이유 — 거기엔 위도·경도가 들어 있어
+        # 헤드가 관측소를 암기할 통로가 된다(Phase 3-6 PPO에서 실제로 발생).
+        #
+        # 회귀(기온·강수)·강수 헤드는 건드리지 않는다. 진단된 결함은 극한기상
+        # 분류에 있고, 강수 경로는 이미 기준선 미달로 취약해 함께 바꾸면
+        # 원인 분리가 불가능해진다.
+        _ext_dim = embed_dim * 2 if signed_head_input else embed_dim
+        self.signed_head_input = signed_head_input
+        self.head_heatwave = _binary_head(_ext_dim, heatwave_prior)
+        self.head_coldwave = _binary_head(_ext_dim, coldwave_prior)
         # Phase 3-9 황사 헤드 — 폭염/한파와 동일 패턴. 라벨은 ASOS 현상번호
         # 추정치가 아니라 기상청 "날씨 이슈별 데이터"의 공식 황사관측여부를
         # 쓴다(import_weather_issues.py, 2026-08-09).
-        self.head_dust = _binary_head(embed_dim, dust_prior)
+        self.head_dust = _binary_head(_ext_dim, dust_prior)
 
         # 출력 편향 초기화 — magnitude 원소값이 ~1/√D 로 작아서 편향만
         # 학습하는 데 수십 에폭이 낭비되는 문제를 제거한다.
@@ -599,9 +619,14 @@ class TriCHEFPipeline(nn.Module):
         # 학습·추론 시 model._last_*_logit / extreme_event_probs() 로 읽는다.
         # forward() 반환 shape(B,2)를 그대로 유지해 predict.py 등 기존
         # 호출부를 건드리지 않는다(head_rain 도입 때와 같은 이유).
-        self._last_heatwave_logit = self.head_heatwave(magnitude)
-        self._last_coldwave_logit = self.head_coldwave(magnitude)
-        self._last_dust_logit = self.head_dust(magnitude)
+        # 극한기상 헤드에는 부호가 살아 있는 v_z 를 함께 넣는다(위 __init__
+        # signed_head_input 주석 참고). magnitude 는 제곱을 거쳐 |편차| 만
+        # 남으므로, 이것만으로는 한겨울과 한여름이 구분되지 않는다.
+        _ext_in = (torch.cat([magnitude, v_z], dim=-1)
+                   if self.signed_head_input else magnitude)
+        self._last_heatwave_logit = self.head_heatwave(_ext_in)
+        self._last_coldwave_logit = self.head_coldwave(_ext_in)
+        self._last_dust_logit = self.head_dust(_ext_in)
 
         return torch.cat([temp_pred, precip_pred], dim=-1)
 
