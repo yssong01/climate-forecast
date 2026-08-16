@@ -432,15 +432,21 @@ class RobustWeatherCollector:
 
     def to_model_vector(self, data: dict) -> list[float]:
         """
-        12차원 수치 벡터 반환 — train.record_to_vec 와 순서가 반드시 같아야 한다.
+        14차원 수치 벡터 반환 — train.record_to_vec 와 순서가 반드시 같아야 한다.
         [기온, 강수량, 습도, 풍속, 풍향sin, 풍향cos, 기압, 강수형태,
-         시각sin, 시각cos, 위도, 경도]
+         시각sin, 시각cos, 위도, 경도, 연중시각sin, 연중시각cos]
         """
         wd_rad = np.deg2rad(data.get("wind_dir", 0.0))
 
         ts = str(data.get("timestamp", ""))      # YYYYMMDDHHmm
         hour = int(ts[8:10]) if len(ts) >= 10 else 0
         h_rad = 2.0 * np.pi * hour / 24.0
+
+        if len(ts) >= 8:
+            doy = datetime.strptime(ts[:8], "%Y%m%d").timetuple().tm_yday
+        else:
+            doy = 1
+        y_rad = 2.0 * np.pi * doy / 365.25
 
         lat, lon = STATION_COORDS.get(str(data.get("stn", self.stn)), _COORD_DEFAULT)
 
@@ -457,6 +463,8 @@ class RobustWeatherCollector:
             float(np.cos(h_rad)),
             lat,
             lon,
+            float(np.sin(y_rad)),
+            float(np.cos(y_rad)),
         ]
 
 

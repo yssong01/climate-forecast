@@ -223,7 +223,7 @@ os.makedirs("./checkpoints", exist_ok=True)
 
 def record_to_vec(r: dict) -> list[float]:
     """
-    관측 레코드 → 12차원 수치 벡터.
+    관측 레코드 → 14차원 수치 벡터.
 
     인덱스 8·9(시각 sin/cos)는 Phase 3-4 에서 추가했다. 기온의 일주기
     (diurnal cycle)는 기온 예측의 지배적 요인인데 기존 8차원에는 시각
@@ -231,6 +231,11 @@ def record_to_vec(r: dict) -> list[float]:
     인덱스 10·11(위도·경도)은 다중 관측소 확장(1단계)에서 추가했다.
     관측소마다 기후가 다르므로(강릉의 동해 영향, 제주의 해양성 기후 등)
     지역 좌표 없이는 하나의 모델이 12개 관측소를 구분할 수 없다.
+    인덱스 12·13(연중 시각 sin/cos)은 2026-08-16 partition_heterogeneity.py
+    실측에서 추가했다 — 월(계절)은 기존 입력 어디에도 없는데, 시각을
+    이미 안 상태에서도 월이 ΔT 설명력을 추가로 +2.59%p(약 6.2배) 더
+    끌어올렸다(조건부 분산 분석). 관측소 η²=0.00%로 공간 분할 근거는
+    없었던 것과 대조적으로 계절축은 실제로 누락된 정보였다.
     인덱스 0(기온)은 퍼시스턴스 잔차 계산에 쓰이므로 위치를 바꾸지 말 것.
     """
     wd_rad = np.deg2rad(r.get("wind_dir", 0.0))
@@ -238,6 +243,12 @@ def record_to_vec(r: dict) -> list[float]:
     ts = str(r.get("timestamp", ""))            # YYYYMMDDHHmm
     hour = int(ts[8:10]) if len(ts) >= 10 else 0
     h_rad = 2.0 * np.pi * hour / 24.0
+
+    if len(ts) >= 8:
+        doy = datetime(int(ts[:4]), int(ts[4:6]), int(ts[6:8])).timetuple().tm_yday
+    else:
+        doy = 1
+    y_rad = 2.0 * np.pi * doy / 365.25
 
     lat, lon = STATION_COORDS.get(str(r.get("stn", "108")), (36.5, 127.5))
 
@@ -254,10 +265,12 @@ def record_to_vec(r: dict) -> list[float]:
         float(np.cos(h_rad)),           # 9: 시각 cos  ← 일주기
         lat,                            # 10: 위도     ← 관측소 위치
         lon,                            # 11: 경도     ← 관측소 위치
+        float(np.sin(y_rad)),           # 12: 연중 시각 sin ← 계절 주기
+        float(np.cos(y_rad)),           # 13: 연중 시각 cos ← 계절 주기
     ]
 
 
-NUM_FEATURES = 12   # record_to_vec 출력 차원
+NUM_FEATURES = 14   # record_to_vec 출력 차원
 
 
 # ── 2. 과거 데이터 수집 ───────────────────────────────────────────

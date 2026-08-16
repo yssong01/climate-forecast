@@ -167,6 +167,9 @@ def build_station_series(records: list, model, ckpt: dict,
     L = ckpt["lead_hours"]
     mean = np.array(ckpt["mean"], dtype=np.float32)
     std  = np.array(ckpt["std"],  dtype=np.float32)
+    # record_to_vec() 은 14차원(연중 시각 sin/cos, 2026-08-16 추가)인데 구버전
+    # 체크포인트는 12차원으로 학습됐다 — 그 체크포인트의 차원만큼만 잘라 쓴다.
+    nf = ckpt.get("num_features", len(mean))
 
     times = [_parse_ts(r["timestamp"]) for r in records]
     stns  = [str(r.get("stn")) for r in records]
@@ -185,7 +188,7 @@ def build_station_series(records: list, model, ckpt: dict,
           else SimulatedTextCollector())
 
     # ── 동결 모델 순전파 ──────────────────────────────────────────
-    vecs  = np.array([record_to_vec(r) for r in src], dtype=np.float32)
+    vecs  = np.array([record_to_vec(r) for r in src], dtype=np.float32)[:, :nf]
     x_num = torch.tensor((vecs - mean) / std, dtype=torch.float32).to(device)
     x_img = torch.tensor(sat.get_batch(src), dtype=torch.float32).to(device)
     x_txt = torch.tensor(txt.get_batch(src), dtype=torch.float32).to(device)

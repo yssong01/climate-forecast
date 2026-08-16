@@ -136,6 +136,10 @@ def main():
 
     model, ckpt = load_model(args.ckpt)
     mean, std = np.array(ckpt["mean"]), np.array(ckpt["std"])
+    # record_to_vec() 은 14차원(연중 시각 sin/cos, 2026-08-16 추가)인데 구버전
+    # 체크포인트는 12차원으로 학습됐다 — 그 체크포인트의 차원만큼만 앞에서
+    # 잘라 쓴다(새 축은 끝에 덧붙었으므로 슬라이싱이 곧 구버전 입력 복원).
+    nf = ckpt.get("num_features", 12)
 
     heat_p, cold_p, dust_p = [], [], []
     B = 512
@@ -143,7 +147,7 @@ def main():
     with torch.no_grad():
         for s in range(0, len(src_records), B):
             chunk = src_records[s:s + B]
-            x_num = np.array([record_to_vec(r) for r in chunk], dtype=np.float32)
+            x_num = np.array([record_to_vec(r) for r in chunk], dtype=np.float32)[:, :nf]
             x_num = torch.tensor((x_num - mean) / std, dtype=torch.float32).to(DEVICE)
             x_img = torch.tensor(np.stack([sat.get_image(r) for r in chunk]),
                                  dtype=torch.float32).to(DEVICE)

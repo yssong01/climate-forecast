@@ -38,8 +38,9 @@ from tendency_collector import TendencyCollector
 from predict import load_model
 
 CANDIDATES = [
-    ("v8 (배포 중, 3.6년 학습)", "./checkpoints/numerical_trichef_v8_before_10y_data.pt"),
-    ("신규 (13년, 그룹 분할)",   "./checkpoints/numerical_trichef_split_group.pt"),
+    ("v8 (13년 이전, 3.6년 학습)",        "./checkpoints/numerical_trichef_v8_before_10y_data.pt"),
+    ("v9 (13년+그룹분할+한파디커플링, 12차원)", "./checkpoints/numerical_trichef_v9_before_doy_features.pt"),
+    ("A안 (12차원 → 14차원, 연중 주기 추가)",  "./checkpoints/numerical_trichef.pt"),
 ]
 
 
@@ -125,7 +126,12 @@ def main():
     for name, path in CANDIDATES:
         model, ckpt = load_model(path)
         mean, std = np.array(ckpt["mean"]), np.array(ckpt["std"])
-        xn_all = (raw_num - mean) / std
+        # record_to_vec() 은 14차원(연중 시각 sin/cos 추가, 2026-08-16)인데
+        # 구버전 체크포인트는 12차원으로 학습됐다. 새 축은 끝에 덧붙었으므로
+        # 앞에서부터 그 체크포인트의 차원만큼만 잘라 쓰면 구버전 입력을
+        # 그대로 복원한다 — 그대로 먹이면 mean/std 와 차원이 안 맞아 깨진다.
+        nf = ckpt.get("num_features", raw_num.shape[1])
+        xn_all = (raw_num[:, :nf] - mean) / std
 
         tp_, pp_, hp_, cp_, dp_ = [], [], [], [], []
         B = 1024
