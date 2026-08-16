@@ -13,6 +13,16 @@ calibration_plot_diagnose.py — 관측소별 재현율×정밀도 신뢰도 플
 표본 수에서 바로 계산되는 실측 불확실성이다. 표본이 적은 관측소일수록
 에러바가 커진다(=신뢰도가 낮다는 뜻을 그대로 반영).
 
+사건 단위 보정(2026-08-16 추가): 처음엔 시간 표본 하나하나를 독립 시행으로
+놓고 신뢰구간을 계산했는데, 한파·폭염은 며칠씩 이어지는 사건이라 같은
+사건 안의 연속 시간 표본은 서로 강하게 연관돼 있다(독립이 아니다). 이러면
+신뢰구간이 실제보다 좁게 나온다. `station_anomaly_investigate.py`로
+확인해보니 대구·강릉은 시간 표본(216~384건)만 보면 적지 않아 보였지만
+실제 사건 수는 8~10개뿐이었다(춘천 40개와 대조적). 그래서 신뢰구간은
+"시간 표본 수"가 아니라 "사건 수"를 유효 표본 크기로 써서 계산한다
+(점 추정값인 재현율·정밀도 자체는 그대로 시간 단위로 잰다 — 이 프로젝트의
+다른 F1 표와 정의를 맞추기 위해서다. 넓어지는 건 신뢰구간뿐이다).
+
 한글 라벨(2026-08-16 추가): 컨테이너 기본 이미지엔 한글 글리프가 있는
 폰트가 전혀 없다(fc-list 0건 실측) — 라벨을 한글로 쓰면 네모(tofu)로
 깨진다. 이 스크립트가 실행 시점에 `fonts-nanum`을 직접 설치하고
@@ -29,7 +39,7 @@ import sys
 import numpy as np
 import torch
 
-from train import collect_historical, WeatherDataset, make_split, STATION_NAMES
+from train import collect_historical, WeatherDataset, make_split, STATION_NAMES, _parse_ts
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
 from weather_collector import STATION_COORDS
@@ -56,6 +66,19 @@ def _ensure_korean_font():
         print(f"폰트 설치 실패({e}) — root 권한·네트워크 필요", file=sys.stderr)
         return None
     return _NANUM_PATH if os.path.exists(_NANUM_PATH) else None
+
+
+def count_events(timestamps, gap_hours=24):
+    """gap_hours 이내로 이어지는 타임스탬프를 사건 하나로 묶어 센다.
+    호출자가 이미 한 관측소·양성(또는 오탐) 표본만 걸러서 넘긴다고 가정한다."""
+    times = sorted(_parse_ts(t) for t in timestamps)
+    if not times:
+        return 0
+    n = 1
+    for prev, cur in zip(times, times[1:]):
+        if (cur - prev).total_seconds() > gap_hours * 3600:
+            n += 1
+    return n
 
 
 def wilson_ci(k: int, n: int, z: float = 1.96):
@@ -95,6 +118,7 @@ def main():
     _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True)
     idx = np.array(val_ds.indices)
     stns = np.array([ds.stns[i] for i in idx])
+    tgt_ts = np.array([ds.tgt_timestamps[i] for i in idx])
 
     heat_p, cold_p = [], []
     model.eval()
@@ -122,28 +146,38 @@ def main():
                 continue
             pred_pos = p[sel] >= 0.5
             labels = y[sel]
+            ts_sel = tgt_ts[sel]
             precision, recall, tp, fp, fn = prf(pred_pos, labels)
             n_pos = int((labels == 1).sum())
-            # Wilson CI — precision 은 "양성 예측" 모집단 기준, recall 은 "실제 양성" 모집단 기준
-            _, p_lo, p_hi = wilson_ci(tp, tp + fp)
-            _, r_lo, r_hi = wilson_ci(tp, tp + fn)
+
+            # 유효 표본 크기는 시간 표본이 아니라 사건 수로 잰다(위 docstring
+            # 참고) — 재현율은 "실제 양성 사건" 수, 정밀도는 "모델이 양성으로
+            # 예측한 사건" 수(오탐 사건도 며칠씩 뭉치므로 같은 보정이 필요).
+            # 점 추정값(precision/recall)은 그대로 시간 단위를 쓴다.
+            n_events_pos = count_events(ts_sel[labels == 1])
+            n_events_predpos = count_events(ts_sel[pred_pos])
+            _, r_lo, r_hi = wilson_ci(round(recall * n_events_pos), n_events_pos)
+            _, p_lo, p_hi = wilson_ci(round(precision * n_events_predpos), n_events_predpos)
+
             results[name].append({
                 "station": STATION_NAMES.get(stn_code, stn_code),
                 "code": stn_code,
                 "n": n, "n_pos": n_pos,
+                "n_events_pos": n_events_pos, "n_events_predpos": n_events_predpos,
                 "precision": precision, "p_lo": p_lo, "p_hi": p_hi,
                 "recall": recall, "r_lo": r_lo, "r_hi": r_hi,
             })
 
     print("=" * 90)
-    print(" 관측소별 재현율×정밀도 (t=0.5, Wilson 95% CI)")
+    print(" 관측소별 재현율×정밀도 (t=0.5, 신뢰구간은 사건 수 기준 Wilson 95% CI)")
     print("=" * 90)
     for name, rows in results.items():
         print(f"\n[{name}]")
-        print(f"{'관측소':<6} {'표본':>7} {'양성':>6} | "
+        print(f"{'관측소':<6} {'시간표본':>8} {'양성사건':>8} {'예측사건':>8} | "
               f"{'재현율':>7} {'CI':>16} | {'정밀도':>7} {'CI':>16}")
         for r in sorted(rows, key=lambda x: -x["n_pos"]):
-            print(f"{r['station']:<6} {r['n']:>7,} {r['n_pos']:>6,} | "
+            print(f"{r['station']:<6} {r['n']:>8,} {r['n_events_pos']:>8,} "
+                  f"{r['n_events_predpos']:>8,} | "
                   f"{r['recall']:>6.1%} [{r['r_lo']:.1%},{r['r_hi']:.1%}] | "
                   f"{r['precision']:>6.1%} [{r['p_lo']:.1%},{r['p_hi']:.1%}]")
 
@@ -173,7 +207,7 @@ def main():
             x, y = r["recall"], r["precision"]
             xerr = [[x - r["r_lo"]], [r["r_hi"] - x]]
             yerr = [[y - r["p_lo"]], [r["p_hi"] - y]]
-            size = 20 + 4 * math.sqrt(r["n_pos"])
+            size = 20 + 4 * math.sqrt(r["n_events_pos"])
             ax.errorbar(x, y, xerr=xerr, yerr=yerr, fmt="+",
                         color=colors[name], markersize=size / 5,
                         markeredgewidth=2, capsize=4, elinewidth=1.5, alpha=0.85)
@@ -182,7 +216,7 @@ def main():
                        xytext=(6, 6), fontsize=8)
         ax.set_xlabel("재현율 (Recall)")
         ax.set_ylabel("정밀도 (Precision)")
-        ax.set_title(f"{labels_ko[name]} — 관측소별 (십자 = Wilson 95% 신뢰구간)")
+        ax.set_title(f"{labels_ko[name]} — 관측소별 (십자 = 사건 수 기준 Wilson 95% 신뢰구간)")
         ax.set_xlim(-0.05, 1.05)
         ax.set_ylim(-0.05, 1.05)
         ax.grid(alpha=0.3)
