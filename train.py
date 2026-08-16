@@ -218,7 +218,11 @@ TEMPORAL_VAL_START = os.getenv("TEMPORAL_VAL_START", "20240102")
 # 1.0 = 끔(기존 동작과 동일, 균등 샘플링).
 CROP_OVERSAMPLE = float(os.getenv("CROP_OVERSAMPLE", "1.0"))
 
-CHECKPOINT  = "./checkpoints/numerical_trichef.pt"
+# 저장 경로도 환경변수로 뺀다(2026-08-16) — 기본값은 배포가 읽는 경로다.
+# seed를 바꿔가며 재현성을 확인하는 대조 실행은 서로 다른 경로에 저장해야
+# 한다. 안 그러면 ① 동시에 돌린 두 실행이 같은 파일을 덮어쓰고 ② 검증도
+# 끝나지 않은 실험 결과가 배포 경로를 곧바로 파괴한다.
+CHECKPOINT  = os.getenv("CHECKPOINT_PATH", "./checkpoints/numerical_trichef.pt")
 # historical_data.json(원본 30일)이 아니라 historical_data_1y.json 을 쓴다.
 # 후자는 apihub 수집(collect_year.py)과 기상자료개방포털 파일셋 임포트
 # (import_kma_fileset.py)로 병합해온 누적 데이터셋 — 2026-08-07 기준
