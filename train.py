@@ -1,16 +1,21 @@
 """
-train.py — Phase 3-4: 3축 Tri-CHEF 학습 (Gram-Schmidt 직교화 + 학습 안정화)
-논문 Eq.1: s = √(A² + (α·B)² + (φ·C)²)
+train.py — Tri-CHEF 3축 파이프라인 학습.
+논문 Eq.1: s = √((w_Re·Re)² + (w_Im·Im)² + (w_Z·Z)²)
 
-Re 축 (A): 위성 이미지 → ResNet18 4채널
-Im 축 (B): 기상 문서   → MiniLM 384 프로젝션
-Z  축 (C): 수치 센서   → MLP 인코더
+Re축(공간): 인접 11개 관측소 실측 IDW 공간보간장 → 소형 CNN
+Im축(시간): 1·3·6시간 전 대비 변화량(경향 벡터) → MLP 프로젝션
+Z축(현재): 수치 센서(기온·강수·습도 등) → MLP 인코더
 
-Phase 3-4 수정 사항
-  1. Gram-Schmidt 직교화 (ORTHOGONALIZE 플래그로 ablation)
-  2. dying-clamp 버그 수정 (pipeline_model: clamp → softplus)
-  3. 손실 스케일 정규화 — 기온 MSE 가 강수 MSE 를 1000배 압도하던 문제
-  4. 축 직교성·강수 예측 분산 진단 로그
+Re·Im축은 원래 위성 이미지·MiniLM 텍스트 임베딩이었으나, 정보량이 정확히
+0으로 실측되어(2026-08-09) 위와 같이 실측 데이터로 교체했다 — 상세 경위는
+README.md '정직한 한계 1번' 참조.
+
+Phase 3-4에서 확정된 사항
+  1. Gram-Schmidt 직교화(ORTHOGONALIZE 플래그로 ablation 가능) — 본 도메인에서는
+     성능이 저하되어 기본값 False.
+  2. dying-clamp 버그 수정(pipeline_model: clamp → softplus).
+  3. 손실 스케일 정규화 — 기온 MSE가 강수 MSE를 1000배 압도하던 문제.
+  4. 축 직교성·강수 예측 분산 진단 로그.
 """
 import os
 import json
@@ -414,7 +419,7 @@ class WeatherDataset(Dataset):
                 tgt_idx.append(j)
 
         if not src_idx:
-            raise ValueError(f"lead={L}시간 유효 쌍이 없습니다. 데이터 연속성 확인 필요.")
+            raise ValueError(f"lead={L}시간 유효 쌍이 없다 — 데이터 연속성을 확인해야 한다.")
         dropped = len(records) - len(src_idx)
         if dropped > 0:
             print(f"  [정보] {dropped}개 레코드는 +{L}h 뒤 관측이 없어 제외 "
