@@ -221,6 +221,17 @@ def main():
         ax.set_ylim(-0.05, 1.05)
         ax.grid(alpha=0.3)
 
+    # 첫 번째 그래프(폭염) 왼쪽 위에 관측소 코드→이름 범례를 붙인다 — 점
+    # 라벨에 이미 "이름(코드)"가 있지만, 코드만 봐도 바로 찾게 하려는
+    # 목적이다(2026-08-16 사용자 요청).
+    legend_codes = sorted({r["code"] for rows in results.values() for r in rows})
+    legend_text = "\n".join(f"{c}: {STATION_NAMES.get(c, c)}" for c in legend_codes)
+    axes[0].text(
+        0.02, 0.98, legend_text, transform=axes[0].transAxes,
+        fontsize=7.5, va="top", ha="left",
+        bbox=dict(boxstyle="round", facecolor="white", edgecolor="gray", alpha=0.85),
+    )
+
     fig.tight_layout()
     fig.savefig(args.out, dpi=130)
     print(f"\n저장: {args.out}")
