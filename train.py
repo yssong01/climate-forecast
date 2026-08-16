@@ -430,6 +430,12 @@ class WeatherDataset(Dataset):
             self.mean = vecs.mean(axis=0)
             self.std  = np.where(vecs.std(axis=0) > 1e-6, vecs.std(axis=0), 1.0)
         else:
+            # record_to_vec()이 나중에 차원을 늘려도(2026-08-16: 12→14, 연중
+            # 시각 sin/cos 추가) 구버전 체크포인트의 mean/std(짧은 차원)를 그대로
+            # 넘겨받는 호출자가 많다(threshold_validation.py 등). 새 축은 벡터
+            # 끝에 붙는 구조이므로 mean 길이만큼만 앞에서 잘라 구버전 입력을
+            # 그대로 복원한다 — 안 자르면 브로드캐스트가 깨진다.
+            vecs = vecs[:, :len(mean)]
             self.mean, self.std = mean, std
         self.X_num = torch.tensor((vecs - self.mean) / self.std, dtype=torch.float32)
 
