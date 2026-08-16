@@ -76,9 +76,41 @@ STATION_EVENT_THRESH_OVERRIDES = {
 }
 
 
-def event_threshold(event: str, stn: str) -> float:
-    """관측소별 재보정값이 있으면 그걸, 없으면 전역 기본값을 반환한다."""
+def raw_event_threshold(event: str, stn: str) -> float:
+    """관측소별 재보정값이 있으면 그걸, 없으면 전역 기본값을 반환한다(보정 전)."""
     return STATION_EVENT_THRESH_OVERRIDES.get((stn, event), EXTREME_EVENT_THRESH[event])
+
+
+def calibrate_prob(prob: float, event: str, ckpt: dict) -> float:
+    """
+    확률 보정(isotonic) 곡선을 적용한다. 곡선이 없는 체크포인트면 그대로 둔다.
+
+    왜 필요한가(2026-08-16 실측, probability_calibration_check.py) — 희소 사건이
+    '항상 아니다'로 붕괴하는 것을 막으려고 BCE에 준 `pos_weight`가 양성 확률을
+    위로 밀어올린다. 그 결과 헤드 넷 모두 체계적으로 과신했다(한파는 "60~70%"
+    라 해도 실제 빈도가 27%). 화면은 이 값을 확률 막대로 그대로 내놓고 있었다.
+
+    보정은 단조 증가 함수라 순위가 보존된다 — 임계값을 같은 곡선으로 옮기면
+    판정 결과가 그대로다(probability_calibration_fit.py에서 F1 보존 확인).
+
+    강수("rain")에는 적용하지 않는다 — 화면에 확률이 아니라 mm로 나가고,
+    양(量) 헤드가 보정 전 확률과 곱해지도록 함께 학습됐다. 여기서 확률만
+    바꾸면 학습된 곱이 깨져 강수량 자체가 틀어진다. 곡선은 분석용으로
+    체크포인트에 남겨두되 서빙 경로에서는 호출하지 않는다.
+    """
+    cal = (ckpt or {}).get("prob_calibration") or {}
+    head = (cal.get("heads") or {}).get(event)
+    if not head or prob is None:
+        return prob
+    return float(np.interp(prob, head["x"], head["y"]))
+
+
+def event_threshold(event: str, stn: str, ckpt: dict = None) -> float:
+    """
+    판정 임계값. 체크포인트에 확률 보정 곡선이 있으면 임계값도 같은 곡선으로
+    옮긴다 — 확률만 보정하고 임계값을 그대로 두면 판정 기준이 어긋난다.
+    """
+    return calibrate_prob(raw_event_threshold(event, stn), event, ckpt)
 
 
 def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
@@ -222,9 +254,14 @@ def predict(stn: str = "108",
     # Phase 3-8/3-9 극한기상 확률 — 구버전 체크포인트(헤드 추가 전)는
     # extreme_event_probs() 가 전부 None 을 반환하므로 결과에서 빠진다.
     extreme = model.extreme_event_probs()
-    heatwave_prob = extreme["heatwave"][0].item() if extreme["heatwave"] is not None else None
-    coldwave_prob = extreme["coldwave"][0].item() if extreme["coldwave"] is not None else None
-    dust_prob     = extreme["dust"][0].item()     if extreme["dust"]     is not None else None
+    # 확률 보정을 여기서 적용한다 — 호출자(app.py·CLI)가 받는 값이 곧 화면에
+    # 나가므로, 보정되지 않은 값이 밖으로 새어 나가지 않게 한 곳에서 처리한다.
+    heatwave_prob = (calibrate_prob(extreme["heatwave"][0].item(), "heatwave", ckpt)
+                     if extreme["heatwave"] is not None else None)
+    coldwave_prob = (calibrate_prob(extreme["coldwave"][0].item(), "coldwave", ckpt)
+                     if extreme["coldwave"] is not None else None)
+    dust_prob     = (calibrate_prob(extreme["dust"][0].item(), "dust", ckpt)
+                     if extreme["dust"] is not None else None)
 
     observed_at = record.get("timestamp")
     # accuracy.py 가 (관측소, 목표시각)으로 로그를 남기려면 이 시각이 필요하다
