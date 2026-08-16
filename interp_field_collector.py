@@ -53,8 +53,24 @@ def _init_worker(collector):
     _WORKER_COLLECTOR = collector
 
 
-def _get_image_worker(record):
-    return _WORKER_COLLECTOR.get_image(record)
+def _get_image_chunk_worker(keys):
+    """
+    (관측소, 시각) 키 묶음 하나를 받아 float16 블록으로 돌려준다.
+
+    레코드 dict가 아니라 키 튜플을 받는 이유 — 워커는 fork로 by_time 전체를
+    이미 갖고 있어 dict를 다시 받을 필요가 없다. 태스크 인자는 fork와 달리
+    매번 pickle되므로, 9개 키짜리 dict 대신 짧은 문자열 2개만 넘긴다.
+
+    낱개가 아니라 묶음으로 주고받는 이유 — 반환값이 진짜 병목이었다.
+    (4,32,32) float32는 16KB이고 138만 개면 22GB가 파이프를 오간다.
+    float16 블록으로 묶으면 전송량이 1/2이 되고 전송 횟수도 청크 크기만큼
+    줄어든다(2026-08-16 실측: 16워커인데 단일 대비 4배에 그치던 원인).
+    """
+    c = _WORKER_COLLECTOR
+    out = np.empty((len(keys), N_BANDS, IMG_SIZE, IMG_SIZE), dtype=np.float16)
+    for i, (stn, ts) in enumerate(keys):
+        out[i] = c.get_image_by_key(stn, ts)
+    return out
 
 
 class InterpolatedFieldCollector:
@@ -64,20 +80,38 @@ class InterpolatedFieldCollector:
     같은 시각 값을 IDW 로 격자에 보간한다.
     """
 
+    # 가중치 캐시 상한 — 중심 관측소 12개 × 이웃 조합이라 정상 데이터에서는
+    # 수십 개면 충분하다. 결측 패턴이 심해 조합이 폭증하는 비정상 입력에서
+    # 메모리를 무한정 먹지 않도록 막아둔다(엔트리당 약 90KB).
+    _W_CACHE_MAX = 512
+
     def __init__(self, records: list[dict], station_coords: dict):
         self.coords = station_coords
         self.by_time: dict[str, dict[str, dict]] = {}
         for r in records:
             ts = str(r["timestamp"])[:12]
             self.by_time.setdefault(ts, {})[str(r.get("stn"))] = r
+        # (중심 관측소, 이웃 집합) → (가중치, 가중치합). 아래 _weights 참고.
+        self._w_cache: dict[tuple, tuple] = {}
 
-    def get_image(self, record: dict) -> np.ndarray:
-        stn = str(record.get("stn"))
-        ts = str(record["timestamp"])[:12]
-        snapshot = self.by_time.get(ts, {})
+    def _weights(self, stn: str, neighbor_stns: tuple):
+        """
+        IDW 가중치와 그 합을 (중심 관측소, 이웃 집합)별로 한 번만 계산한다.
 
-        neighbor_stns = [s for s in snapshot
-                         if s != stn and s in self.coords]
+        격자 좌표·이웃까지의 거리·가중치는 관측값에 전혀 의존하지 않는다 —
+        오직 중심 관측소가 어디이고 이웃이 누구인지에만 달려 있다. 그런데
+        종전 구현은 이걸 레코드마다 다시 계산했다. 138만 표본이면 실제로
+        필요한 계산은 수십 번인데 138만 번을 한 셈이다(2026-08-16 실측:
+        단일 스레드 8.1분 중 대부분).
+
+        이웃 집합을 키에 포함하는 이유 — 어떤 시각에 일부 관측소가 결측이면
+        이웃 목록이 달라지고 가중치도 달라진다. 중심 관측소만으로 키를 잡으면
+        그 경우에 틀린 가중치를 재사용하게 된다.
+        """
+        key = (stn, neighbor_stns)
+        hit = self._w_cache.get(key)
+        if hit is not None:
+            return hit
 
         center = self.coords.get(stn, (36.5, 127.5))
         lons = np.linspace(center[1] - GRID_HALF_SPAN_DEG,
@@ -86,17 +120,38 @@ class InterpolatedFieldCollector:
                            center[0] - GRID_HALF_SPAN_DEG, IMG_SIZE)
         lon_grid, lat_grid = np.meshgrid(lons, lats)   # (32,32) 각각
 
-        if not neighbor_stns:
-            # 같은 시각 이웃 관측 자체가 없는 드문 경우 — 노이즈가 아니라
-            # "정보 없음"을 뜻하는 중립값(0.5)으로 채운다.
-            return np.full((N_BANDS, IMG_SIZE, IMG_SIZE), 0.5, dtype=np.float32)
-
         n_lats = np.array([self.coords[s][0] for s in neighbor_stns])
         n_lons = np.array([self.coords[s][1] for s in neighbor_stns])
         d2 = ((lat_grid[..., None] - n_lats[None, None, :]) ** 2
              + (lon_grid[..., None] - n_lons[None, None, :]) ** 2)
         w = 1.0 / (np.sqrt(d2) ** IDW_POWER + 1e-6)   # (32,32,n_neighbors)
         w_sum = w.sum(axis=-1)
+
+        if len(self._w_cache) < self._W_CACHE_MAX:
+            self._w_cache[key] = (w, w_sum)
+        return w, w_sum
+
+    def get_image(self, record: dict) -> np.ndarray:
+        return self.get_image_by_key(str(record.get("stn")),
+                                     str(record["timestamp"])[:12])
+
+    def get_image_by_key(self, stn: str, ts: str) -> np.ndarray:
+        """레코드 dict 없이 (관측소, 시각)만으로 보간장을 만든다 — 계산에
+        실제로 필요한 건 이 둘뿐이다. 프로세스 풀에 dict를 pickle해 넘기는
+        비용을 없애기 위해 분리했다(`_get_image_chunk_worker` 참고)."""
+        snapshot = self.by_time.get(ts, {})
+
+        # 캐시 키로 쓰므로 튜플(해시 가능)로 만든다. dict 순회 순서는 삽입
+        # 순서로 고정되어 있어 같은 이웃 집합이면 같은 튜플이 나온다.
+        neighbor_stns = tuple(s for s in snapshot
+                              if s != stn and s in self.coords)
+
+        if not neighbor_stns:
+            # 같은 시각 이웃 관측 자체가 없는 드문 경우 — 노이즈가 아니라
+            # "정보 없음"을 뜻하는 중립값(0.5)으로 채운다.
+            return np.full((N_BANDS, IMG_SIZE, IMG_SIZE), 0.5, dtype=np.float32)
+
+        w, w_sum = self._weights(stn, neighbor_stns)
 
         channels = []
         for key, norm_fn in _CHANNEL_SPEC:
@@ -135,9 +190,19 @@ class InterpolatedFieldCollector:
             for i, r in enumerate(records):
                 out[i] = self.get_image(r)
             return out
-        chunksize = max(1, n // (n_workers * 8))
+        # 워커에는 레코드 dict가 아니라 (관측소, 시각) 키만 넘긴다 — 계산에
+        # 필요한 건 이 둘뿐이고, 태스크 인자는 매번 pickle되기 때문이다.
+        keys = [(str(r.get("stn")), str(r["timestamp"])[:12]) for r in records]
+        # 청크 하나가 float16 블록 하나로 돌아온다. 2048개면 블록당 약 16MB로,
+        # 전송 횟수를 줄이면서도 워커 간 부하 불균형이 눈에 띄지 않는 크기다.
+        chunk = 2048
+        chunks = [keys[i:i + chunk] for i in range(0, n, chunk)]
         ctx = mp.get_context("fork")
+        pos = 0
         with ctx.Pool(n_workers, initializer=_init_worker, initargs=(self,)) as pool:
-            for i, img in enumerate(pool.imap(_get_image_worker, records, chunksize=chunksize)):
-                out[i] = img
+            # imap은 입력 순서를 보존한다 — out의 행 순서가 records와 일치해야
+            # 라벨·타깃과 어긋나지 않는다.
+            for block in pool.imap(_get_image_chunk_worker, chunks):
+                out[pos:pos + len(block)] = block
+                pos += len(block)
         return out
