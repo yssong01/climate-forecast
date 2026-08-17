@@ -199,21 +199,25 @@ def main():
         ax.set_title(f"{name} — ECE {ece:.3f} · Brier {brier:.3f}",
                      fontsize=15, fontweight="bold")
         ax.tick_params(labelsize=11)
-        ax.legend(fontsize=12, loc="upper left", labelspacing=0.6,
-                  borderpad=0.7, handlelength=1.8, framealpha=0.92)
-        # 범례 바로 아래에 '실제 양성률'이 무엇이고 무엇을 뜻하는지 밝힌다 —
-        # 그림만 떼어 문서·발표자료에 실릴 때 본문 설명이 따라가지 않는다.
-        ax.text(0.035, 0.735,
-                f"실제 양성률({base:.1%}) = 전체 표본 중\n"
-                "사건이 실제로 일어난 비율이다.\n"
-                "아무 정보 없이 늘 이 값만 답할 때\n"
-                "그려지는 수평선이며, 곡선이 이 선에서\n"
-                "위아래로 크게 벌어질수록 위험한 시각과\n"
-                "그렇지 않은 시각을 실제로 가려낸다는 뜻이다.",
-                transform=ax.transAxes, fontsize=10, va="top", ha="left",
-                linespacing=1.6,
-                bbox=dict(boxstyle="round,pad=0.5", facecolor="#F7F7F7",
-                          edgecolor="gray", alpha=0.92))
+        # 범례와 설명 상자는 첫 열에만 둔다 — 네 패널의 기호가 모두 같으므로
+        # 열마다 반복하면 곡선만 가린다(2026-08-17 조정).
+        if j == 0:
+            ax.legend(fontsize=10.5, loc="upper left", labelspacing=0.35,
+                      borderpad=0.5, handlelength=1.6, framealpha=0.92)
+            # 범례 바로 아래에 '실제 양성률'이 무엇이고 무엇을 뜻하는지 밝힌다 —
+            # 그림만 떼어 문서·발표자료에 실릴 때 본문 설명이 따라가지 않는다.
+            ax.text(0.035, 0.755,
+                    f"실제 양성률({base:.1%})은 전체 표본 중\n"
+                    "사건이 실제로 일어난 비율이다.\n"
+                    "아무 정보 없이 늘 이 값만 답할 때\n"
+                    "그려지는 수평선이며, 곡선이 이 선에서\n"
+                    "위아래로 크게 벌어질수록 위험한 시각과\n"
+                    "그렇지 않은 시각을 실제로 가려낸다는 뜻이다.\n"
+                    "네 패널의 기호는 모두 같다.",
+                    transform=ax.transAxes, fontsize=9.5, va="top", ha="left",
+                    linespacing=1.55,
+                    bbox=dict(boxstyle="round,pad=0.45", facecolor="#F7F7F7",
+                              edgecolor="gray", alpha=0.92))
         ax.grid(alpha=0.25)
 
         axh.bar([r[2] for r in rows if r[4] > 0], ns,
