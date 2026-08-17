@@ -441,6 +441,72 @@ st.markdown(
         overflow: hidden;
         text-overflow: ellipsis;
     }
+
+    /* ── 모바일·태블릿(≤900px) 대응 ─────────────────────────────
+       휴대폰에서 화면이 헤더로만 채워지는 문제를 고친다(2026-08-17 제보).
+       원인은 두 가지였다.
+         1) 고정 헤더가 제목·설명·관측소명·지표 4개를 모두 담는데, 좁은
+            화면에서는 st.columns 가 세로로 쌓여 헤더 높이가 뷰포트만큼
+            커진다. 헤더가 fixed 라 그만큼의 스페이서가 본문을 아래로
+            밀어내므로, 처음 화면에는 헤더밖에 안 보인다. 아래 JS 가
+            이 폭에서는 고정을 아예 풀어 일반 흐름으로 되돌린다.
+         2) 제목에 걸어둔 말줄임표 규칙이 좁은 화면에서 항상 발동해
+            "기후 모델 ..." 로 잘렸다.
+       ------------------------------------------------------------ */
+    @media (max-width: 900px) {
+        /* 제목은 자르지 말고 줄바꿈한다 — 좁을수록 잘라선 안 된다. */
+        .st-key-sticky_header h1 {
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+            font-size: 1.6rem !important;
+            line-height: 1.25 !important;
+            word-break: keep-all;
+        }
+        /* 헤더의 지표 4개를 2×2 로 접는다. Streamlit 은 좁은 화면에서
+           컬럼을 세로로 쌓는데, 그러면 네 줄이 화면을 다 먹는다. */
+        .st-key-sticky_header [data-testid="stHorizontalBlock"] {
+            flex-direction: row !important;
+            flex-wrap: wrap !important;
+            gap: 0.25rem 0.5rem !important;
+        }
+        .st-key-sticky_header [data-testid="stColumn"] {
+            flex: 1 1 44% !important;
+            min-width: 44% !important;
+            width: auto !important;
+        }
+        .st-key-sticky_header [data-testid="stMetricValue"] {
+            font-size: 1.35rem !important;
+        }
+        .st-key-sticky_header [data-testid="stMetricLabel"] p {
+            font-size: 0.78rem !important;
+        }
+        /* 상태 배지는 툴바로 옮기지 않고 본문에 그대로 둔다(JS 참조).
+           잘리지 않도록 말줄임표 규칙도 해제한다. */
+        .st-key-status_badge [data-testid="stAlertContainer"] {
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+        }
+        /* 표가 넘칠 때 가로 스크롤을 허용한다 — 글자를 뭉개는 것보다 낫다. */
+        [data-testid="stMarkdownContainer"] table {
+            display: block;
+            overflow-x: auto;
+            white-space: nowrap;
+        }
+        /* 탭 라벨이 네 개라 좁은 화면에서 넘친다 — 가로 스크롤을 허용하고
+           글자를 줄여 최대한 한 줄에 담는다. */
+        [data-testid="stTabs"] [role="tablist"] {
+            overflow-x: auto;
+            scrollbar-width: none;
+        }
+        [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar { display: none; }
+        [data-testid="stTabs"] [role="tab"] p { font-size: 0.86rem !important; }
+        /* Plotly 툴바(카메라·확대 아이콘)는 데스크톱에서는 hover 시에만 뜨지만
+           터치 기기에서는 계속 떠 있어 차트 상단을 가린다. 좁은 화면에서는
+           숨긴다 — 확대·저장은 터치로 대체된다. */
+        .js-plotly-plot .modebar { display: none !important; }
+    }
     /* 상태 배지 — Deploy 툴바 줄로 옮겨 붙는다(JS). 그 줄이 60px로 좁으니
        내용이 넘치면 말줄임표로 정리한다. */
     .st-key-status_badge [data-testid="stAlertContainer"] {
@@ -549,6 +615,44 @@ components.html(
         const wrapper = header.parentElement;   // fixed로 빠지며 생기는 공백을 되돌려줄 대상
         const appEl = doc.querySelector('[data-testid="stApp"]') || doc.body;
 
+        // 좁은 화면(휴대폰·세로 태블릿)에서는 고정 헤더를 쓰지 않는다.
+        // 헤더가 담는 제목·설명·관측소명·지표 4개는 좁아지면 세로로 쌓여
+        // 높이가 뷰포트만큼 커지고, fixed 로 빠진 만큼의 스페이서가 본문을
+        // 아래로 밀어내 첫 화면에 헤더밖에 안 보이게 된다(2026-08-17 제보).
+        // CSS 미디어 쿼리(max-width:900px)와 같은 경계를 쓴다.
+        const NARROW_MAX = 900;
+        function isNarrow() {
+            return (window.parent.innerWidth || doc.documentElement.clientWidth)
+                   <= NARROW_MAX;
+        }
+
+        // 고정을 풀고 원래 흐름으로 되돌린다 — 인라인으로 박아둔 값을 모두
+        // 지워야 CSS 가 다시 주도권을 갖는다.
+        function releaseHeader() {
+            header.style.position = '';
+            header.style.top = '';
+            header.style.left = '';
+            header.style.width = '';
+            header.style.zIndex = '';
+            header.style.backgroundColor = '';
+            wrapper.style.height = '';
+        }
+        function releaseBadge() {
+            if (!badge) return;
+            badge.style.position = '';
+            badge.style.top = '';
+            badge.style.left = '';
+            badge.style.height = '';
+            badge.style.maxWidth = '';
+            badge.style.display = '';
+            badge.style.alignItems = '';
+            badge.style.zIndex = '';
+            const bWrapper = badge.parentElement;
+            bWrapper.style.height = '';
+            bWrapper.style.margin = '';
+            bWrapper.style.overflow = '';
+        }
+
         function toolbarBottom() {
             return toolbarEl ? toolbarEl.getBoundingClientRect().bottom : 0;
         }
@@ -571,6 +675,7 @@ components.html(
         // 옮겨 붙인다 — 왼쪽 정렬, 세로로는 그 줄 가운데(2026-08-10 요청).
         function positionBadge() {
             if (!badge || !toolbarEl) return;
+            if (isNarrow()) { releaseBadge(); return; }
             const r = toolbarEl.getBoundingClientRect();
             badge.style.position = 'fixed';
             badge.style.top = r.top + 'px';
@@ -588,6 +693,7 @@ components.html(
         }
 
         function reposition() {
+            if (isNarrow()) { releaseHeader(); return; }
             // 좌우 폭은 stMainBlockContainer(실제 콘텐츠 폭) 기준으로 맞추되,
             // 그 컨테이너 자체의 좌우 padding까지 더해야 탭·본문과 정확히
             // 일치한다 — 헤더는 fixed로 빠져나와 있어 blockEl의 padding을
@@ -622,7 +728,7 @@ components.html(
                     const h = entry.borderBoxSize
                         ? entry.borderBoxSize[0].blockSize
                         : entry.contentRect.height;
-                    wrapper.style.height = h + 'px';
+                    wrapper.style.height = isNarrow() ? '' : (h + 'px');
                 }
                 reposition();
             });
