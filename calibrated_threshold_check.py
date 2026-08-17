@@ -32,7 +32,7 @@ import numpy as np
 from probability_calibration_fit import (
     CALIB_SEED, apply_calibration, fit_isotonic, load_probs, prf,
 )
-from predict import CHECKPOINT, EXTREME_EVENT_THRESH
+from predict import CHECKPOINT, EXTREME_EVENT_THRESH, event_threshold
 
 KO = {"rain": "강수", "heatwave": "폭염", "coldwave": "한파", "dust": "황사"}
 
@@ -55,7 +55,7 @@ def best_threshold(probs, labels, n_grid=400):
 
 def main():
     ckpt_path = sys.argv[1] if len(sys.argv) > 1 else CHECKPOINT
-    heads, _ = load_probs(ckpt_path)
+    heads, ckpt = load_probs(ckpt_path)
 
     # probability_calibration_fit.main() 과 동일한 난수열·순회 순서를 써야
     # 같은 보정용/평가용 분할이 재현된다.
@@ -86,7 +86,8 @@ def main():
         t_pick, _ = best_threshold(pc_cal, lc)     # ③ 보정용에서 선정
         f_picked = prf(pe_cal, le, t_pick)[2]      # 평가용에서 채점
 
-        rows.append((key, t_raw, t_mapped, t_pick, f_ideal, f_current, f_picked))
+        rows.append((key, t_raw, t_mapped, t_pick, f_ideal, f_current, f_picked,
+                     pe_cal, le))
         print(f"{KO[key]:<6}{f_ideal:>12.4f}{f_current:>12.4f}{f_picked:>14.4f}"
               f"{f_current - f_ideal:>+10.4f}{f_picked - f_current:>+10.4f}")
 
@@ -97,6 +98,32 @@ def main():
 
     print("\n판정 기준 — ②손실이 0 이면 현행 방식이 판정을 보존한다. 손실이 있고"
           "\n③이 그 손실을 되찾으면, 임계값은 보정 공간에서 직접 골라야 한다.")
+
+    # ── 판정선 민감도 ────────────────────────────────────────
+    # 원본 공간에서는 threshold_validation.py 가 ±0.02 흔들기를 재고 있으나,
+    # 판정이 실제로 이뤄지는 보정 공간에서는 재본 적이 없다. 등온 회귀는
+    # 평탄 구간을 가지므로 임계값을 조금만 옮겨도 구간 하나가 통째로 넘어가
+    # 판정이 계단식으로 바뀔 수 있다 — 그 취약성을 직접 확인한다.
+    print(f"\n{'=' * 74}\n 보정 공간 판정선 민감도 — 배포 판정선을 ±0.02 흔들면"
+          f"\n{'=' * 74}")
+    print(f"  {'헤드':<6}{'배포 t':>9}{'F1':>9}{'−0.02':>9}{'+0.02':>9}"
+          f"{'F1 범위':>10}{'동점 표본':>11}{'판정':>10}")
+    worst = 0.0
+    for key, t_raw, t_mapped, t_pick, f_ideal, f_current, f_picked, pe_cal, le in rows:
+        t_dep = event_threshold(key, "108", ckpt)
+        f_dep = prf(pe_cal, le, t_dep)[2]
+        f_lo = prf(pe_cal, le, max(0.0, t_dep - 0.02))[2]
+        f_hi = prf(pe_cal, le, min(1.0, t_dep + 0.02))[2]
+        rng_f1 = max(f_dep, f_lo, f_hi) - min(f_dep, f_lo, f_hi)
+        worst = max(worst, rng_f1)
+        # 배포 판정선과 정확히 같은 보정값을 갖는 표본 수 — 평탄 구간의 크기다.
+        ties = int(np.isclose(pe_cal, t_dep, atol=1e-9).sum())
+        mark = "취약" if rng_f1 > 0.02 else "안정"
+        print(f"  {KO[key]:<6}{t_dep:>9.3f}{f_dep:>9.4f}{f_lo:>9.4f}{f_hi:>9.4f}"
+              f"{rng_f1:>10.4f}{ties:>11,}{mark:>10}")
+    print(f"\n  최악 F1 변동폭 {worst:.4f} — 0.02 이하면 배포 동작점이 안정적이다.")
+    print(f"VERDICT calibrated_threshold_sensitivity "
+          f"{'PASS' if worst <= 0.02 else 'WARN'} worst_f1_range={worst:.4f}")
 
 
 if __name__ == "__main__":
