@@ -92,7 +92,27 @@ def accuracy_block(d):
     wet_true = pt >= HIT_PRECIP_THRESH
     hit_precip = float((wet_pred == wet_true).mean())
 
+    # 강수의 주 지표(2026-08-17 변경). MAE 단독은 표본의 93.8%가 무강수인
+    # 분포에서 "거의 항상 0"이라는 퇴화 해로 끌린다 — 후처리 임계값을 2.95mm
+    # 로 올리면 MAE 로는 기준선을 넘지만 발생 판정 F1 이 0.430→0.103 으로
+    # 무너진다(error_breakdown.py 실측). 따라서 발생 판정 F1 과 강수 구간
+    # 조건부 MAE 를 주 지표로 두고, 전체 MAE 는 정직성 차원에서 병기한다.
+    tp_w = int((wet_pred & wet_true).sum())
+    fp_w = int((wet_pred & ~wet_true).sum())
+    fn_w = int((~wet_pred & wet_true).sum())
+    p_w = tp_w / (tp_w + fp_w) if tp_w + fp_w else 0.0
+    r_w = tp_w / (tp_w + fn_w) if tp_w + fn_w else 0.0
+    f1_w = 2 * p_w * r_w / (p_w + r_w) if p_w + r_w else 0.0
+    mae_wet = float(np.abs(pp_served[wet_true] - pt[wet_true]).mean())
+    base_wet = float(np.abs(pt[wet_true]).mean())
+    mae_dry = float(np.abs(pp_served[~wet_true] - pt[~wet_true]).mean())
+
     return {
+        "precip_wet_precision": p_w, "precip_wet_recall": r_w,
+        "precip_wet_f1": f1_w,
+        "precip_mae_wet": mae_wet, "precip_baseline_mae_wet": base_wet,
+        "precip_mae_dry": mae_dry,
+        "n_wet": int(wet_true.sum()),
         "n": int(len(tt)),
         "temp_mae": temp_mae,
         "temp_baseline_mae": temp_naive,
@@ -166,6 +186,16 @@ def print_report(acc, pre, cal):
           f"{acc['precip_baseline_mae']:>12.4f}{acc['precip_delta_pct_served']:>11.1f}%")
     print(f"\n  적중률 — 기온 ±{HIT_TEMP_TOL}°C 이내 {acc['hit_rate_temp']:.1%} · "
           f"강수 발생 여부 일치 {acc['hit_rate_precip']:.1%}")
+    print(f"\n  강수 주 지표(후처리 적용) — MAE 단독은 무강수 93.8% 분포에서"
+          f" 퇴화 해로 끌리므로 아래를 먼저 본다")
+    print(f"    발생 판정  정밀도 {acc['precip_wet_precision']:.1%} · "
+          f"재현율 {acc['precip_wet_recall']:.1%} · F1 {acc['precip_wet_f1']:.3f}"
+          f"  (실제 강수 {acc['n_wet']:,}건)")
+    print(f"    강수 구간 조건부 MAE  모델 {acc['precip_mae_wet']:.4f}mm  vs  "
+          f"기준선(상시 0) {acc['precip_baseline_mae_wet']:.4f}mm  → "
+          f"{(acc['precip_mae_wet'] / acc['precip_baseline_mae_wet'] - 1) * 100:+.1f}%")
+    print(f"    무강수 구간 MAE       모델 {acc['precip_mae_dry']:.4f}mm  vs  "
+          f"기준선 0.0000mm  ← 전체 격차의 대부분이 여기서 나온다")
 
     print(f"\n{'=' * 78}\n ② 정밀도(precision) — 분류\n{'=' * 78}")
     print(f"  {'사건':<6}{'기준':<8}{'임계값':>8}{'정밀도':>9}{'재현율':>9}{'F1':>9}"

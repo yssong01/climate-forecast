@@ -179,6 +179,17 @@ COLDWAVE_THRESH = -12.0       # °C
 # 값을 바꿔 돌릴 수 있다(BATCH_SIZE/TRAIN_LR 과 같은 패턴, 2026-08-16).
 EXTREME_BCE_WEIGHT = float(os.getenv("EXTREME_BCE_WT", "0.3"))
 
+# 황사 손실 가중 — 0 이면 황사 헤드를 손실에서 제외해 학습시키지 않는다.
+# 왜 이런 스위치가 필요한가(2026-08-17): 황사는 정밀도 11.8%로 실용 수준에
+# 미달해 화면에서 이미 제외돼 있고, 12개 관측소 중 6곳은 라벨이 아예 없어
+# 채점된 적도 없다. 그런데 헤드가 늘면 강수가 나빠진다는 것은 이 저장소가
+# 이미 확립한 사실이다(EXTREME_BCE_WT 를 1.0→0.3 으로 낮춰 강수를
+# -25.6%→-19.3% 로 개선한 실측). 헤드 하나를 손실에서 빼는 것은 같은 방향의
+# 더 강한 조치이므로, 공유 표현 경쟁 가설을 직접 검증할 수 있다.
+# 모듈 자체는 남겨 둔다 — state_dict 키가 유지돼야 구버전 체크포인트와
+# 로더가 호환되고, 되돌릴 때 코드를 고칠 필요가 없다.
+DUST_LOSS_WEIGHT = float(os.getenv("DUST_LOSS_WT", "1.0"))
+
 # Phase 3-9 황사 헤드 + 폭염·한파 라벨 소스 교체 — import_weather_issues.py
 # 가 만든 기상청 "날씨 이슈별 데이터"(공식 폭염특보/한파특보/황사관측여부)
 # 조회표. 순간 임계값 근사 대신 실제 발표된 특보를 쓴다(WeatherDataset.
@@ -202,7 +213,14 @@ EXTREME_LABEL_MASKING = os.getenv("EXTREME_LABEL_MASKING", "1") != "0"
 #   group    — 날짜 단위. 하루를 통째로 한쪽에 배정해 일 단위 라벨 누수를
 #              없앤다. 사계절이 양쪽에 다 들어가 분산이 작아 개발용에 적합.
 #   temporal — 과거로 배워 미래를 예측. 실제 운영과 같은 구조라 보고용.
-SPLIT_MODE = os.getenv("SPLIT_MODE", "random")
+#
+# 기본값을 group 으로 바꿨다(2026-08-17). 종전 기본값은 random 이었는데,
+# 규약(CLAUDE.md 2절)은 사건 단위 라벨을 그룹 분할로 검증하도록 요구하므로
+# 매 실험마다 SPLIT_MODE=group 을 기억해서 붙여야 했다. 실제로 황사 헤드
+# 제외 실험에서 이 환경변수를 빠뜨려, 배포본(group)과 검증셋이 다른 결과를
+# 만들어 놓고 비교할 뻔했다 — 기준선 MAE 가 달라 눈치챘다. 규약이 요구하는
+# 값을 기본값으로 두면 이 실수 자체가 불가능해진다.
+SPLIT_MODE = os.getenv("SPLIT_MODE", "group")
 # temporal 모드 경계. 사이 하루(2024-01-01)는 완충으로 비운다 — Im축이
 # 6시간 전을 보고 타깃이 +6시간이라 경계 표본은 양쪽에 걸친다.
 TEMPORAL_TRAIN_END = os.getenv("TEMPORAL_TRAIN_END", "20231231")
@@ -726,7 +744,9 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         print(f" 배치 {BATCH_SIZE} | LR {LR:.2e} | 워커 {NUM_WORKERS} | "
               f"극한기상 라벨 마스킹: {'ON' if EXTREME_LABEL_MASKING else 'OFF(대조군)'}")
         print(f" EXTREME_BCE_WEIGHT: {EXTREME_BCE_WEIGHT} | "
-              f"CROP_OVERSAMPLE: {CROP_OVERSAMPLE}")
+              f"CROP_OVERSAMPLE: {CROP_OVERSAMPLE} | "
+              f"DUST_LOSS_WEIGHT: {DUST_LOSS_WEIGHT}"
+              f"{'  ← 황사 헤드 손실 제외' if DUST_LOSS_WEIGHT == 0 else ''}")
         print(f" 분할 방식: {SPLIT_MODE}"
               + (f" (학습 ~{TEMPORAL_TRAIN_END} / 검증 {TEMPORAL_VAL_START}~)"
                  if SPLIT_MODE == "temporal" else ""))
@@ -995,8 +1015,9 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             if hasattr(model, "head_coldwave") and cmask_b.sum() > 0:
                 loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
                     model._last_coldwave_logit, cold_b, cmask_b, coldwave_pos_weight)
-            if hasattr(model, "head_dust") and dmask_b.sum() > 0:
-                loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
+            if (DUST_LOSS_WEIGHT > 0 and hasattr(model, "head_dust")
+                    and dmask_b.sum() > 0):
+                loss = loss + EXTREME_BCE_WEIGHT * DUST_LOSS_WEIGHT * _masked_bce(
                     model._last_dust_logit, dust_b, dmask_b, dust_pos_weight)
             # 게이트 엔트로피 정규화 — 가중치를 소수 축에 집중시키는 압력.
             # 이 항이 없으면 게이트도 정적 α/φ 와 마찬가지로 무용 축의
@@ -1129,6 +1150,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # 받는다. 없으면 False(구버전)로 읽혀 기존 체크포인트가 그대로
                 # 로드된다.
                 "signed_head_input": SIGNED_HEAD_INPUT,
+                "dust_loss_weight": DUST_LOSS_WEIGHT,
                 "signed_precip_input": SIGNED_PRECIP_INPUT,
                 "head_dropout": HEAD_DROPOUT,
                 "coldwave_dropout": COLDWAVE_DROPOUT,
