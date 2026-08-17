@@ -126,6 +126,8 @@ def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
         # 없으면 False — 이 플래그 도입 이전 체크포인트는 헤드 입력이
         # embed_dim 이므로 그대로 복원해야 state_dict 이 맞는다.
         signed_head_input=ckpt.get("signed_head_input", False),
+        signed_precip_input=ckpt.get("signed_precip_input", False),
+        head_dropout=ckpt.get("head_dropout", 0.0),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

@@ -77,13 +77,28 @@ def _pairwise_abs_cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return F.cosine_similarity(a, b, dim=-1).abs().mean().item()
 
 
-def _binary_head(embed_dim: int, prior: float) -> nn.Sequential:
+def _head_layers(in_dim: int, dropout: float = 0.0) -> list:
+    """
+    헤드 공통 층 구성. dropout>0 일 때만 Dropout 을 끼운다.
+
+    p=0 이어도 무조건 끼우면 Sequential 의 인덱스가 밀려 state_dict 키가
+    바뀌고(`head.2.weight` → `head.3.weight`) 구버전 체크포인트를 못 읽는다.
+    Dropout 자체는 파라미터가 없으므로, 넣지 않으면 키가 그대로 유지된다.
+    """
+    layers = [nn.Linear(in_dim, 32), nn.GELU()]
+    if dropout > 0:
+        layers.append(nn.Dropout(dropout))
+    layers.append(nn.Linear(32, 1))
+    return layers
+
+
+def _binary_head(embed_dim: int, prior: float, dropout: float = 0.0) -> nn.Sequential:
     """
     이진분류 헤드(강수/폭염/한파 공용) — 편향을 prior의 로짓으로 초기화.
     head_rain 이 처음 도입한 패턴(logit(wet_prior))을 그대로 재사용한다.
     prior 는 호출부(train.py)가 학습 표본에서 실측한 값을 넘긴다.
     """
-    head = nn.Sequential(nn.Linear(embed_dim, 32), nn.GELU(), nn.Linear(32, 1))
+    head = nn.Sequential(*_head_layers(embed_dim, dropout))
     p = min(max(prior, 1e-4), 1 - 1e-4)
     with torch.no_grad():
         head[-1].bias.fill_(math.log(p / (1 - p)))
@@ -288,7 +303,9 @@ class TriCHEFPipeline(nn.Module):
                  heatwave_prior: float = 0.01,
                  coldwave_prior: float = 0.003,
                  dust_prior: float = 0.05,
-                 signed_head_input: bool = False):
+                 signed_head_input: bool = False,
+                 signed_precip_input: bool = False,
+                 head_dropout: float = 0.0):
         """
         orthogonalize        : Gram-Schmidt 직교화 on/off (ablation 스위치)
         gs_eps               : 소프트 정규화 ε — gradient 상한 1/ε
@@ -349,12 +366,17 @@ class TriCHEFPipeline(nn.Module):
             self.log_phi   = nn.Parameter(torch.tensor(math.log(phi_init)))
 
         # 예측 헤드
-        self.head_temp = nn.Sequential(
-            nn.Linear(embed_dim, 32), nn.GELU(), nn.Linear(32, 1),
-        )
-        self.head_precip = nn.Sequential(
-            nn.Linear(embed_dim, 32), nn.GELU(), nn.Linear(32, 1),
-        )
+        # signed_precip_input (2026-08-17) — 강수 경로(양·확률)에도 부호 표현을
+        # 함께 넣는 실험 스위치. 극한기상 헤드에 같은 조치를 했더니 강수 MAE가
+        # 기준선 대비 −17.9%에서 −9.9%로 좋아졌는데, 헤드들이 공유 표현을 두고
+        # 벌이던 경쟁이 완화된 것으로 해석했다. 그렇다면 강수 헤드 자신에게도
+        # 같은 여지를 주면 더 좋아질 수 있다는 가설을 검증하기 위한 것이다.
+        # 기본값 False — 검증 전까지 배포 동작을 바꾸지 않는다.
+        self.signed_precip_input = signed_precip_input
+        self.head_dropout = head_dropout
+        _reg_dim = embed_dim * 2 if signed_precip_input else embed_dim
+        self.head_temp = nn.Sequential(*_head_layers(embed_dim, head_dropout))
+        self.head_precip = nn.Sequential(*_head_layers(_reg_dim, head_dropout))
         # Phase 3-7 hurdle 헤드 — "비가 오는가"를 별도 이진분류기로 분리.
         #
         # 왜 필요한가(2026-08-07 실측, precip_breakdown.py): 검증셋의
@@ -374,7 +396,7 @@ class TriCHEFPipeline(nn.Module):
         # 수렴하면서도, 학습 내내 미분 가능해 그래디언트가 끊기지 않기
         # 때문이다(Phase 3-3 의 dying-clamp 교훈과 같은 이유로 하드 게이트를
         # 피한다).
-        self.head_rain = _binary_head(embed_dim, wet_prior)
+        self.head_rain = _binary_head(_reg_dim, wet_prior, head_dropout)
 
         # Phase 3-8 극한기상 경보 헤드 — head_rain 과 동일한 구조·목적
         # (연속 회귀로는 못 내는 "일어나는가"를 명시적으로 학습). 임계값은
@@ -402,12 +424,12 @@ class TriCHEFPipeline(nn.Module):
         # 원인 분리가 불가능해진다.
         _ext_dim = embed_dim * 2 if signed_head_input else embed_dim
         self.signed_head_input = signed_head_input
-        self.head_heatwave = _binary_head(_ext_dim, heatwave_prior)
-        self.head_coldwave = _binary_head(_ext_dim, coldwave_prior)
+        self.head_heatwave = _binary_head(_ext_dim, heatwave_prior, head_dropout)
+        self.head_coldwave = _binary_head(_ext_dim, coldwave_prior, head_dropout)
         # Phase 3-9 황사 헤드 — 폭염/한파와 동일 패턴. 라벨은 ASOS 현상번호
         # 추정치가 아니라 기상청 "날씨 이슈별 데이터"의 공식 황사관측여부를
         # 쓴다(import_weather_issues.py, 2026-08-09).
-        self.head_dust = _binary_head(_ext_dim, dust_prior)
+        self.head_dust = _binary_head(_ext_dim, dust_prior, head_dropout)
 
         # 출력 편향 초기화 — magnitude 원소값이 ~1/√D 로 작아서 편향만
         # 학습하는 데 수십 에폭이 낭비되는 문제를 제거한다.
@@ -609,10 +631,12 @@ class TriCHEFPipeline(nn.Module):
         # clamp(x,0,·) 대신 softplus 를 양(量) 헤드에 쓰는 이유는 여전히
         # Phase 3-3 과 동일 — x<0 에서 gradient 0 이 되는 dying-clamp을
         # 피한다.
-        rain_logit = self.head_rain(magnitude)
+        _reg_in = (torch.cat([magnitude, v_z], dim=-1)
+                   if self.signed_precip_input else magnitude)
+        rain_logit = self.head_rain(_reg_in)
         self._last_rain_logit = rain_logit   # train.py 가 BCE 손실 계산에 사용
         rain_prob = torch.sigmoid(rain_logit)
-        amount = F.softplus(self.head_precip(magnitude))
+        amount = F.softplus(self.head_precip(_reg_in))
         precip_pred = rain_prob * amount
 
         # 극한기상 경보 확률 — 회귀 출력(temp_pred/precip_pred)과 별개로

@@ -226,6 +226,19 @@ CROP_OVERSAMPLE = float(os.getenv("CROP_OVERSAMPLE", "1.0"))
 # 대조군(끈 상태)과 나란히 돌려 이 변경만의 효과를 분리하기 위함이다.
 SIGNED_HEAD_INPUT = os.getenv("SIGNED_HEAD_INPUT", "1") != "0"
 
+# 강수 경로(확률·양)에도 같은 부호 표현을 줄지 여부(2026-08-17 실험).
+# 극한기상 헤드에 적용했더니 강수 MAE가 −17.9%에서 −9.9%로 좋아졌다 —
+# 헤드 간 공유 표현 경쟁이 완화된 것으로 해석했으므로, 강수 헤드 자신에게도
+# 같은 여지를 주면 더 좋아질 수 있다는 가설이다. 기본값 0(끔) — 검증 전까지
+# 배포 동작을 바꾸지 않는다.
+SIGNED_PRECIP_INPUT = os.getenv("SIGNED_PRECIP_INPUT", "0") != "0"
+
+# 헤드 드롭아웃 비율(2026-08-17). >0 이면 MC Dropout 으로 예측별 불확실성을
+# 낼 수 있다 — 현재 화면의 ± 는 검증셋 평균오차일 뿐 이 예측 하나의
+# 신뢰구간이 아니다. 다만 파라미터가 5.4만개뿐인 작은 모델이라 드롭아웃이
+# 성능을 깎을 위험이 있어, 부호 표현 실험과 **섞지 않고** 따로 검증한다.
+HEAD_DROPOUT = float(os.getenv("HEAD_DROPOUT", "0"))
+
 # 저장 경로도 환경변수로 뺀다(2026-08-16) — 기본값은 배포가 읽는 경로다.
 # seed를 바꿔가며 재현성을 확인하는 대조 실행은 서로 다른 경로에 저장해야
 # 한다. 안 그러면 ① 동시에 돌린 두 실행이 같은 파일을 덮어쓰고 ② 검증도
@@ -861,6 +874,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         heatwave_prior=heatwave_prior, coldwave_prior=coldwave_prior,
         dust_prior=dust_prior,
         signed_head_input=SIGNED_HEAD_INPUT,
+        signed_precip_input=SIGNED_PRECIP_INPUT,
+        head_dropout=HEAD_DROPOUT,
         im_dim=TENDENCY_DIM,   # Phase 3-11 — 384(MiniLM) 대신 12(경향벡터)
     ).to(DEVICE)
 
@@ -1105,6 +1120,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # 받는다. 없으면 False(구버전)로 읽혀 기존 체크포인트가 그대로
                 # 로드된다.
                 "signed_head_input": SIGNED_HEAD_INPUT,
+                "signed_precip_input": SIGNED_PRECIP_INPUT,
+                "head_dropout": HEAD_DROPOUT,
                 "lead_hours":   lead_hours,
                 "num_features": NUM_FEATURES,
                 "alpha_init":   ALPHA_INIT,
