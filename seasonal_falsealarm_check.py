@@ -98,8 +98,11 @@ def main():
                 mark = "—"
             print(f"{f'{lo}~{hi}°C':<13}{len(idx):>10,}{h.mean():>10.4f}"
                   f"{(h > 0.5).mean():>9.2%}{c.mean():>10.4f}{(c > 0.5).mean():>9.2%}   {mark}")
+        verdict = "FAIL" if worst > 0.10 else ("WARN" if worst > 0.02 else "PASS")
         print(f"\n  계절 오탐 최악값: {worst:.2%}  →  "
-              f"{'배포 부적합' if worst > 0.10 else ('검토 필요' if worst > 0.02 else '통과')}")
+              f"{'배포 부적합' if verdict=='FAIL' else ('검토 필요' if verdict=='WARN' else '통과')}")
+        # promote_checkpoint.py 가 이 줄을 파싱한다 — 형식을 바꾸지 말 것.
+        print(f"VERDICT seasonal_false_alarm {verdict} worst={worst:.6f}")
 
 
 if __name__ == "__main__":

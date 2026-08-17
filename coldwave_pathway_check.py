@@ -127,6 +127,10 @@ def main():
         verdict = "무반응" if np.isnan(corr) else ("정상" if good else ("★역전★" if bad else "혼재"))
         name = p.split("/")[-1]
         print(f"{name:<44}{at:>10.4f}{as_:>10.4f}{ratio:>10.2f}{corr:>10.2f}  {verdict}")
+        # promote_checkpoint.py 가 이 줄을 파싱한다 — 형식을 바꾸지 말 것.
+        # 역전이면 FAIL, 방향이 뚜렷하지 않으면(혼재·무반응) WARN.
+        code = "FAIL" if verdict.startswith("★") else ("PASS" if verdict == "정상" else "WARN")
+        print(f"VERDICT monotonicity_{head} {code} corr={corr:.4f}")
 
     print(f"\n대상 헤드: {head}")
     print("계절의존 = 계절 진폭 ÷ 기온 진폭. 클수록 기온보다 계절에 의존한다.")
