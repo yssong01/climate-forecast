@@ -198,7 +198,7 @@ def main():
     else:
         print("\n한글 폰트 설치 실패 — 관측소 코드만 라벨로 사용")
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(15.5, 7.6))
     colors = {"heatwave": "#E2954F", "coldwave": "#4C78A8"}
     labels_ko = {"heatwave": "폭염", "coldwave": "한파"}
     for ax, name in zip(axes, ["heatwave", "coldwave"]):
@@ -213,26 +213,42 @@ def main():
                         markeredgewidth=2, capsize=4, elinewidth=1.5, alpha=0.85)
             label = f"{r['station']}({r['code']})" if korean_font else r["code"]
             ax.annotate(label, (x, y), textcoords="offset points",
-                       xytext=(6, 6), fontsize=8)
-        ax.set_xlabel("재현율 (Recall)")
-        ax.set_ylabel("정밀도 (Precision)")
-        ax.set_title(f"{labels_ko[name]} — 관측소별 (십자 = 사건 수 기준 Wilson 95% 신뢰구간)")
+                       xytext=(6, 6), fontsize=10)
+        ax.set_xlabel("재현율 (Recall) — 실제 사건 중 잡아낸 비율",
+                      fontsize=13, fontweight="bold")
+        ax.set_ylabel("정밀도 (Precision) — 사건이라 판정한 것 중 맞은 비율",
+                      fontsize=13, fontweight="bold")
+        ax.set_title(f"{labels_ko[name]} — 관측소별\n"
+                     "(십자 = 사건 수 기준 Wilson 95% 신뢰구간)",
+                     fontsize=15, fontweight="bold")
         ax.set_xlim(-0.05, 1.05)
         ax.set_ylim(-0.05, 1.05)
+        ax.tick_params(labelsize=11)
         ax.grid(alpha=0.3)
 
     # 첫 번째 그래프(폭염) 왼쪽 위에 관측소 코드→이름 범례를 붙인다 — 점
     # 라벨에 이미 "이름(코드)"가 있지만, 코드만 봐도 바로 찾게 하려는
-    # 목적이다(2026-08-16 사용자 요청).
+    # 목적이다(2026-08-16 사용자 요청). 12개를 한 줄씩 쌓으면 세로로 길어
+    # 데이터를 가리므로 2열로 접는다(2026-08-17).
     legend_codes = sorted({r["code"] for rows in results.values() for r in rows})
-    legend_text = "\n".join(f"{c}: {STATION_NAMES.get(c, c)}" for c in legend_codes)
+    _pairs = [f"{c}: {STATION_NAMES.get(c, c)}" for c in legend_codes]
+    _half = (len(_pairs) + 1) // 2
+    _left, _right = _pairs[:_half], _pairs[_half:]
+    _right += [""] * (len(_left) - len(_right))
+    legend_text = "관측소 코드\n" + "\n".join(
+        f"{a:<12}{b}" for a, b in zip(_left, _right))
     axes[0].text(
         0.02, 0.98, legend_text, transform=axes[0].transAxes,
-        fontsize=7.5, va="top", ha="left",
-        bbox=dict(boxstyle="round", facecolor="white", edgecolor="gray", alpha=0.85),
+        fontsize=11, va="top", ha="left", linespacing=1.5,
+        family="monospace" if not korean_font else None,
+        bbox=dict(boxstyle="round,pad=0.6", facecolor="white",
+                  edgecolor="gray", alpha=0.9),
     )
 
-    fig.tight_layout()
+    fig.suptitle("관측소별 신뢰도 분석 — 오른쪽 위로 갈수록 좋다"
+                 "(정밀도·재현율이 함께 높다)",
+                 fontsize=19, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(args.out, dpi=130)
     print(f"\n저장: {args.out}")
 

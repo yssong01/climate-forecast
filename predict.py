@@ -84,8 +84,11 @@ def calibrate_prob(prob: float, event: str, ckpt: dict) -> float:
     위로 밀어올린다. 그 결과 헤드 넷 모두 체계적으로 과신했다(한파는 "60~70%"
     라 해도 실제 빈도가 27%). 화면은 이 값을 확률 막대로 그대로 내놓고 있었다.
 
-    보정은 단조 증가 함수라 순위가 보존된다 — 임계값을 같은 곡선으로 옮기면
-    판정 결과가 그대로다(probability_calibration_fit.py에서 F1 보존 확인).
+    보정은 단조 증가 함수이나 **순증가는 아니다** — 등장성 회귀 결과는 평탄
+    구간을 가지므로 서로 다른 원본 확률이 같은 보정값으로 접힌다. 따라서
+    임계값을 같은 곡선으로 옮겨도 판정이 항상 보존되지는 않는다(2026-08-17
+    한파 헤드에서 F1 0.4566→0.4484로 실측). 판정선은 `event_threshold()`가
+    별도로 처리한다.
 
     강수("rain")에는 적용하지 않는다 — 화면에 확률이 아니라 mm로 나가고,
     양(量) 헤드가 보정 전 확률과 곱해지도록 함께 학습됐다. 여기서 확률만
@@ -101,10 +104,26 @@ def calibrate_prob(prob: float, event: str, ckpt: dict) -> float:
 
 def event_threshold(event: str, stn: str, ckpt: dict = None) -> float:
     """
-    판정 임계값. 체크포인트에 확률 보정 곡선이 있으면 임계값도 같은 곡선으로
-    옮긴다 — 확률만 보정하고 임계값을 그대로 두면 판정 기준이 어긋난다.
+    판정 임계값. 확률을 보정했으면 판정선도 보정 공간의 값이어야 한다 — 확률만
+    보정하고 임계값을 그대로 두면 판정 기준이 어긋난다.
+
+    보정 공간의 판정선은 두 경로로 정해진다.
+      · `threshold_decision` — `probability_calibration_fit.py`가 보정 공간에서
+        직접 고른 값. 곡선의 평탄 구간 때문에 '곡선으로 옮기기'가 판정을
+        보존하지 못할 때만 재선정하며, 고른 표본과 채점한 표본을 분리해
+        순이득이 0.01 이상일 때만 채택한다.
+      · 그 키가 없으면(재선정 도입 이전 체크포인트) 원본 임계값을 곡선으로
+        옮긴 값을 그대로 쓴다.
+
+    관측소별 예외가 걸린 조합은 전역 재선정값을 쓰지 않는다 — 예외는 그
+    관측소 표본에서 따로 검증해 고른 값이므로 전역값으로 덮으면 근거가 사라진다.
     """
-    return calibrate_prob(raw_event_threshold(event, stn), event, ckpt)
+    raw = raw_event_threshold(event, stn)
+    if (stn, event) not in STATION_EVENT_THRESH_OVERRIDES:
+        head = (((ckpt or {}).get("prob_calibration") or {}).get("heads") or {}).get(event)
+        if head and head.get("threshold_decision") is not None:
+            return float(head["threshold_decision"])
+    return calibrate_prob(raw, event, ckpt)
 
 
 def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):

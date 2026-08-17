@@ -47,6 +47,7 @@ CALIB_SEED = 1234    # threshold_validation.py와 같은 값 — 같은 재분�
 N_KNOTS = 200        # 조회표 크기. 200이면 곡선을 충분히 담으면서 체크포인트에
                      # 부담이 없다(헤드당 약 3KB).
 MIN_ECE_GAIN = 0.005 # 평가용에서 이만큼은 좋아져야 채택한다
+MIN_THRESH_GAIN = 0.01  # 임계값 재선정 채택 기준 — threshold_validation.py 와 동일
 
 
 def _pava(y, w):
@@ -141,6 +142,19 @@ def prf(probs, labels, t):
     return p, r, f
 
 
+def _best_threshold(probs, labels, n_grid=400):
+    """주어진 확률 공간에서 F1 을 최대화하는 임계값을 격자 탐색으로 고른다."""
+    if len(probs) == 0:
+        return 0.5
+    grid = np.linspace(float(probs.min()), float(probs.max()), n_grid)
+    best_t, best_f1 = float(grid[0]), -1.0
+    for t in grid:
+        f1 = prf(probs, labels, float(t))[2]
+        if f1 > best_f1:
+            best_t, best_f1 = float(t), f1
+    return best_t
+
+
 def load_probs(ckpt_path):
     model, ckpt = load_model(ckpt_path, DEVICE)
     model.eval()
@@ -206,6 +220,7 @@ def main():
 
         xs, ys = fit_isotonic(pc, lc)
         pe_cal = apply_calibration(pe, xs, ys)
+        pc_cal = apply_calibration(pc, xs, ys)   # 임계값 재선정용(보정용 절반)
 
         e0, e1 = ece(pe, le), ece(pe_cal, le)
         m0, m1 = mce(pe, le), mce(pe_cal, le)
@@ -218,6 +233,18 @@ def main():
         f_raw = prf(pe, le, t_raw)[2]
         f_cal = prf(pe_cal, le, t_cal)[2]
 
+        # 옮긴 임계값이 판정을 보존하지 못할 때의 대비책(2026-08-17 추가).
+        # 등장성 곡선은 평탄 구간을 가지므로 순증가가 아니다 — 임계값이 그
+        # 구간 안에 떨어지면 구간 전체가 한쪽으로 몰려 실효 임계값이 어긋난다.
+        # 실제로 한파 헤드 디커플링 직후 F1 이 0.4566→0.4484 로 떨어졌다
+        # (calibrated_threshold_check.py 로 확인). 판정이 실제로 이뤄지는
+        # 공간(보정 후)에서 임계값을 직접 고르되, 고르는 표본과 채점하는
+        # 표본을 분리하고 순이득이 기준에 미달하면 채택하지 않는다.
+        t_pick = _best_threshold(pc_cal, lc)
+        f_pick = prf(pe_cal, le, t_pick)[2]
+        repick = (f_pick - f_cal) >= MIN_THRESH_GAIN
+        t_decision = t_pick if repick else t_cal
+
         gain = e0 - e1
         adopt = gain >= MIN_ECE_GAIN
         summary.append((key, e0, e1, m0, m1, b0, b1, t_raw, t_cal, f_raw, f_cal, gain, adopt))
@@ -225,14 +252,22 @@ def main():
             calib_maps[key] = {"x": [float(v) for v in xs],
                                "y": [float(v) for v in ys],
                                "threshold_raw": t_raw,
-                               "threshold_calibrated": t_cal}
+                               "threshold_calibrated": t_cal,
+                               # 서빙이 실제로 쓰는 판정선. 재선정을 채택하지
+                               # 않으면 옮긴 값과 같다.
+                               "threshold_decision": t_decision,
+                               "threshold_repicked": bool(repick)}
 
         print(f"\n{'='*74}\n[{ko[key]}]  평가용 {len(pe):,}개 (보정용 {len(pc):,}개로 적합)")
         print(f"  ECE   {e0:.4f} → {e1:.4f}   (개선 {gain:+.4f})")
         print(f"  MCE   {m0:.4f} → {m1:.4f}")
         print(f"  Brier {b0:.4f} → {b1:.4f}")
         print(f"  임계값 {t_raw:.3f} → {t_cal:.3f} 로 이동 시 F1 {f_raw:.4f} → {f_cal:.4f}"
-              f"  ({'보존됨' if abs(f_raw - f_cal) < 1e-6 else '차이 발생 — 확인 필요'})")
+              f"  ({'보존됨' if abs(f_raw - f_cal) < 1e-6 else '차이 발생 — 재선정 검토'})")
+        print(f"  보정 공간 재선정 t = {t_pick:.3f} → 평가용 F1 {f_pick:.4f} "
+              f"(순이득 {f_pick - f_cal:+.4f}) — "
+              f"{'채택' if repick else f'기각(기준 {MIN_THRESH_GAIN})'}")
+        print(f"  서빙 판정선 = {t_decision:.3f}")
         print(f"  판정: {'채택' if adopt else f'기각(개선 {gain:+.4f} < 기준 {MIN_ECE_GAIN})'}")
 
     print(f"\n{'='*74}\n요약")

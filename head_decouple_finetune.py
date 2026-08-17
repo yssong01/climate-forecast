@@ -249,8 +249,16 @@ def main():
             parts.append(df)
         score = sum(parts) / len(parts)
         if best is None or score > best[0]:
+            # detach().clone() 이 필수다 — state_dict() 는 파라미터 텐서를 복사하지
+            # 않고 그대로 돌려주므로, 그냥 담아두면 이후 에폭의 갱신이 그 텐서를
+            # 제자리에서 덮어쓴다. 즉 "최선 에폭"을 골라놓고 실제로는 마지막 에폭을
+            # 저장하게 되며, 마지막 줄에 출력하는 최선 지표도 저장된 모델의 값이
+            # 아니게 된다. 2026-08-17 한파 디커플링에서 발견했다 — 최선 에폭 21의
+            # 한파 F1 을 0.462 로 출력했으나 저장본을 patch_extreme_metrics.py 로
+            # 재계산하니 마지막 에폭 값인 0.458 이 나와 드러났다.
             best = (score, epoch, precip_mae, temp_mae, hf, cf, df,
-                    {attr: getattr(model, attr).state_dict()
+                    {attr: {k: v.detach().clone() for k, v in
+                            getattr(model, attr).state_dict().items()}
                      for h in heads for attr in _HEAD_ATTR[h]})
 
     print(f"\n최선 에폭 {best[1]} — 강수MAE {best[2]:.4f} 기온MAE {best[3]:.4f} "

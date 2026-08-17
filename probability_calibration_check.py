@@ -168,9 +168,12 @@ def main():
         plt.rcParams["font.family"] = font_manager.FontProperties(fname=fp).get_name()
     plt.rcParams["axes.unicode_minus"] = False
 
+    # 배치(2026-08-17 조정) — 1행(신뢰도 곡선)은 x·y가 모두 확률이라 축척이
+    # 같아야 대각선을 눈으로 판정할 수 있다. `set_box_aspect(1)`로 정사각형을
+    # 강제하고, 그만큼 남는 세로 공간을 2행(표본 수 히스토그램)에 넘긴다.
     n = len(results)
-    fig, axes = plt.subplots(2, n, figsize=(4.2 * n, 7.6),
-                             gridspec_kw={"height_ratios": [3, 1]})
+    fig, axes = plt.subplots(2, n, figsize=(4.8 * n, 8.9),
+                             gridspec_kw={"height_ratios": [4.2, 2.6]})
     if n == 1:
         axes = axes.reshape(2, 1)
 
@@ -180,30 +183,52 @@ def main():
         ys = [r[3] for r in rows if r[4] > 0]
         ns = [r[4] for r in rows if r[4] > 0]
 
-        ax.plot([0, 1], [0, 1], "--", color="gray", lw=1, label="완전 보정")
-        ax.plot(xs, ys, "o-", color="#4C78A8", lw=1.8, ms=6, label="실측")
+        ax.plot([0, 1], [0, 1], "--", color="gray", lw=1.4, label="완전 보정선(y = x)")
+        ax.plot(xs, ys, "o-", color="#4C78A8", lw=2.2, ms=7,
+                label="실측값(점 크기 = 표본 수)")
         # 점 크기로 표본 수를 함께 보여준다 — 오른쪽 끝 구간은 표본이 극히
         # 적어 실제 빈도가 요동치므로, 크기 없이 보면 과대해석하기 쉽다.
         ax.scatter(xs, ys, s=[max(12, 320 * k / max(ns)) for k in ns],
                    color="#4C78A8", alpha=0.30, zorder=3)
-        ax.axhline(base, color="#B0413E", ls=":", lw=1,
+        ax.axhline(base, color="#B0413E", ls=":", lw=1.4,
                    label=f"실제 양성률 {base:.1%}")
         ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-        ax.set_xlabel("모델이 낸 확률"); ax.set_ylabel("실제 사건 빈도")
-        ax.set_title(f"{name} — ECE {ece:.3f} · Brier {brier:.3f}", fontsize=11)
-        ax.legend(fontsize=8, loc="upper left")
+        ax.set_box_aspect(1)
+        ax.set_xlabel("모델이 낸 확률", fontsize=13, fontweight="bold")
+        ax.set_ylabel("실제 사건 빈도", fontsize=13, fontweight="bold")
+        ax.set_title(f"{name} — ECE {ece:.3f} · Brier {brier:.3f}",
+                     fontsize=15, fontweight="bold")
+        ax.tick_params(labelsize=11)
+        ax.legend(fontsize=12, loc="upper left", labelspacing=0.6,
+                  borderpad=0.7, handlelength=1.8, framealpha=0.92)
+        # 범례 바로 아래에 '실제 양성률'이 무엇이고 무엇을 뜻하는지 밝힌다 —
+        # 그림만 떼어 문서·발표자료에 실릴 때 본문 설명이 따라가지 않는다.
+        ax.text(0.035, 0.735,
+                f"실제 양성률({base:.1%}) = 전체 표본 중\n"
+                "사건이 실제로 일어난 비율이다.\n"
+                "아무 정보 없이 늘 이 값만 답할 때\n"
+                "그려지는 수평선이며, 곡선이 이 선에서\n"
+                "위아래로 크게 벌어질수록 위험한 시각과\n"
+                "그렇지 않은 시각을 실제로 가려낸다는 뜻이다.",
+                transform=ax.transAxes, fontsize=10, va="top", ha="left",
+                linespacing=1.6,
+                bbox=dict(boxstyle="round,pad=0.5", facecolor="#F7F7F7",
+                          edgecolor="gray", alpha=0.92))
         ax.grid(alpha=0.25)
 
         axh.bar([r[2] for r in rows if r[4] > 0], ns,
                 width=0.08, color="#54A24B", alpha=0.75)
         axh.set_yscale("log")
         axh.set_xlim(0, 1)
-        axh.set_xlabel("모델이 낸 확률"); axh.set_ylabel("표본 수(로그)")
+        axh.set_xlabel("모델이 낸 확률", fontsize=13, fontweight="bold")
+        axh.set_ylabel("표본 수(로그 눈금)", fontsize=13, fontweight="bold")
+        axh.set_title("구간별 표본 수", fontsize=13, fontweight="bold")
+        axh.tick_params(labelsize=11)
         axh.grid(alpha=0.25)
 
-    fig.suptitle("확률 보정 상태 — 대각선에 붙을수록 '확률'을 액면 그대로 읽어도 된다",
-                 fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.suptitle("확률 보정 상태 — 대각선에 근접할수록 '확률'의 신뢰도가 높아진다",
+                 fontsize=19, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.965])
     os.makedirs(os.path.dirname(OUT_PNG), exist_ok=True)
     fig.savefig(OUT_PNG, dpi=130, bbox_inches="tight")
     print(f"\n저장: {OUT_PNG}")
