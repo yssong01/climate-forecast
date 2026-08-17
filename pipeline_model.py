@@ -305,7 +305,8 @@ class TriCHEFPipeline(nn.Module):
                  dust_prior: float = 0.05,
                  signed_head_input: bool = False,
                  signed_precip_input: bool = False,
-                 head_dropout: float = 0.0):
+                 head_dropout: float = 0.0,
+                 coldwave_dropout: float = 0.0):
         """
         orthogonalize        : Gram-Schmidt 직교화 on/off (ablation 스위치)
         gs_eps               : 소프트 정규화 ε — gradient 상한 1/ε
@@ -425,7 +426,16 @@ class TriCHEFPipeline(nn.Module):
         _ext_dim = embed_dim * 2 if signed_head_input else embed_dim
         self.signed_head_input = signed_head_input
         self.head_heatwave = _binary_head(_ext_dim, heatwave_prior, head_dropout)
-        self.head_coldwave = _binary_head(_ext_dim, coldwave_prior, head_dropout)
+        # coldwave_dropout (2026-08-17) — head_dropout과 별도로 한파 헤드에만
+        # 거는 드롭아웃. head_dropout을 전체 헤드에 걸었더니(2026-08-17 기각)
+        # 겨울 폭염 오탐이 38.8%로 재발했다 — 드롭아웃이 폭염 헤드의 부호
+        # 표현(v_Z) 경로 유닛까지 무작위로 꺼버려, 그 결함을 고친 경로 자체를
+        # 학습 중 반복 차단했기 때문이다. 한파는 사건이 8~40건뿐이라 과적합
+        # 억제가 필요하지만(실제로 head_dropout 전체 적용 시 한파 F1이
+        # 0.449→0.472로 개선됐었다), 폭염·황사 헤드는 건드리지 않아야 그 개선을
+        # 부작용 없이 취할 수 있다.
+        self.head_coldwave = _binary_head(_ext_dim, coldwave_prior,
+                                          max(head_dropout, coldwave_dropout))
         # Phase 3-9 황사 헤드 — 폭염/한파와 동일 패턴. 라벨은 ASOS 현상번호
         # 추정치가 아니라 기상청 "날씨 이슈별 데이터"의 공식 황사관측여부를
         # 쓴다(import_weather_issues.py, 2026-08-09).

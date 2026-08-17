@@ -239,6 +239,14 @@ SIGNED_PRECIP_INPUT = os.getenv("SIGNED_PRECIP_INPUT", "0") != "0"
 # 성능을 깎을 위험이 있어, 부호 표현 실험과 **섞지 않고** 따로 검증한다.
 HEAD_DROPOUT = float(os.getenv("HEAD_DROPOUT", "0"))
 
+# 한파 헤드 전용 드롭아웃(2026-08-17). HEAD_DROPOUT(전체 헤드 일괄 적용)은
+# 겨울 폭염 오탐을 38.8%로 재발시켜 기각했다 — 드롭아웃이 폭염 헤드의 부호
+# 표현(v_Z) 경로 유닛까지 무작위로 꺼버리기 때문이다. 그런데 그 실행에서
+# 한파 F1은 0.449→0.472로 개선됐었다(사건 8~40건뿐인 희소 헤드라 과적합
+# 억제 효과가 실제로 있다). 폭염·황사 헤드는 건드리지 않고 한파 헤드에만
+# 정규화를 걸어 그 개선만 부작용 없이 취할 수 있는지 검증한다.
+COLDWAVE_DROPOUT = float(os.getenv("COLDWAVE_DROPOUT", "0"))
+
 # 저장 경로도 환경변수로 뺀다(2026-08-16) — 기본값은 배포가 읽는 경로다.
 # seed를 바꿔가며 재현성을 확인하는 대조 실행은 서로 다른 경로에 저장해야
 # 한다. 안 그러면 ① 동시에 돌린 두 실행이 같은 파일을 덮어쓰고 ② 검증도
@@ -876,6 +884,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         signed_head_input=SIGNED_HEAD_INPUT,
         signed_precip_input=SIGNED_PRECIP_INPUT,
         head_dropout=HEAD_DROPOUT,
+        coldwave_dropout=COLDWAVE_DROPOUT,
         im_dim=TENDENCY_DIM,   # Phase 3-11 — 384(MiniLM) 대신 12(경향벡터)
     ).to(DEVICE)
 
@@ -1122,6 +1131,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "signed_head_input": SIGNED_HEAD_INPUT,
                 "signed_precip_input": SIGNED_PRECIP_INPUT,
                 "head_dropout": HEAD_DROPOUT,
+                "coldwave_dropout": COLDWAVE_DROPOUT,
                 "lead_hours":   lead_hours,
                 "num_features": NUM_FEATURES,
                 "alpha_init":   ALPHA_INIT,
