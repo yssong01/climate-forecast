@@ -265,6 +265,18 @@ HEAD_DROPOUT = float(os.getenv("HEAD_DROPOUT", "0"))
 # 정규화를 걸어 그 개선만 부작용 없이 취할 수 있는지 검증한다.
 COLDWAVE_DROPOUT = float(os.getenv("COLDWAVE_DROPOUT", "0"))
 
+# 강수 amount 헤드를 MSE 대신 Gamma NLL 로 학습할지 여부(2026-08-18 실험).
+# distribution_diagnostics.py 실측(cache/eval_cache.npz, 습윤 표본 n=17,015):
+# 강수량 분포의 KS 통계량이 정규 0.294·감마 0.111·로그정규 0.066 순으로
+# 뚜렷하게 우측 치우침이며, MSE(대칭 손실)로 학습된 현재 헤드는 99백분위를
+# 6.55mm 로 예측하지만 실측은 21.49mm(0.30배 — 구조적 과소예측)이다. Gamma
+# NLL 은 CRPS 와 같은 적정 점수규칙 계열로, 큰 값을 log-비율 오차로 다뤄
+# 대칭 손실보다 꼬리를 덜 짓누른다. 습윤 표본(강수≥WET_THRESH)에만 적용—
+# 무강수 판정은 이미 head_rain(hurdle BCE)이 담당하므로 이중으로 벌점을
+# 주지 않는다. 기본값 0(끔) — 검증 전까지 배포 동작을 바꾸지 않는다
+# (head_dropout/signed_precip_input 과 같은 패턴).
+PRECIP_GAMMA_NLL = os.getenv("PRECIP_GAMMA_NLL", "0") != "0"
+
 # 저장 경로도 환경변수로 뺀다(2026-08-16) — 기본값은 배포가 읽는 경로다.
 # seed를 바꿔가며 재현성을 확인하는 대조 실행은 서로 다른 경로에 저장해야
 # 한다. 안 그러면 ① 동시에 돌린 두 실행이 같은 파일을 덮어쓰고 ② 검증도
@@ -860,6 +872,17 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         print(f"Hurdle 헤드 — 학습셋 강수 비율 {wet_prior:.4f} "
               f"({n_wet}/{len(train_precip)}), BCE pos_weight={rain_pos_weight.item():.2f}")
 
+    # Gamma α 초기값 — 학습셋 습윤 표본의 모멘트법(method of moments)으로
+    # 산출한다(하드코딩 금지, CLAUDE.md 규칙 4). Gamma(shape=α, mean=μ) 에서
+    # Var = μ²/α ⟹ α = mean²/var.
+    wet_train_precip = train_precip[train_precip >= WET_THRESH]
+    _wet_mean = wet_train_precip.mean().item()
+    _wet_var  = wet_train_precip.var(unbiased=True).item()
+    precip_gamma_alpha_init = max(_wet_mean ** 2 / max(_wet_var, 1e-6), 1e-3)
+    if verbose and PRECIP_GAMMA_NLL:
+        print(f"강수 Gamma NLL — 습윤 표본 모멘트법 α 초기값 {precip_gamma_alpha_init:.4f} "
+              f"(평균 {_wet_mean:.4f}mm, 분산 {_wet_var:.4f}, n={len(wet_train_precip)})")
+
     # Phase 3-8/3-9 극한기상 헤드 사전확률·클래스 불균형 가중치.
     # 세 사건 모두 기상청 공식 라벨이 있는 표본에서만 비율을 잰다 — 마스크=0인
     # 표본은 "사건 없음으로 확인됨"이 아니라 "판정 불가"라 분모에서도 뺀다
@@ -905,6 +928,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         signed_precip_input=SIGNED_PRECIP_INPUT,
         head_dropout=HEAD_DROPOUT,
         coldwave_dropout=COLDWAVE_DROPOUT,
+        precip_gamma_nll=PRECIP_GAMMA_NLL,
+        precip_gamma_alpha_init=precip_gamma_alpha_init,
         im_dim=TENDENCY_DIM,   # Phase 3-11 — 384(MiniLM) 대신 12(경향벡터)
     ).to(DEVICE)
 
@@ -985,8 +1010,24 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
 
             optimizer.zero_grad()
             pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt)
-            loss = (mse(pred[:, 0:1], y_b[:, 0:1]) / temp_var
-                    + PRECIP_WEIGHT * mse(pred[:, 1:2], y_b[:, 1:2]))
+            loss = mse(pred[:, 0:1], y_b[:, 0:1]) / temp_var
+            if PRECIP_GAMMA_NLL:
+                # 강수 amount 를 MSE(대칭 손실) 대신 Gamma NLL 로 학습한다
+                # (위 PRECIP_GAMMA_NLL 정의부 주석 참고). "오는가"는 이미
+                # head_rain(hurdle BCE)이 담당하므로, amount 항은 습윤
+                # 표본에서만 계산한다 — 무강수 표본까지 넣으면 이중 벌점.
+                is_wet_f = (y_b[:, 1:2] >= WET_THRESH).float()
+                gamma_dist = torch.distributions.Gamma(
+                    concentration=model._last_precip_alpha,
+                    rate=model._last_precip_alpha / model._last_precip_mu,
+                )
+                y_wet_clamped = y_b[:, 1:2].clamp(min=1e-6)
+                nll_raw = -gamma_dist.log_prob(y_wet_clamped)
+                loss = loss + PRECIP_WEIGHT * (
+                    (nll_raw * is_wet_f).sum() / is_wet_f.sum().clamp(min=1)
+                )
+            else:
+                loss = loss + PRECIP_WEIGHT * mse(pred[:, 1:2], y_b[:, 1:2])
             # Hurdle BCE — "비가 오는가"에 직접 그래디언트를 준다. softplus
             # 회귀 손실만으로는 무강수 쪽으로 정확히 0을 향할 유인이 약해서
             # (기울기가 실측치와의 차이에만 비례) 이 항이 없으면 dynamic_gate
@@ -1154,6 +1195,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "signed_precip_input": SIGNED_PRECIP_INPUT,
                 "head_dropout": HEAD_DROPOUT,
                 "coldwave_dropout": COLDWAVE_DROPOUT,
+                "precip_gamma_nll": PRECIP_GAMMA_NLL,
+                "precip_gamma_alpha_init": precip_gamma_alpha_init,
                 "lead_hours":   lead_hours,
                 "num_features": NUM_FEATURES,
                 "alpha_init":   ALPHA_INIT,

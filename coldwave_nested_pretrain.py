@@ -1,0 +1,160 @@
+"""
+coldwave_nested_pretrain.py — 한파 헤드 중첩 극한사건 전이학습(사전학습 단계).
+
+Jacques-Dumas et al.(arXiv:2103.09743)의 중첩 극한사건 전이학습을 적용한다
+— 더 극단적인 사건은 덜 극단적인 사건의 부분집합이라는 성질을 이용해,
+표본이 많은 "약한" 사건으로 먼저 학습한 뒤 표본이 극히 적은 진짜 사건으로
+옮겨간다.
+
+**왜 필요한가.** 한파는 공식 라벨 기간이 포털 제공 범위(2020년~)로 고정돼
+못 늘리지만(README 검증 규약), 원시 기온 자체는 13.6년치가 있다. 이
+스크립트는 학습셋(공식 학습/검증 분할과 동일 — 검증셋은 절대 보지 않는다)
+기온 분포의 하위 백분위 3단계로 "약한 한파" 라벨을 만들어 head_coldwave를
+순차적으로 사전학습한다. 트렁크는 동결한다(head_decouple_finetune.py 와
+같은 원리 — Kang et al. 2020, Decoupling Representation and Classifier).
+
+**마지막 단계 출력은 그 자체로 배포하지 않는다.** 이 스크립트가 만드는
+체크포인트를 `head_decouple_finetune.py`의 입력(CHECKPOINT_PATH)으로 넘기면
+그 스크립트가 공식 라벨로 최종 미세조정을 수행한다 — 사전학습 따로,
+공식 라벨 적응 따로다.
+
+**약한 라벨은 사전학습에만 쓴다 — 평가에는 절대 쓰지 않는다.** 검증은
+언제나 공식 라벨(ds.y_coldwave/cold_mask)로만 수행한다(아래 스테이지별로
+찍는 F1은 진행 상황 참고용일 뿐 스테이지 선택 기준이 아니다). 라벨 정의를
+섞으면 과거 폭염 F1 사고(공식 0.842 vs 근사 0.195)가 되풀이된다
+(EXTREME_LABEL_MASKING 도입 배경, README 참고).
+
+백분위 임계값은 학습셋에서만 실측한다(하드코딩 금지, CLAUDE.md 4절) —
+전역이나 검증셋에서 구하지 않는다.
+
+각 스테이지 시작 전 head_coldwave 를 다시 초기화한다 — 직전 공식 라벨로
+학습된 편향을 지우고 순수하게 약한 라벨 curriculum 으로만 쌓아올리기
+위함이다(이미 공식 정의를 아는 헤드에 약한 신호를 더하면 잡음이 될 뿐이다).
+
+실행: python coldwave_nested_pretrain.py --out checkpoints/numerical_trichef_coldwave_pretrain.pt
+"""
+import argparse
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from head_decouple_finetune import freeze_trunk, evaluate, _HEAD_ATTR
+from train import collect_historical, WeatherDataset, make_split
+from weather_collector import STATION_COORDS
+from interp_field_collector import InterpolatedFieldCollector
+from tendency_collector import TendencyCollector
+from predict import load_model, CHECKPOINT
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH = 2048
+# 하위 백분위 3단계 — 점점 좁혀 진짜 사건(포털 공식 정의)에 가까워진다.
+# p20(가장 관대) → p10 → p5(공식 한파 비율 6.84%에 가장 근접).
+WEAK_PERCENTILES = [20.0, 10.0, 5.0]
+EPOCHS_PER_STAGE = 8
+LR = 5e-4
+
+
+def reinit_head(module):
+    """Linear 층을 PyTorch 기본 초기화로 되돌린다 — 이전 스테이지(또는 공식
+    라벨 학습)의 편향을 지우고 이번 curriculum 단계를 순수하게 시작한다."""
+    for m in module.modules():
+        if isinstance(m, nn.Linear):
+            m.reset_parameters()
+
+
+def train_stage(model, ds, train_idx, weak_label_all, epochs, lr, device):
+    optimizer = torch.optim.Adam(
+        [p for p in model.parameters() if p.requires_grad], lr=lr)
+    idx_t = torch.as_tensor(train_idx)
+    weak_t = weak_label_all[idx_t]
+    n = len(idx_t)
+    for epoch in range(1, epochs + 1):
+        model.train()
+        perm = torch.randperm(n)
+        total_loss, n_batches = 0.0, 0
+        for b in range(0, n, BATCH):
+            sel = perm[b:b + BATCH]
+            sl = idx_t[sel]
+            wl = weak_t[sel].to(device).unsqueeze(-1)
+            x_num = ds.X_num[sl].to(device)
+            x_img = ds.X_img[sl].to(device).float()
+            x_txt = ds.X_txt[sl].to(device)
+            optimizer.zero_grad()
+            model(num_x=x_num, img_x=x_img, txt_x=x_txt)
+            loss = nn.functional.binary_cross_entropy_with_logits(
+                model._last_coldwave_logit, wl)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+        print(f"      epoch {epoch:2d}/{epochs} | 약한라벨 BCE {total_loss/n_batches:.4f}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="checkpoints/numerical_trichef_coldwave_pretrain.pt")
+    args = ap.parse_args()
+
+    model, ckpt = load_model(CHECKPOINT, DEVICE)
+    print(f"기반 체크포인트 — split_mode={ckpt.get('split_mode')} "
+          f"기온MAE {ckpt['val_temp_mae']:.4f} 강수MAE {ckpt['val_precip_mae']:.4f}")
+
+    records = collect_historical()
+    txt_collector = TendencyCollector(records)
+    ds = WeatherDataset(
+        records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
+        txt_collector=txt_collector, lead_hours=ckpt["lead_hours"],
+        mean=np.array(ckpt["mean"], dtype=np.float32),
+        std=np.array(ckpt["std"], dtype=np.float32),
+    )
+    train_ds, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True)
+    train_idx = list(train_ds.indices)
+    val_idx = list(val_ds.indices)
+
+    n_tunable = freeze_trunk(model, ["coldwave"])
+    print(f"트렁크 동결, head_coldwave만 학습 — {n_tunable:,}개 파라미터")
+
+    temp_tgt_train = ds.y[torch.as_tensor(train_idx), 0].numpy()
+    temp_tgt_all = ds.y[:, 0].numpy()
+
+    print(f"\n학습셋 기온 분포(n={len(temp_tgt_train):,})에서 산출한 약한 한파 임계값:")
+    thresholds = []
+    for p in WEAK_PERCENTILES:
+        t = float(np.percentile(temp_tgt_train, p))
+        thresholds.append(t)
+        n_pos = int((temp_tgt_train <= t).sum())
+        print(f"  p{p:>4.1f} → {t:6.2f}°C 이하 ({n_pos:,}개, "
+              f"{100*n_pos/len(temp_tgt_train):.1f}%)")
+
+    for stage, (p, t) in enumerate(zip(WEAK_PERCENTILES, thresholds), 1):
+        print(f"\n{'='*70}\n스테이지 {stage}/{len(thresholds)} — p{p:.1f} 이하 "
+              f"({t:.2f}°C) 를 양성으로 학습")
+        reinit_head(model.head_coldwave)
+        weak_label_all = torch.tensor((temp_tgt_all <= t).astype(np.float32))
+        train_stage(model, ds, train_idx, weak_label_all, EPOCHS_PER_STAGE, LR, DEVICE)
+
+        # 진행 상황 참고용 — 공식 라벨로 채점(스테이지 선택 기준 아님, 약한
+        # 라벨로 학습한 헤드가 공식 정의와 얼마나 가까워지는지 관찰만 한다).
+        _, _, m = evaluate(model, ds, val_idx, DEVICE)
+        cf = m["coldwave"]["f1"]
+        print(f"  [참고] 공식 라벨 기준 한파 F1(스테이지 선택에 미사용): {cf:.4f}")
+
+    ckpt_out = dict(ckpt)
+    ckpt_out["model_state"] = model.state_dict()
+    ckpt_out["coldwave_nested_pretrain"] = {
+        "weak_percentiles": WEAK_PERCENTILES,
+        "weak_thresholds_c": thresholds,
+        "epochs_per_stage": EPOCHS_PER_STAGE,
+    }
+    # val_temp_mae/val_precip_mae 등은 트렁크·다른 헤드가 안 바뀌었으므로
+    # 그대로 둔다. head_coldwave 만 바뀌었고, 다음 단계(head_decouple_
+    # finetune.py, 공식 라벨)가 한파 지표를 다시 재는 시점에 갱신된다.
+    torch.save(ckpt_out, args.out)
+    print(f"\n저장: {args.out}")
+    print(f"다음 단계: CHECKPOINT_PATH={args.out} python head_decouple_finetune.py "
+          f"--heads coldwave --out checkpoints/numerical_trichef_coldwave_nested.pt")
+
+
+if __name__ == "__main__":
+    main()

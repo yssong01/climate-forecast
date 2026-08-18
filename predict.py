@@ -148,6 +148,8 @@ def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
         signed_precip_input=ckpt.get("signed_precip_input", False),
         head_dropout=ckpt.get("head_dropout", 0.0),
         coldwave_dropout=ckpt.get("coldwave_dropout", 0.0),
+        precip_gamma_nll=ckpt.get("precip_gamma_nll", False),
+        precip_gamma_alpha_init=ckpt.get("precip_gamma_alpha_init", 1.0),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

@@ -77,18 +77,21 @@ def _pairwise_abs_cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return F.cosine_similarity(a, b, dim=-1).abs().mean().item()
 
 
-def _head_layers(in_dim: int, dropout: float = 0.0) -> list:
+def _head_layers(in_dim: int, dropout: float = 0.0, out_dim: int = 1) -> list:
     """
     헤드 공통 층 구성. dropout>0 일 때만 Dropout 을 끼운다.
 
     p=0 이어도 무조건 끼우면 Sequential 의 인덱스가 밀려 state_dict 키가
     바뀌고(`head.2.weight` → `head.3.weight`) 구버전 체크포인트를 못 읽는다.
     Dropout 자체는 파라미터가 없으므로, 넣지 않으면 키가 그대로 유지된다.
+
+    out_dim — 기본 1(회귀·이진분류 공용). Gamma NLL 강수 헤드처럼 분포
+    모수 두 개(μ, α)를 함께 내야 할 때만 2로 지정한다.
     """
     layers = [nn.Linear(in_dim, 32), nn.GELU()]
     if dropout > 0:
         layers.append(nn.Dropout(dropout))
-    layers.append(nn.Linear(32, 1))
+    layers.append(nn.Linear(32, out_dim))
     return layers
 
 
@@ -306,7 +309,9 @@ class TriCHEFPipeline(nn.Module):
                  signed_head_input: bool = False,
                  signed_precip_input: bool = False,
                  head_dropout: float = 0.0,
-                 coldwave_dropout: float = 0.0):
+                 coldwave_dropout: float = 0.0,
+                 precip_gamma_nll: bool = False,
+                 precip_gamma_alpha_init: float = 1.0):
         """
         orthogonalize        : Gram-Schmidt 직교화 on/off (ablation 스위치)
         gs_eps               : 소프트 정규화 ε — gradient 상한 1/ε
@@ -377,7 +382,21 @@ class TriCHEFPipeline(nn.Module):
         self.head_dropout = head_dropout
         _reg_dim = embed_dim * 2 if signed_precip_input else embed_dim
         self.head_temp = nn.Sequential(*_head_layers(embed_dim, head_dropout))
-        self.head_precip = nn.Sequential(*_head_layers(_reg_dim, head_dropout))
+        # precip_gamma_nll (2026-08-18) — 강수 amount 헤드를 MSE 회귀 대신
+        # Gamma 분포 모수(μ, α) 회귀로 바꾸는 ablation 스위치. distribution_
+        # diagnostics.py 실측: 습윤 표본(강수≥WET_THRESH) 의 KS 통계량이
+        # 정규 0.294·감마 0.111·로그정규 0.066 순으로, 강수량 분포가 뚜렷하게
+        # 우측 치우침(로그정규 최적합)이라 대칭 손실인 MSE 로는 호우 분위수를
+        # 구조적으로 과소예측한다(99백분위 실측 6.55mm vs 예측 21.49mm, 0.30배
+        # — precip_breakdown.py 별개 진단인 "무강수 구간 비영 오차"와는 다른
+        # 결함). Gamma NLL 은 CRPS 처럼 적정 점수규칙이고, 오른쪽 꼬리가 두꺼운
+        # 표본에 그래디언트가 (진실 - 예측) 대신 log-비율로 걸려 대칭 손실보다
+        # 큰 값을 과소평가하지 않는다. 기본값 False — 검증 전까지 배포 동작을
+        # 바꾸지 않는다(head_dropout/signed_precip_input 과 같은 패턴).
+        self.precip_gamma_nll = precip_gamma_nll
+        _precip_out = 2 if precip_gamma_nll else 1
+        self.head_precip = nn.Sequential(
+            *_head_layers(_reg_dim, head_dropout, out_dim=_precip_out))
         # Phase 3-7 hurdle 헤드 — "비가 오는가"를 별도 이진분류기로 분리.
         #
         # 왜 필요한가(2026-08-07 실측, precip_breakdown.py): 검증셋의
@@ -448,12 +467,19 @@ class TriCHEFPipeline(nn.Module):
             self.head_temp[-1].bias.fill_(0.0 if persistence_residual else temp_mean)
             # softplus(b) = precip_mean  →  b = log(exp(precip_mean) − 1)
             b = math.log(math.expm1(max(precip_mean, 1e-3)))
-            self.head_precip[-1].bias.fill_(b)
+            if precip_gamma_nll:
+                self.head_precip[-1].bias[0].fill_(b)
+                a0 = max(precip_gamma_alpha_init - 1e-3, 1e-3)
+                self.head_precip[-1].bias[1].fill_(math.log(math.expm1(a0)))
+            else:
+                self.head_precip[-1].bias.fill_(b)
 
         # 마지막 forward 의 축 진단 지표 (detach 된 float, 학습에 무관)
         self.last_diagnostics: dict = {}
         self._gate_w = None   # 동적 게이트의 마지막 출력 (엔트로피 정규화용)
         self._last_rain_logit = None      # hurdle BCE 손실 계산용 (train.py 가 읽음)
+        self._last_precip_mu = None       # Gamma NLL μ (precip_gamma_nll=True 일 때만)
+        self._last_precip_alpha = None    # Gamma NLL α (precip_gamma_nll=True 일 때만)
         self._last_heatwave_logit = None  # 폭염 BCE 손실 계산용
         self._last_coldwave_logit = None  # 한파 BCE 손실 계산용
         self._last_dust_logit = None      # 황사 BCE 손실 계산용
@@ -646,7 +672,14 @@ class TriCHEFPipeline(nn.Module):
         rain_logit = self.head_rain(_reg_in)
         self._last_rain_logit = rain_logit   # train.py 가 BCE 손실 계산에 사용
         rain_prob = torch.sigmoid(rain_logit)
-        amount = F.softplus(self.head_precip(_reg_in))
+        if self.precip_gamma_nll:
+            _precip_out = self.head_precip(_reg_in)
+            mu    = F.softplus(_precip_out[:, 0:1]) + 1e-6
+            alpha = F.softplus(_precip_out[:, 1:2]) + 1e-3
+            self._last_precip_mu, self._last_precip_alpha = mu, alpha
+            amount = mu
+        else:
+            amount = F.softplus(self.head_precip(_reg_in))
         precip_pred = rain_prob * amount
 
         # 극한기상 경보 확률 — 회귀 출력(temp_pred/precip_pred)과 별개로
