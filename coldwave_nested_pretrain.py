@@ -14,9 +14,15 @@ Jacques-Dumas et al.(arXiv:2103.09743)의 중첩 극한사건 전이학습을 �
 같은 원리 — Kang et al. 2020, Decoupling Representation and Classifier).
 
 **마지막 단계 출력은 그 자체로 배포하지 않는다.** 이 스크립트가 만드는
-체크포인트를 `head_decouple_finetune.py`의 입력(CHECKPOINT_PATH)으로 넘기면
+체크포인트 경로를 `head_decouple_finetune.py`의 **위치 인자**로 넘기면
 그 스크립트가 공식 라벨로 최종 미세조정을 수행한다 — 사전학습 따로,
 공식 라벨 적응 따로다.
+
+환경변수(`CHECKPOINT_PATH`)가 아니라 위치 인자를 쓸 것(2026-08-19 정정) —
+`predict.py`의 `CHECKPOINT`가 그 환경변수를 하드코딩으로 무시하던 버그가
+있었고, 그 때문에 2026-08-18 실험 두 번 모두 사전학습을 거치지 않은
+프로덕션 체크포인트가 그대로 로드됐다. 지금은 predict.py 도 고쳐졌지만,
+환경변수보다 명시적 인자가 더 안전하다.
 
 **약한 라벨은 사전학습에만 쓴다 — 평가에는 절대 쓰지 않는다.** 검증은
 언제나 공식 라벨(ds.y_coldwave/cold_mask)로만 수행한다(아래 스테이지별로
@@ -27,9 +33,17 @@ Jacques-Dumas et al.(arXiv:2103.09743)의 중첩 극한사건 전이학습을 �
 백분위 임계값은 학습셋에서만 실측한다(하드코딩 금지, CLAUDE.md 4절) —
 전역이나 검증셋에서 구하지 않는다.
 
-각 스테이지 시작 전 head_coldwave 를 다시 초기화한다 — 직전 공식 라벨로
+head_coldwave 는 **커리큘럼 시작 전 한 번만** 초기화한다 — 직전 공식 라벨로
 학습된 편향을 지우고 순수하게 약한 라벨 curriculum 으로만 쌓아올리기
 위함이다(이미 공식 정의를 아는 헤드에 약한 신호를 더하면 잡음이 될 뿐이다).
+스테이지 사이에는 재초기화하지 않는다 — p20 에서 배운 가중치 위에 p10 이
+이어서 학습해야 "중첩(nested)"이 성립한다. 이걸 반복문 안에 두는 실수를
+2026-08-18에 실제로 했다(README '기각한 시험' 정정 기록 참고) — 그러면
+매 스테이지가 무작위 초기값에서 다시 시작해 앞 단계 학습이 통째로
+버려지고, 결과가 "마지막 스테이지 하나만 돌린 것"과 같아진다. 이 파일
+아래의 가중치 노름 로그가 그 회귀를 다시 조용히 들여오지 않았는지
+매 실행마다 보여준다 — 스테이지 간 노름이 서로 다르면(수렴이 아니라
+초기화로 리셋되면 항상 비슷한 값 근처에서 시작한다) 재발을 의심할 것.
 
 실행: python coldwave_nested_pretrain.py --out checkpoints/numerical_trichef_coldwave_pretrain.pt
 """
@@ -85,6 +99,16 @@ def _reinit_head_bias(module, temp_tgt_train, first_threshold):
         last.bias.fill_(math.log(prior / (1 - prior)))
     print(f"  헤드 편향 재초기화 — 1단계 사전확률 {prior:.4f} "
           f"(로짓 {math.log(prior/(1-prior)):+.3f})")
+
+
+def head_checksum(module):
+    """head_coldwave 가중치의 L2 노름 — 스테이지 간 warm start 를 실행마다
+    직접 확인하기 위한 진단(2026-08-19 추가). 재초기화가 반복문 안으로
+    되돌아가는 회귀가 생기면, 매 스테이지 학습 전 노름이 비슷한 무작위
+    초기값 근처로 반복해서 리셋되는 게 여기서 바로 보인다 — 이전엔 코드
+    리뷰로만 잡았던 문제라 실행 결과로도 볼 수 있게 남긴다."""
+    with torch.no_grad():
+        return math.sqrt(sum((p ** 2).sum().item() for p in module.parameters()))
 
 
 def train_stage(model, ds, train_idx, weak_label_all, epochs, lr, device):
@@ -161,12 +185,18 @@ def main():
     # 것도 학습 누적이 아니라 임계값이 공식 한파 정의에 가까워진 효과였다.
     reinit_head(model.head_coldwave)
     _reinit_head_bias(model.head_coldwave, temp_tgt_train, thresholds[0])
+    print(f"\n초기화 직후 head_coldwave 노름: {head_checksum(model.head_coldwave):.4f}")
 
     for stage, (p, t) in enumerate(zip(WEAK_PERCENTILES, thresholds), 1):
         print(f"\n{'='*70}\n스테이지 {stage}/{len(thresholds)} — p{p:.1f} 이하 "
               f"({t:.2f}°C) 를 양성으로 학습")
+        norm_before = head_checksum(model.head_coldwave)
         weak_label_all = torch.tensor((temp_tgt_all <= t).astype(np.float32))
         train_stage(model, ds, train_idx, weak_label_all, EPOCHS_PER_STAGE, LR, DEVICE)
+        norm_after = head_checksum(model.head_coldwave)
+        print(f"  head_coldwave 노름: {norm_before:.4f} → {norm_after:.4f} "
+              f"(직전 스테이지에서 이어졌으면 두 값이 가깝다; 초기화로 리셋됐으면 "
+              f"norm_before 가 매번 초기화 직후 값 근처로 되돌아간다)")
 
         # 진행 상황 참고용 — 공식 라벨로 채점(스테이지 선택 기준 아님, 약한
         # 라벨로 학습한 헤드가 공식 정의와 얼마나 가까워지는지 관찰만 한다).
