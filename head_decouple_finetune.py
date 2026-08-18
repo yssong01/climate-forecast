@@ -132,13 +132,21 @@ def main():
                          "(rain,heatwave,coldwave,dust 중). 기본은 한파 단독 "
                          "— 스모크 테스트(2026-08-16) 3종 비교에서 뚜렷한 순이득이 "
                          "확인된 유일한 헤드였다(강수는 오염, 황사는 표본 부족으로 악화).")
+    # 위치 인자 없이 CHECKPOINT_PATH 환경변수에만 의존했다가, predict.py의
+    # CHECKPOINT가 당시 하드코딩이라 조용히 무시된 사고가 있었다(2026-08-18,
+    # 한파 중첩 전이학습 실험 무효화). predict.CHECKPOINT는 이제 그 환경변수를
+    # 읽도록 고쳤지만, 여기서도 명시적 인자를 받아 이중으로 막는다 — 다음
+    # 실행자가 어느 쪽에 의존하는지 헷갈릴 필요가 없게 한다.
+    ap.add_argument("ckpt", nargs="?", default=CHECKPOINT,
+                    help="기반 체크포인트 경로(생략 시 CHECKPOINT_PATH 환경변수 또는 배포 경로)")
     args = ap.parse_args()
     heads = [h.strip() for h in args.heads.split(",") if h.strip()]
     for h in heads:
         assert h in _ALL_HEADS, f"알 수 없는 헤드: {h}"
 
-    model, ckpt = load_model(CHECKPOINT, DEVICE)
-    print(f"기반 체크포인트 — split_mode={ckpt.get('split_mode')} "
+    model, ckpt = load_model(args.ckpt, DEVICE)
+    print(f"기반 체크포인트 — {args.ckpt}")
+    print(f"  split_mode={ckpt.get('split_mode')} "
           f"기온MAE {ckpt['val_temp_mae']:.4f} 강수MAE {ckpt['val_precip_mae']:.4f}")
 
     records = collect_historical()

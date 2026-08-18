@@ -37,6 +37,13 @@ from predict import (
 )
 import accuracy
 
+# +12h 2차 산출값(2026-08-18) — 기온·강수 성능 저하 곡선을 실측한 결과,
+# +6h 대비 절대오차 악화가 완만해(기온 1.30→1.66°C) 병행 제공 가치가
+# 있다고 판단해 채택했다(한파 F1은 0.458→0.453으로 사실상 그대로).
+# 계절 오탐이 배포본(0.06%)보다 높게 나왔으나(5.41%, FAIL 기준 10% 미만)
+# WARN 상태로 채택하기로 결정했다 — 판단 근거를 README에 남긴다.
+CHECKPOINT_12H = "./checkpoints/numerical_trichef_12h.pt"
+
 # ASOS 타임스탬프는 tz 정보 없는 KST 벽시계 표기다. 컨테이너 기본 시간대는
 # UTC라 datetime.now()를 그대로 쓰면 "최근 72시간" 커트라인이 실제로는 9시간
 # 밀려 81시간이 된다(weather_collector.py가 이미 조심하는 것과 같은 문제 —
@@ -62,7 +69,7 @@ st.set_page_config(
 
 # ── 캐시된 리소스 — 세션당 한 번만 로드 ──────────────────────────────
 
-def ckpt_fingerprint() -> str:
+def ckpt_fingerprint(path: str = CHECKPOINT) -> str:
     """
     체크포인트 파일의 신원(수정시각·크기). 캐시 키에 넣어 파일이 바뀌면
     자동으로 새로 로드되게 한다.
@@ -76,16 +83,26 @@ def ckpt_fingerprint() -> str:
     물론 코드 갱신 후에도 같은 프로세스면 살아남기 때문이다.
     """
     try:
-        st_ = os.stat(CHECKPOINT)
+        st_ = os.stat(path)
         return f"{st_.st_mtime_ns}:{st_.st_size}"
     except OSError:
         return "missing"
 
 
 @st.cache_resource(show_spinner="모델 로드 중...")
+def get_model_at(path: str, fingerprint: str):
+    """fingerprint 는 캐시 무효화 전용 — 값 자체는 쓰지 않는다.
+
+    path 를 캐시 키에 포함시켜(+6h/+12h 처럼) 서로 다른 체크포인트를
+    동시에 로드해도 한쪽이 다른 쪽을 덮어쓰지 않는다(2026-08-18, +12h
+    2차 산출값 추가 시 일반화).
+    """
+    return load_model(path)
+
+
 def get_model(fingerprint: str):
-    """fingerprint 는 캐시 무효화 전용 — 값 자체는 쓰지 않는다."""
-    return load_model(CHECKPOINT)
+    """기존 호출부 호환용 — +6h 배포 체크포인트를 로드한다."""
+    return get_model_at(CHECKPOINT, fingerprint)
 
 
 def obs_hour_key() -> str:
@@ -114,8 +131,13 @@ def obs_hour_key() -> str:
 #
 # model/ckpt 는 언더스코어 접두어로 넘긴다 — Streamlit 이 해시 대상에서
 # 제외하는 규약이다(torch 모듈은 해시할 수 없다).
+#
+# lead_hours 는 캐시 키에 반드시 넣어야 한다(2026-08-18, +12h 추가 시
+# 확인) — model/ckpt 가 해시 대상에서 빠지므로, 이 인자가 없으면 캐시 키가
+# (stn, obs_hour) 뿐이라 +6h 호출과 +12h 호출이 같은 항목을 공유해 버린다.
+# 먼저 계산된 쪽의 결과를 나중 호출이 그대로 돌려받는 사고가 난다.
 @st.cache_data(ttl=3600, show_spinner="관측 조회 중... (12개 관측소)")
-def cached_predict(stn: str, obs_hour: str, _model, _ckpt) -> dict:
+def cached_predict(stn: str, obs_hour: str, lead_hours: int, _model, _ckpt) -> dict:
     return predict(stn=stn, model=_model, ckpt=_ckpt)
 
 
@@ -381,7 +403,7 @@ if not os.path.exists(CHECKPOINT):
 
 try:
     model, ckpt = get_model(ckpt_fingerprint())
-    result = cached_predict(stn, obs_hour_key(), model, ckpt)
+    result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], model, ckpt)
 except Exception as e:
     st.error(f"예측 실패: {e}")
     st.stop()
@@ -758,6 +780,38 @@ tab_trend, tab_extreme, tab_perf, tab_model = st.tabs(
 # ── 탭 1: 출력값 추이 ──────────────────────────────────────────────
 
 with tab_trend:
+    # +12h 2차 산출값 토글(2026-08-18). 이 탭 안에서만 쓰는 지역 변수
+    # (f_disp/c_disp/lead_disp/result_disp)로 분리한다 — 전역 f/c/lead 를
+    # 여기서 재할당하면 '성능 검증' 탭이 뒤에서 그 값을 다시 읽으므로
+    # (lead, f["temperature"] 등) 토글이 다른 탭까지 조용히 물들인다.
+    lead_choice = st.radio(
+        "예측 리드타임", ["+6시간(기본)", "+12시간(2차 산출값)"],
+        horizontal=True, key="lead_choice",
+        help="+12시간은 2차 산출값이다. 절대오차가 +6시간보다 크다(기온 "
+             "1.30→1.66°C, 검증셋 평균) — '성능 검증' 탭 수치는 +6시간 "
+             "기준이며 이 토글의 영향을 받지 않는다.",
+    )
+    if lead_choice.startswith("+12"):
+        try:
+            model_disp, ckpt_disp = get_model_at(
+                CHECKPOINT_12H, ckpt_fingerprint(CHECKPOINT_12H))
+            result_disp = cached_predict(
+                stn, obs_hour_key(), ckpt_disp["lead_hours"], model_disp, ckpt_disp)
+        except Exception as e:
+            # +6h(배포 필수 경로)와 달리 +12h 는 2차 산출값이라 없어도 앱
+            # 전체가 멈출 이유는 없다 — 실패하면 +6h 로 조용히 대체한다.
+            st.error(f"+12시간 산출값을 불러오지 못해 +6시간으로 대신 표시한다: {e}")
+            model_disp, ckpt_disp, result_disp = model, ckpt, result
+        else:
+            st.caption(
+                "⚠️ +12시간 출력값은 2차 산출값이다 — 계절 오탐 검증이 배포본"
+                "(0.06%)보다 높게 나왔다(5.41%, 차단 기준 10% 미만이라 채택). "
+                "폭염·강수는 +6시간과 비슷하게 유지되나 한파·황사는 리드타임이 "
+                "늘수록 더 크게 흔들린다."
+            )
+    else:
+        model_disp, ckpt_disp, result_disp = model, ckpt, result
+
     history = load_merged_history()
     series = recent_series(history, stn, hours=72)
 
@@ -792,7 +846,9 @@ with tab_trend:
         precs = [r["precipitation"] for r in series]
         hums  = [r["humidity"] for r in series]
         press = [r["pressure"] for r in series]
-        tgt_x = datetime.strptime(result["target_time"][:12], "%Y%m%d%H%M")
+        f_disp = result_disp["forecast"]
+        lead_disp = result_disp["forecast_lead_hours"]
+        tgt_x = datetime.strptime(result_disp["target_time"][:12], "%Y%m%d%H%M")
 
         fig = make_subplots(
             rows=2, cols=2,
@@ -802,7 +858,7 @@ with tab_trend:
 
         fig.add_trace(go.Scatter(x=xs, y=temps, mode="lines", name="실측 기온",
                                  line=dict(color="#4C78A8", width=2)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=[xs[-1], tgt_x], y=[temps[-1], f["temperature"]],
+        fig.add_trace(go.Scatter(x=[xs[-1], tgt_x], y=[temps[-1], f_disp["temperature"]],
                                  mode="lines+markers", name="모델 출력값",
                                  line=dict(color="#E2954F", width=1.5, dash="dot"),
                                  marker=dict(size=[0, 10], symbol="star")),
@@ -810,7 +866,7 @@ with tab_trend:
 
         fig.add_trace(go.Bar(x=xs, y=precs, name="실측 강수",
                              marker_color="#4C78A8", showlegend=False), row=1, col=2)
-        fig.add_trace(go.Scatter(x=[tgt_x], y=[f["precipitation"]], mode="markers",
+        fig.add_trace(go.Scatter(x=[tgt_x], y=[f_disp["precipitation"]], mode="markers",
                                  name="모델 출력값(강수)", marker=dict(size=10, symbol="star",
                                  color="#E2954F"), showlegend=False), row=1, col=2)
 
@@ -835,17 +891,18 @@ with tab_trend:
         st.plotly_chart(fig, width="stretch")
         st.caption(
             f"선과 막대는 실측값이다 — 최근 72시간 중 관측이 있는 {len(series)}개 "
-            f"시점. ★ 표시는 이번 +{lead}시간 후 예측값이다. 예측 대상은 기온·강수 "
+            f"시점. ★ 표시는 이번 +{lead_disp}시간 후 예측값이다. 예측 대상은 기온·강수 "
             f"두 항목이며, 습도·기압은 참고용 실측값으로 예측 대상이 아니다."
         )
 
-    st.markdown("#### +%d시간 후 모델 출력값" % lead)
-    _val_temp_mae = ckpt.get("val_temp_mae")
-    _val_precip_mae = ckpt.get("val_precip_mae")
+    c_disp = result_disp["current"]
+    st.markdown("#### +%d시간 후 모델 출력값" % lead_disp)
+    _val_temp_mae = ckpt_disp.get("val_temp_mae")
+    _val_precip_mae = ckpt_disp.get("val_precip_mae")
     fc1, fc2 = st.columns(2)
     fc1.metric(
-        "기온 출력값", f"{f['temperature']:.1f} °C",
-        delta=f"{f['temperature'] - c['temperature']:+.1f} °C (현재 대비)",
+        "기온 출력값", f"{f_disp['temperature']:.1f} °C",
+        delta=f"{f_disp['temperature'] - c_disp['temperature']:+.1f} °C (현재 대비)",
         help="모델은 절대 기온을 직접 산출하지 않고, '현재 기온 대비 변화량(Δ)'을 "
              "계산하여 더한다. 평균적으로 '성능 검증' 탭의 기온 평균절대오차(MAE)"
              "만큼 오차가 발생한다.",
@@ -857,8 +914,8 @@ with tab_trend:
             unsafe_allow_html=True,
         )
     fc2.metric(
-        "강수 출력값", f"{f['precipitation']:.1f} mm",
-        delta=f"{f['precipitation'] - c['precipitation']:+.1f} mm (현재 대비)",
+        "강수 출력값", f"{f_disp['precipitation']:.1f} mm",
+        delta=f"{f_disp['precipitation'] - c_disp['precipitation']:+.1f} mm (현재 대비)",
         delta_color="inverse",
         help=f"강수 확률과 강수량 추정치를 곱하여 산출한 값이다(허들(Hurdle) 구조 "
              f"— '모델 구조' 탭에 상세 설명). 확률이 낮으면 추정량이 커도 최종값은 "

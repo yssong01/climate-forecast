@@ -13,6 +13,7 @@ train.record_to_vec() 을 그대로 재사용한다 — 별도 구현하면 두 
 """
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timedelta
 
@@ -26,7 +27,18 @@ from text_collector import SimulatedTextCollector
 from pipeline_model import TriCHEFPipeline
 from train import record_to_vec, STATION_NAMES
 
-CHECKPOINT = "./checkpoints/numerical_trichef.pt"
+# 환경변수로 뺀다(2026-08-18 수정, train.py의 CHECKPOINT_PATH 패턴과 통일).
+#
+# 이전엔 하드코딩 리터럴이었다 — head_decouple_finetune.py·
+# coldwave_nested_pretrain.py 등 다수 스크립트가 위치 인자로 경로를 안 받고
+# `from predict import CHECKPOINT` 의 기본값에만 의존하는데, 그 상태에서
+# CHECKPOINT_PATH 를 지정해도 조용히 무시되고 항상 프로덕션 체크포인트가
+# 로드됐다. 실제로 이 버그 때문에 한파 헤드 중첩 극한사건 전이학습 실험
+# (2026-08-18)의 "최종 미세조정" 단계 두 번 모두 사전학습 체크포인트가 아닌
+# 프로덕션 체크포인트를 그대로 불러왔다 — "재현성 확인"이 실은 같은 일반
+# 디커플링을 두 번 돌린 것이었다. README·CLAUDE.md 의 해당 실험 결론은
+# 무효로 표시했다(재실행 필요).
+CHECKPOINT = os.getenv("CHECKPOINT_PATH", "./checkpoints/numerical_trichef.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 강수 후처리 클리핑 — precip_breakdown.py 실측: 극한기상 헤드가 늘어날수록
