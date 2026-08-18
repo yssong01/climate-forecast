@@ -70,8 +70,29 @@ jobs:
           python refresh_deploy_data.py \
             ${{ inputs.dry_run && '--dry-run' || '' }}
 
-      - name: Commit refreshed data
-        if: ${{ !inputs.dry_run }}
+      # 신선도 게이트가 실패해도(= 위 스텝 exit 1) 이 스텝은 반드시 돈다.
+      #
+      # 왜 `!cancelled()` 인가(2026-08-18, 실측으로 원인 규명): 종전 조건은
+      # `${{ !inputs.dry_run }}` 뿐이었다. schedule 이벤트에서 inputs 는 비어
+      # 있으므로 이 식 자체는 참인데도 스텝이 skipped 됐다 — GitHub Actions 는
+      # 상태 함수(success/failure/always/cancelled)가 없는 `if` 에 암묵적으로
+      # `success()` 를 AND 로 붙이기 때문이다. 그 결과 게이트가 한 번 실패하면
+      # **이미 수집해 디스크에 저장까지 끝낸 관측이 커밋되지 않고 러너와 함께
+      # 폐기**됐다. 저장소는 낡은 창 그대로 남고, 다음 실행도 같은 낡은 기준점
+      # 에서 다시 시작한다. 실제로 run #30·#31 이 연속 실패하며 배포 화면에
+      # 17시간 묵은 데이터가 노출됐다(수집 자체는 정상이었고, 같은 시각 API 를
+      # 직접 호출하면 04:00~17:00 이 전부 SUCCESS_LIVE 로 응답했다).
+      #
+      # 즉 게이트는 제 역할(장애 감지)을 했으나, 실패 처리 방식이 부분 진척을
+      # 통째로 버려 일시적 장애를 장기 정지로 키웠다. 관측소 하나만 계속
+      # 뒤처져도 나머지 11곳의 갱신이 영구히 막히는 구조이기도 했다.
+      #
+      # 그래서 **저장과 경보를 분리한다** — 수집분은 상태와 무관하게 커밋하고
+      # (창은 항상 갈 수 있는 데까지 전진), 묵음 여부는 아래 별도 스텝이
+      # 잡 전체를 빨간불로 만들어 알린다. `always()` 대신 `!cancelled()` 를
+      # 쓰는 이유는 수동 취소 시까지 커밋하지 않기 위함이다.
+      - name: Commit refreshed data (게이트 실패와 무관하게 수집분 보존)
+        if: ${{ !cancelled() && !inputs.dry_run }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -81,4 +102,13 @@ jobs:
             exit 0
           fi
           git commit -m "데이터 갱신: 최근 관측 창 + 적중률 로그 대조 (자동)"
-          git push
+          # 커밋과 푸시 사이에 사람이 main 에 푸시하면 non-fast-forward 로
+          # 거부된다. 이 잡이 건드리는 파일은 cache/ 둘뿐이라 rebase 로 그
+          # 위에 다시 얹으면 충돌 없이 흡수된다.
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin main && git push && exit 0
+            echo "push 재시도 $i/3 (원격이 앞서 있음)"
+            sleep 5
+          done
+          echo "::error::3회 시도 후에도 push 실패"
+          exit 1
