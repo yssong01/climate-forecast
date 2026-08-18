@@ -25,6 +25,7 @@ enc_im/gate)는 자연 분포로 이미 잘 학습돼 있으니 그대로 얼리
 """
 import argparse
 import json
+import sys
 from datetime import timedelta
 
 import numpy as np
@@ -146,8 +147,22 @@ def main():
 
     model, ckpt = load_model(args.ckpt, DEVICE)
     print(f"기반 체크포인트 — {args.ckpt}")
-    print(f"  split_mode={ckpt.get('split_mode')} "
+    print(f"  split_mode={ckpt.get('split_mode')} lead_hours=+{ckpt.get('lead_hours')}h "
           f"기온MAE {ckpt['val_temp_mae']:.4f} 강수MAE {ckpt['val_precip_mae']:.4f}")
+
+    # Gamma NLL 헤드에 rain 미세조정을 걸면 조용히 망가진다(2026-08-19 확인).
+    # 이 스크립트의 강수 항은 MSE(pred[:,1:2]) 인데, gamma 모드에서 그 출력은
+    # rain_prob×μ 이므로 μ(편향 행 0)만 MSE 로 되돌려 학습되고 α(행 1)는
+    # forward 반환 경로에 없어 그래디언트를 아예 못 받는다. 저장된 체크포인트는
+    # 여전히 precip_gamma_nll=True 라 다음 로드 때 Gamma 모델로 복원되지만
+    # 헤드는 반쯤 MSE 로 학습된 상태다. 기본값이 꺼짐이라 지금은 닿지 않지만,
+    # 다시 켤 때를 대비해 여기서 막는다.
+    if ckpt.get("precip_gamma_nll", False) and "rain" in heads:
+        print("\n★중단★ 이 체크포인트는 Gamma NLL 강수 헤드(precip_gamma_nll=True)다.\n"
+              "  --heads 에 rain 을 넣으면 MSE 손실이 μ 만 되돌려 학습하고 α 는\n"
+              "  그래디언트를 받지 못해 헤드가 일관성을 잃는다. rain 을 빼고 돌리거나,\n"
+              "  Gamma 대응 손실을 먼저 구현할 것.")
+        sys.exit(2)
 
     records = collect_historical()
     txt_collector = TendencyCollector(records)

@@ -34,6 +34,7 @@ Jacques-Dumas et al.(arXiv:2103.09743)의 중첩 극한사건 전이학습을 �
 실행: python coldwave_nested_pretrain.py --out checkpoints/numerical_trichef_coldwave_pretrain.pt
 """
 import argparse
+import math
 
 import numpy as np
 import torch
@@ -56,11 +57,34 @@ LR = 5e-4
 
 
 def reinit_head(module):
-    """Linear 층을 PyTorch 기본 초기화로 되돌린다 — 이전 스테이지(또는 공식
-    라벨 학습)의 편향을 지우고 이번 curriculum 단계를 순수하게 시작한다."""
+    """Linear 층을 PyTorch 기본 초기화로 되돌린다 — 공식 라벨로 학습된 편향을
+    지우고 커리큘럼을 무작위 초기값에서 시작한다(호출은 커리큘럼 시작 전 1회).
+
+    주의: reset_parameters() 는 마지막 층의 편향까지 U(-1/√32, 1/√32)≈0 으로
+    되돌린다. 그런데 `_binary_head`(pipeline_model.py)는 그 편향을 일부러
+    logit(prior) 로 초기화해 둔다 — 희소 사건에서 "대부분 음성"을 학습 시작
+    시점부터 반영하려는 것이다. 따라서 이 함수만 쓰면 헤드가 p≈0.5 에서
+    출발하고, 이 스크립트의 train_stage 에는 pos_weight 도 없어 보정되지
+    않는다. 반드시 _reinit_head_bias() 로 사전확률을 다시 심을 것.
+    """
     for m in module.modules():
         if isinstance(m, nn.Linear):
             m.reset_parameters()
+
+
+def _reinit_head_bias(module, temp_tgt_train, first_threshold):
+    """마지막 Linear 의 편향을 첫 스테이지 약한 라벨의 사전확률 로짓으로 심는다.
+
+    `_binary_head` 가 하던 일을 재초기화 후 복원하는 것이다. 비율은 학습
+    표본에서 실측해 쓴다(하드코딩 금지 — CLAUDE.md 4절).
+    """
+    prior = float((temp_tgt_train <= first_threshold).mean())
+    prior = min(max(prior, 1e-4), 1 - 1e-4)
+    last = [m for m in module.modules() if isinstance(m, nn.Linear)][-1]
+    with torch.no_grad():
+        last.bias.fill_(math.log(prior / (1 - prior)))
+    print(f"  헤드 편향 재초기화 — 1단계 사전확률 {prior:.4f} "
+          f"(로짓 {math.log(prior/(1-prior)):+.3f})")
 
 
 def train_stage(model, ds, train_idx, weak_label_all, epochs, lr, device):
@@ -127,10 +151,20 @@ def main():
         print(f"  p{p:>4.1f} → {t:6.2f}°C 이하 ({n_pos:,}개, "
               f"{100*n_pos/len(temp_tgt_train):.1f}%)")
 
+    # 재초기화는 **커리큘럼 시작 전 한 번만** 한다(2026-08-19 수정).
+    #
+    # 예전에는 이 호출이 for 문 **안**에 있어, 스테이지마다 직전 단계에서 배운
+    # 가중치를 지우고 무작위 초기화로 되돌렸다. 그러면 p20·p10 단계는 계산만
+    # 하고 버려져 결과가 "p5 한 단계만 돌린 것"과 비트 단위로 같아진다 —
+    # 중첩 전이학습(더 쉬운 사건에서 warm start 해 더 극단적인 사건으로
+    # 옮겨간다)이라는 방법 자체가 성립하지 않는다. 단계별 참고 F1 이 상승한
+    # 것도 학습 누적이 아니라 임계값이 공식 한파 정의에 가까워진 효과였다.
+    reinit_head(model.head_coldwave)
+    _reinit_head_bias(model.head_coldwave, temp_tgt_train, thresholds[0])
+
     for stage, (p, t) in enumerate(zip(WEAK_PERCENTILES, thresholds), 1):
         print(f"\n{'='*70}\n스테이지 {stage}/{len(thresholds)} — p{p:.1f} 이하 "
               f"({t:.2f}°C) 를 양성으로 학습")
-        reinit_head(model.head_coldwave)
         weak_label_all = torch.tensor((temp_tgt_all <= t).astype(np.float32))
         train_stage(model, ds, train_idx, weak_label_all, EPOCHS_PER_STAGE, LR, DEVICE)
 

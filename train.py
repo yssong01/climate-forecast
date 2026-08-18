@@ -938,6 +938,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         coldwave_dropout=COLDWAVE_DROPOUT,
         precip_gamma_nll=PRECIP_GAMMA_NLL,
         precip_gamma_alpha_init=precip_gamma_alpha_init,
+        precip_gamma_mu_init=_wet_mean,   # μ 의 학습 목표는 E[y | 강수] 다
         im_dim=TENDENCY_DIM,   # Phase 3-11 — 384(MiniLM) 대신 12(경향벡터)
     ).to(DEVICE)
 
@@ -1029,6 +1030,14 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                     concentration=model._last_precip_alpha,
                     rate=model._last_precip_alpha / model._last_precip_mu,
                 )
+                # 이 clamp 은 방어용이 아니라 **필수**다 — 지우면 손실이 NaN 이
+                # 된다(2026-08-19 실측). log_prob 은 마스킹 **전에** 전 표본에
+                # 대해 계산되는데, 무강수 표본은 y=0 이고 Gamma.log_prob(0) 은
+                # concentration<1 일 때 +inf 다(학습셋 모멘트법 α 초기값이
+                # 0.3029 라 실제로 이 구간에 들어간다). 그 inf 에 마스크 0 을
+                # 곱하면 0 이 아니라 NaN 이므로(파이토치 실측: inf*0=nan),
+                # 마스킹만으로는 무강수 표본을 배제하지 못한다.
+                # "어차피 습윤 표본만 쓰니 불필요하다"고 보고 지우지 말 것.
                 y_wet_clamped = y_b[:, 1:2].clamp(min=1e-6)
                 nll_raw = -gamma_dist.log_prob(y_wet_clamped)
                 loss = loss + PRECIP_WEIGHT * (
@@ -1205,6 +1214,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "coldwave_dropout": COLDWAVE_DROPOUT,
                 "precip_gamma_nll": PRECIP_GAMMA_NLL,
                 "precip_gamma_alpha_init": precip_gamma_alpha_init,
+                "precip_gamma_mu_init": _wet_mean,
                 "lead_hours":   lead_hours,
                 "num_features": NUM_FEATURES,
                 "alpha_init":   ALPHA_INIT,

@@ -837,6 +837,15 @@ with tab_trend:
             icon="⚠️",
         )
 
+    # 차트를 그리는 else 절 안이 아니라 **여기서** 꺼낸다(2026-08-19 수정).
+    # 아래 출력값 카드는 series 길이와 무관하게 항상 그리는데, 이 세 개를
+    # else 안에서 할당하면 관측 창이 비었을 때(len(series)<2) NameError 로
+    # 앱 전체가 죽는다 — 갱신 경로가 72시간 넘게 끊기면 실제로 발생하는
+    # 조건이고(a1329e7 참고), 그때야말로 화면이 살아 있어야 한다.
+    f_disp = result_disp["forecast"]
+    c_disp = result_disp["current"]
+    lead_disp = result_disp["forecast_lead_hours"]
+
     if len(series) < 2:
         st.caption("최근 추이를 표시하기에 로컬 캐시의 데이터가 부족하다"
                    "(수집이 진행 중이면 곧 채워진다).")
@@ -846,8 +855,6 @@ with tab_trend:
         precs = [r["precipitation"] for r in series]
         hums  = [r["humidity"] for r in series]
         press = [r["pressure"] for r in series]
-        f_disp = result_disp["forecast"]
-        lead_disp = result_disp["forecast_lead_hours"]
         tgt_x = datetime.strptime(result_disp["target_time"][:12], "%Y%m%d%H%M")
 
         fig = make_subplots(
@@ -895,7 +902,6 @@ with tab_trend:
             f"두 항목이며, 습도·기압은 참고용 실측값으로 예측 대상이 아니다."
         )
 
-    c_disp = result_disp["current"]
     st.markdown("#### +%d시간 후 모델 출력값" % lead_disp)
     _val_temp_mae = ckpt_disp.get("val_temp_mae")
     _val_precip_mae = ckpt_disp.get("val_precip_mae")

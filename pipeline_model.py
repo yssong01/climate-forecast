@@ -311,7 +311,8 @@ class TriCHEFPipeline(nn.Module):
                  head_dropout: float = 0.0,
                  coldwave_dropout: float = 0.0,
                  precip_gamma_nll: bool = False,
-                 precip_gamma_alpha_init: float = 1.0):
+                 precip_gamma_alpha_init: float = 1.0,
+                 precip_gamma_mu_init: float = None):
         """
         orthogonalize        : Gram-Schmidt 직교화 on/off (ablation 스위치)
         gs_eps               : 소프트 정규화 ε — gradient 상한 1/ε
@@ -468,7 +469,14 @@ class TriCHEFPipeline(nn.Module):
             # softplus(b) = precip_mean  →  b = log(exp(precip_mean) − 1)
             b = math.log(math.expm1(max(precip_mean, 1e-3)))
             if precip_gamma_nll:
-                self.head_precip[-1].bias[0].fill_(b)
+                # μ 는 **습윤 조건부** 평균으로 초기화한다 — Gamma NLL 이
+                # 습윤 표본에서만 계산되므로 μ 의 학습 목표가 E[y | 강수] 다.
+                # 전체 평균(precip_mean≈0.16mm)을 쓰면 목표(≈2.4mm)보다 15배
+                # 낮은 데서 출발해, 이 블록이 없애려던 "편향만 학습하느라
+                # 에폭을 낭비하는" 문제가 그대로 남는다(2026-08-19 수정).
+                mu0 = precip_gamma_mu_init if precip_gamma_mu_init else precip_mean
+                self.head_precip[-1].bias[0].fill_(
+                    math.log(math.expm1(max(mu0, 1e-3))))
                 a0 = max(precip_gamma_alpha_init - 1e-3, 1e-3)
                 self.head_precip[-1].bias[1].fill_(math.log(math.expm1(a0)))
             else:

@@ -103,12 +103,29 @@ jobs:
           fi
           git commit -m "데이터 갱신: 최근 관측 창 + 적중률 로그 대조 (자동)"
           # 커밋과 푸시 사이에 사람이 main 에 푸시하면 non-fast-forward 로
-          # 거부된다. 이 잡이 건드리는 파일은 cache/ 둘뿐이라 rebase 로 그
-          # 위에 다시 얹으면 충돌 없이 흡수된다.
+          # 거부되므로 rebase 로 다시 얹는다.
+          #
+          # rebase --abort 가 반드시 먼저 와야 한다(2026-08-19 수정). 이 잡이
+          # 건드리는 cache/*.json 은 파일 전체가 한 줄로 재생성되므로, 원격이
+          # 같은 파일을 건드렸으면 충돌은 가능성이 아니라 **필연**이다. 그때
+          # 러너는 rebase 진행 중 상태로 남고, 뒤이은 재시도는 네트워크에
+          # 닿지도 못한 채 "Pulling is not possible... unmerged files" 로
+          # 죽으면서 화면에는 엉뚱하게 "원격이 앞서 있음"만 찍힌다.
+          #
+          # 충돌 시 러너가 방금 수집한 쪽을 택한다 — 이 파일들은 관측을 다시
+          # 받아 통째로 재생성한 결과라 우리 것이 더 최신이다.
+          #
+          # 여기서 `-X theirs` 인 것이 맞다. rebase 는 upstream 을 체크아웃한 뒤
+          # 내 커밋을 그 위에 replay 하므로 ours/theirs 가 뒤집힌다 —
+          # ours=원격(upstream), theirs=내 커밋. 실측(2026-08-19)으로 확인:
+          #   -X ours   → 결과 REMOTE      (수집분이 버려진다. 틀림)
+          #   -X theirs → 결과 LOCAL-fresh (수집분이 남는다. 맞음)
           for i in 1 2 3; do
-            git pull --rebase --autostash origin main && git push && exit 0
-            echo "push 재시도 $i/3 (원격이 앞서 있음)"
+            git rebase --abort 2>/dev/null || true
+            git pull --rebase -X theirs --autostash origin main && git push && exit 0
+            echo "push 재시도 $i/3 (원격이 앞서 있거나 rebase 충돌)"
             sleep 5
           done
+          git rebase --abort 2>/dev/null || true
           echo "::error::3회 시도 후에도 push 실패"
           exit 1

@@ -66,10 +66,25 @@ RAIN_PROB_EDGES = [0.0, 0.1, 0.3, 0.6, 1.01]
 
 
 def _signed_quantiles(e, alpha):
-    """부호 있는 잔차 e 에서 (α/2, 1−α/2) 분위수 — 유한표본 보정 포함."""
+    """
+    부호 있는 잔차 e 에서 (α/2, 1−α/2) 분위수 — 유한표본 보정 포함.
+
+    아래쪽은 floor, 위쪽은 ceil 이다(2026-08-19 수정). 연속 잔차에서 실현
+    커버리지는 정확히 (hi_rank − lo_rank)/(n+1) 인데, 양쪽 모두 ceil 을 쓰면
+    아래쪽 순서통계량 하나를 더 잘라내 목표를 **구조적으로** 밑돈다 —
+    n=200 에서 0.8955, n=1,000 에서 0.8991 로, 잡음이 아니라 결정적 미달이다.
+    특히 MIN_GROUP_N(=200) 근처의 관측소별 층에서 가장 크게 나타난다.
+    이 상태로는 아래 채택 기준("커버리지가 목표 이상")이 원리적으로 충족될 수
+    없어, 게이트가 COVERAGE_TOL 아래에 숨는 형태로 무력화된다.
+    """
     n = len(e)
+    if n == 0:
+        # 표본이 없으면 유한 구간을 만들 근거가 없다 — 무한 구간을 돌려
+        # "보장 없음"을 드러낸다(작은 표본을 최댓값으로 대체해 '틀린 보장'을
+        # 만드는 것보다 낫다). 현재는 MIN_GROUP_N 가 막아 도달하지 않는다.
+        return float("-inf"), float("inf")
     e_sorted = np.sort(e)
-    lo_rank = int(np.ceil((n + 1) * (alpha / 2))) - 1
+    lo_rank = int(np.floor((n + 1) * (alpha / 2))) - 1
     hi_rank = int(np.ceil((n + 1) * (1 - alpha / 2))) - 1
     lo_rank = min(max(lo_rank, 0), n - 1)
     hi_rank = min(max(hi_rank, 0), n - 1)
@@ -87,11 +102,18 @@ def _fit_one(name, y_true, y_pred, group, group_label, calib_mask, alpha,
     ec, ee = calib_mask, ~calib_mask
     e_all = y_true - y_pred
 
+    # 전역(층화 없음) 구간 — 층화가 실제로 나은지 비교 근거로 함께 잰다.
+    # 예전에는 계산만 하고 쓰지 않아, "층화가 전역보다 낫다"는 주장을 뒷받침할
+    # 수치가 정작 출력되지 않았다(2026-08-19 수정).
     q_lo, q_hi = _signed_quantiles(e_all[ec], alpha)
     lo_global = y_pred + q_lo
     hi_global = y_pred + q_hi
     if clip_min is not None:
         lo_global = np.clip(lo_global, clip_min, None)
+        hi_global = np.clip(hi_global, clip_min, None)
+    cov_global = float(((y_true[ee] >= lo_global[ee])
+                        & (y_true[ee] <= hi_global[ee])).mean())
+    width_global = float((hi_global[ee] - lo_global[ee]).mean())
 
     per_group = {}
     group_eval_cov = {}
@@ -117,14 +139,20 @@ def _fit_one(name, y_true, y_pred, group, group_label, calib_mask, alpha,
                    & (y_true[g_all][g_eval_local] <= hi_strat[g_all][g_eval_local])).mean())
             if g_eval_local.sum() else float("nan"))
     if clip_min is not None:
+        # 상한도 함께 clip 한다 — 아래만 clip 하면 상한이 clip_min 보다 작은
+        # 층에서 [0, 음수] 같은 뒤집힌 구간이 생겨 커버리지가 0이 되고,
+        # 폭이 음수로 잡혀 평균 폭까지 실제보다 작게 보고된다(2026-08-19).
         lo_strat = np.clip(lo_strat, clip_min, None)
+        hi_strat = np.clip(hi_strat, clip_min, None)
+    assert (hi_strat >= lo_strat).all(), "구간 상한이 하한보다 작다 — 분위수 산출 오류"
 
     cov_strat = float(((y_true[ee] >= lo_strat[ee]) & (y_true[ee] <= hi_strat[ee])).mean())
     width_strat = float((hi_strat[ee] - lo_strat[ee]).mean())
 
     print(f"\n{'='*74}\n[{name}]  보정용 {int(ec.sum()):,}개 / 평가용 {int(ee.sum()):,}개")
-    print(f"  전역 구간폭 [{q_lo:+.4f}, {q_hi:+.4f}]  |  층화 평가 커버리지 {cov_strat:.4f}"
-          f"  (목표 {1-alpha:.2f})  |  평균 구간폭 {width_strat:.4f}")
+    print(f"  전역 잔차 분위수 [{q_lo:+.4f}, {q_hi:+.4f}]   (목표 커버리지 {1-alpha:.2f})")
+    print(f"    층화 없음 : 커버리지 {cov_global:.4f} · 평균폭 {width_global:.4f}")
+    print(f"    층화 적용 : 커버리지 {cov_strat:.4f} · 평균폭 {width_strat:.4f}")
     for gname, v in sorted(per_group.items()):
         print(f"    {gname:>12}: n_calib={v['n_calib']:>7,}  "
               f"커버리지={group_eval_cov[gname]:.3f}"
@@ -145,6 +173,8 @@ def _fit_one(name, y_true, y_pred, group, group_label, calib_mask, alpha,
         "q_lo_global": q_lo, "q_hi_global": q_hi,
         "coverage_eval_stratified": cov_strat,
         "width_eval_stratified": width_strat,
+        "coverage_eval_global": cov_global,
+        "width_eval_global": width_global,
         "coverage_eval_wet_conditional": cov_wet,
         "per_group": per_group,
         "clip_min": clip_min,
