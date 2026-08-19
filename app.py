@@ -417,7 +417,7 @@ if not os.path.exists(CHECKPOINT):
 
 # API 연결이 막혔을 때 쓸 폴백 재료를 컬렉터에 등록한다(2026-08-19 추가).
 #
-# 저장소 창(recent_window.json)은 GitHub Actions(refresh-data.yml)가 6시간마다
+# 저장소 창(recent_window.json)은 GitHub Actions(refresh-data.yml)가 2시간마다
 # 갱신하는 **실측**이고, 레코드 형식이 컬렉터 반환값과 동일하다. 등록해두면
 # 조회가 실패해도 컬렉터가 날조 상수(20.0°C/50%/1013hPa) 대신 이 실측으로
 # 내려간다 — 2026-08-19 Streamlit Cloud 발신 IP 가 막혔을 때 화면에 날조값이
