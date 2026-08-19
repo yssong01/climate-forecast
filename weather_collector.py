@@ -96,6 +96,174 @@ def _empty_retry_wait() -> float:
     except ValueError:
         return 60.0
 
+
+# ── 연결 차단 감지(circuit breaker) ─────────────────────────────────
+#
+# 2026-08-19 실측: Streamlit Cloud 발신 IP 에서만 apihub.kma.go.kr 로의 TCP
+# 연결이 통째로 막혔다(ConnectTimeoutError, 같은 시각 GitHub Actions 와 로컬은
+# 정상 응답). 그 상태에서 12개 관측소가 각자 재시도 한도까지 소진하면
+# 관측소당 34초 × 12곳 + 과거 3시점 61초 ≈ 469초 — 조회마다 화면이 8분 멈춘다.
+# 실패는 캐시되지 않으므로 재실행마다 이 시간을 다시 쓴다.
+#
+# 연결 자체가 안 되는 상황은 관측소를 바꿔도 재시도를 해도 결과가 같다.
+# 한 번 확인되면 쿨다운 동안 나머지 호출을 즉시 폴백으로 내린다.
+# ReadTimeout(서버에는 닿았는데 응답이 늦음)은 여기 넣지 않는다 — 그건
+# 시각·관측소마다 결과가 달라 개별 재시도에 의미가 있다.
+CONN_FAIL_COOLDOWN = float(os.getenv("KMA_CONN_FAIL_COOLDOWN", "120"))
+
+_conn_lock = threading.Lock()
+_conn_state = {"blocked_until": 0.0, "last_error": "", "failures": 0}
+
+
+def _note_conn_failure(err: Exception) -> None:
+    with _conn_lock:
+        _conn_state["blocked_until"] = time.monotonic() + CONN_FAIL_COOLDOWN
+        _conn_state["last_error"] = f"{type(err).__name__}: {str(err)[:200]}"
+        _conn_state["failures"] += 1
+
+
+def _note_conn_success() -> None:
+    with _conn_lock:
+        _conn_state["blocked_until"] = 0.0
+
+
+def _conn_blocked() -> bool:
+    with _conn_lock:
+        return time.monotonic() < _conn_state["blocked_until"]
+
+
+def connection_state() -> dict:
+    """화면 진단용 — 연결이 차단 상태인지, 마지막 오류가 무엇이었는지."""
+    with _conn_lock:
+        remain = max(0.0, _conn_state["blocked_until"] - time.monotonic())
+        return {
+            "blocked": remain > 0,
+            "cooldown_remaining": int(remain),
+            "last_error": _conn_state["last_error"],
+            "failures": _conn_state["failures"],
+        }
+
+
+def network_env_report() -> dict:
+    """
+    배포 환경이 프록시를 주입했는지 확인하는 진단(2026-08-19 추가).
+
+    requests 는 HTTP_PROXY/HTTPS_PROXY 환경변수를 자동으로 신뢰한다(trust_env).
+    호스팅 측이 이 변수를 넣어두면 요청이 엉뚱한 경로로 나가 connect timeout 이
+    날 수 있는데, 코드만 읽어서는 배제할 수 없다 — 실제 배포 환경의 환경변수를
+    봐야 판별된다. 이 저장소 코드는 프록시를 설정하지도 읽지도 않으므로,
+    값이 잡히면 그건 전부 플랫폼이 주입한 것이다.
+
+    값에 자격증명(user:pass@host)이 섞일 수 있어 호스트 부분만 남긴다.
+    """
+    keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+            "http_proxy", "https_proxy", "all_proxy", "no_proxy")
+    found = {}
+    for k in keys:
+        v = os.environ.get(k)
+        if not v:
+            continue
+        found[k] = v.split("@")[-1] if "@" in v else v
+    return found
+
+
+# ── 저장소 실측 폴백(offline fallback) ──────────────────────────────
+#
+# 연결이 막혔을 때 종전 _fallback() 은 20.0°C/50%/1013hPa 라는 **날조 상수**를
+# 실측인 양 돌려줬다(FALLBACK_DEFAULT). 배포 환경은 컨테이너 파일시스템이
+# 휘발성인 데다 cache/latest_weather_*.json 이 gitignore 대상이라 디스크 캐시가
+# 아예 없어서, 실패하면 곧바로 이 날조값으로 떨어진다 — 2026-08-19 화면에 뜬
+# "현재 기온 20.0°C · 습도 50% · 기압 1013hPa" 가 정확히 그것이었고, 그 값으로
+# 계산한 출력값까지 표시됐다. 규약 5(가짜 데이터를 입력으로 쓰지 않는다)에
+# 정면으로 어긋난다.
+#
+# 저장소에는 GitHub Actions(refresh-data.yml)가 갱신하는 recent_window.json 이
+# 있고, 그 레코드는 이 컬렉터의 반환 형식과 키·단위가 동일한 실측이다
+# (status=SUCCESS_LIVE). 날조 대신 그걸 쓴다. 12개 관측소가 모두 채워져 있어
+# 대상 관측소(Z축)뿐 아니라 이웃 보간(Re축)까지 실측으로 복원된다.
+#
+# 컬렉터가 파일 경로를 알 필요가 없도록 호출부(app.py)가 주입한다.
+_offline_lock = threading.Lock()
+_offline_latest: dict = {}    # stn -> 가장 최근 실측 레코드
+_offline_by_key: dict = {}    # (stn, timestamp) -> 실측 레코드
+
+
+def set_offline_fallback(records) -> int:
+    """
+    저장소 창의 실측 레코드를 폴백 재료로 등록한다.
+
+    관측소별 '가장 최근 1건'(fetch 용)과 (관측소, 시각) 색인(fetch_at 용)을
+    함께 만든다. 시각 색인이 필요한 이유는 Im축(시간 경향)이 특정 과거 시각을
+    콕 집어 요청하기 때문이다 — 그 시각의 실측이 아니라 '최근 값'을 돌려주면
+    존재한 적 없는 변화량이 만들어진다.
+
+    records: recent_window.json 형태의 list[dict].
+    반환: 등록된 관측소 수.
+    """
+    latest: dict = {}
+    by_key: dict = {}
+    for r in (records or []):
+        if not isinstance(r, dict):
+            continue
+        # 실측만 받는다 — 폴백으로 만들어진 레코드를 다시 폴백 재료로
+        # 쓰면 날조가 세탁되어 되돌아온다.
+        if r.get("status") != "SUCCESS_LIVE":
+            continue
+        stn = str(r.get("stn", ""))
+        ts = str(r.get("timestamp", ""))[:12]
+        if not stn or not ts:
+            continue
+        by_key[(stn, ts)] = r
+        if stn not in latest or ts > str(latest[stn].get("timestamp", "")):
+            latest[stn] = r
+    with _offline_lock:
+        _offline_latest.clear()
+        _offline_latest.update(latest)
+        _offline_by_key.clear()
+        _offline_by_key.update(by_key)
+    return len(latest)
+
+
+def offline_fallback_state() -> dict:
+    """등록된 저장소 폴백의 관측소 수와 가장 최근 관측 시각."""
+    with _offline_lock:
+        if not _offline_latest:
+            return {"stations": 0, "latest": None, "records": 0}
+        return {
+            "stations": len(_offline_latest),
+            "latest": max(str(r.get("timestamp", ""))
+                          for r in _offline_latest.values()),
+            "records": len(_offline_by_key),
+        }
+
+
+def _offline_record(stn: str, tm: str = None) -> dict | None:
+    """tm 을 주면 그 시각의 실측만, 없으면 가장 최근 실측을 돌려준다."""
+    with _offline_lock:
+        if tm is not None:
+            r = _offline_by_key.get((str(stn), str(tm)[:12]))
+        else:
+            r = _offline_latest.get(str(stn))
+    return dict(r) if r else None
+
+
+# 실측으로 인정하는 status 목록.
+#
+# FALLBACK_WINDOW 는 저장소 창에서 꺼낸 값이라 '관측 시각이 과거일 뿐 사람이
+# 만든 값이 아니다'. FALLBACK_CACHED 도 이 프로세스가 앞서 실제로 받은 응답
+# 이다. 둘 다 관측 시각(timestamp)을 조작하지 않고 원본 그대로 보존하므로,
+# 보간·경향 계산에 넣어도 규약 5 를 어기지 않는다 — 다만 호출부는 '같은 시각
+# 스냅샷'인지를 별도로 확인해야 한다(predict.py 참고).
+#
+# FALLBACK_DEFAULT 만 유일하게 날조값이며, 여기 포함되지 않는다.
+REAL_STATUSES = ("SUCCESS_LIVE", "FALLBACK_WINDOW", "FALLBACK_CACHED")
+
+
+def is_real_observation(status) -> bool:
+    """이 레코드가 실제 관측에서 온 값인가(날조 기본값이 아닌가)."""
+    return str(status) in REAL_STATUSES
+
+
 # 주요 관측소 번호 참고
 STATIONS = {
     "서울": "108", "인천": "112", "수원": "119", "춘천": "101",
@@ -224,7 +392,12 @@ class RobustWeatherCollector:
         tm 형식: YYYYMMDDHHmm (예: 202608062200)
         """
         if not self.api_key or self.api_key == "여기에_발급받은_API_키_입력":
-            return self._fallback(tm)
+            return self._fallback(tm, exact_time=True)
+
+        # 연결 자체가 막힌 것으로 확인된 동안은 시도하지 않는다
+        # (_note_conn_failure 주석 참고).
+        if _conn_blocked():
+            return self._fallback(tm, exact_time=True)
 
         params = {"tm": tm, "stn": self.stn, "help": "1", "authKey": self.api_key}
 
@@ -232,21 +405,29 @@ class RobustWeatherCollector:
             if not _reserve_call():
                 print(f"[WARN] 일일 API 예산({DAILY_CALL_BUDGET}건) 초과 — "
                       f"fetch_at {tm} 은 폴백으로 처리")
-                return self._fallback(tm)
+                return self._fallback(tm, exact_time=True)
             try:
                 resp = requests.get(ASOS_URL, params=params, timeout=timeout)
                 if resp.status_code == 200:
                     parsed = self._parse_asos(resp.text, tm)
                     if parsed:
+                        _note_conn_success()
                         parsed["status"] = "SUCCESS_LIVE"
                         return parsed
+            except (requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ConnectionError) as e:
+                _note_conn_failure(e)
+                print(f"[WARN] fetch_at {tm} 연결 실패 — 이후 "
+                      f"{CONN_FAIL_COOLDOWN:.0f}초간 조회를 건너뛴다 "
+                      f"({type(e).__name__})")
+                break
             except Exception as e:
                 if attempt == retries:
                     print(f"[WARN] fetch_at {tm} 실패: {e}")
             if attempt < retries:
                 time.sleep(0.5)
 
-        return self._fallback(tm)
+        return self._fallback(tm, exact_time=True)
 
     @staticmethod
     def _obs_time() -> str:
@@ -281,6 +462,12 @@ class RobustWeatherCollector:
             "authKey": self.api_key,
         }
 
+        # 연결 자체가 막힌 것으로 확인된 동안은 시도하지 않는다. 12개 관측소가
+        # 각자 재시도 한도를 소진하면 조회 1회가 8분까지 늘어나기 때문이다
+        # (_note_conn_failure 주석의 실측 계산 참고).
+        if _conn_blocked():
+            return self._fallback(tm)
+
         for attempt in range(1, retries + 1):
             if not _reserve_call():
                 print(f"[WARN] 일일 API 예산({DAILY_CALL_BUDGET}건) 초과 — "
@@ -291,6 +478,7 @@ class RobustWeatherCollector:
                 if resp.status_code == 200:
                     parsed = self._parse_asos(resp.text, tm)
                     if parsed:
+                        _note_conn_success()
                         self._save_disk_cache(parsed)
                         parsed["status"] = "SUCCESS_LIVE"
                         return parsed
@@ -308,8 +496,19 @@ class RobustWeatherCollector:
                     continue
                 else:
                     print(f"[WARN] HTTP {resp.status_code}: {resp.text[:150]}")
+            except (requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ConnectionError) as e:
+                # 연결이 안 되는 것은 관측소를 바꾸거나 재시도해도 결과가
+                # 같다 — 이 관측소의 남은 재시도를 접고, 쿨다운 동안 다른
+                # 관측소 조회도 건너뛴다.
+                _note_conn_failure(e)
+                print(f"[WARN] 연결 실패 (관측소 {self.stn}) — 이후 "
+                      f"{CONN_FAIL_COOLDOWN:.0f}초간 조회를 건너뛴다 "
+                      f"({type(e).__name__})")
+                break
             except requests.exceptions.Timeout:
-                print(f"[WARN] 타임아웃 (시도 {attempt}/{retries})")
+                # ReadTimeout — 서버에는 닿았으므로 재시도할 값어치가 있다.
+                print(f"[WARN] 응답 지연 (시도 {attempt}/{retries})")
             except Exception as e:
                 print(f"[WARN] 오류 (시도 {attempt}/{retries}): {e}")
             if attempt < retries:
@@ -408,19 +607,54 @@ class RobustWeatherCollector:
 
     # ── Fallback ────────────────────────────────────────────────────
 
-    def _fallback(self, tm: str = None) -> dict:
+    def _fallback(self, tm: str = None, exact_time: bool = False) -> dict:
+        """
+        조회 실패 시 대체 레코드. 실측 → 실측 → (최후에만) 날조 순으로 내려간다.
+
+        exact_time=True 면 요청한 시각(tm)의 실측만 인정한다. Im축(시간 경향)이
+        특정 과거 시각을 집어 요청할 때 쓴다 — '가장 최근 값'을 대신 주면
+        그 시각에 관측이 있었던 것처럼 보여 가짜 변화량이 만들어진다.
+
+        2026-08-19 개편 전에는 두 가지 날조가 있었다.
+          ① 캐시가 있으면 그 값의 **타임스탬프를 요청 시각으로 갈아끼우고**
+             기온에 `np.random.uniform(-0.05, 0.05)` 노이즈를 더했다 — 묵은
+             관측이 방금 받은 실측처럼 보이고, 실재하지 않는 변동까지 생겼다.
+          ② 캐시가 없으면 20.0°C/50%/1013hPa 라는 상수를 돌려줬다. 배포
+             환경은 디스크 캐시가 없어(휘발성 + gitignore) 항상 이 경로였다.
+        둘 다 규약 5(가짜 데이터를 입력으로 쓰지 않는다) 위반이라 제거했다.
+
+        이제 관측 시각을 **조작하지 않는다**. 폴백 레코드는 자기가 실제로
+        관측된 시각을 그대로 달고 나가므로, 호출부는 그 값이 얼마나 묵었는지
+        판단할 수 있고 record_to_vec 의 시각 특징(시각·연중 시각 sin/cos)도
+        그 관측 시각과 맞아떨어진다.
+        """
         if tm is None:
             tm = self._obs_time()
 
+        # 후보 둘 다 실측이다. 이 프로세스가 앞서 받은 응답(캐시)이 저장소
+        # 창보다 최신일 수도, 그 반대일 수도 있으므로 관측 시각이 더 새로운
+        # 쪽을 고른다.
+        candidates = []
         if self._memory_cache is not None:
-            fb = self._memory_cache.copy()
-            fb["timestamp"] = tm
-            fb["status"]    = "FALLBACK_CACHED"
-            fb["temperature"] = round(
-                fb["temperature"] + float(np.random.uniform(-0.05, 0.05)), 2
-            )
-            return fb
+            fb = dict(self._memory_cache)
+            if not exact_time or str(fb.get("timestamp", ""))[:12] == str(tm)[:12]:
+                fb["status"] = "FALLBACK_CACHED"
+                candidates.append(fb)
 
+        win = _offline_record(self.stn, tm if exact_time else None)
+        if win is not None:
+            win["status"] = "FALLBACK_WINDOW"
+            candidates.append(win)
+
+        if candidates:
+            best = max(candidates, key=lambda r: str(r.get("timestamp", "")))
+            # 관측소가 섞이면 record_to_vec 이 남의 위경도를 쓰게 된다.
+            best["stn"] = self.stn
+            return best
+
+        # 여기까지 왔다는 건 실측이 하나도 없다는 뜻이다. 이 값은 관측이
+        # 아니라 자리표시자이며, 호출부는 status 로 이를 구분해 화면 표시와
+        # 적중률 기록에서 제외해야 한다(app.py·predict.py 참고).
         return {
             "timestamp": tm, "temperature": 20.0, "precipitation": 0.0,
             "humidity": 50.0, "wind_speed": 1.5, "wind_dir": 0.0,

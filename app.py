@@ -31,7 +31,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 
-from weather_collector import STATIONS, STATION_COORDS, api_call_stats
+from weather_collector import (
+    STATIONS, STATION_COORDS, api_call_stats,
+    set_offline_fallback, offline_fallback_state,
+    connection_state, network_env_report,
+)
 from predict import (
     load_model, predict, CHECKPOINT, event_threshold, PRECIP_CLIP_THRESH,
 )
@@ -181,6 +185,15 @@ def history_age_hours(history: dict) -> float | None:
         return None
     latest = max(datetime.strptime(ts[:12], "%Y%m%d%H%M") for _, ts in history)
     return (_now_kst_naive() - latest).total_seconds() / 3600
+
+
+def observed_age_hours(observed_at) -> float | None:
+    """이 관측 시각이 지금으로부터 몇 시간 전인지. 파싱 불가면 None."""
+    try:
+        t = datetime.strptime(str(observed_at)[:12], "%Y%m%d%H%M")
+    except Exception:
+        return None
+    return (_now_kst_naive() - t).total_seconds() / 3600
 
 
 @st.cache_resource(show_spinner=False)
@@ -402,6 +415,18 @@ if not os.path.exists(CHECKPOINT):
     )
     st.stop()
 
+# API 연결이 막혔을 때 쓸 폴백 재료를 컬렉터에 등록한다(2026-08-19 추가).
+#
+# 저장소 창(recent_window.json)은 GitHub Actions(refresh-data.yml)가 6시간마다
+# 갱신하는 **실측**이고, 레코드 형식이 컬렉터 반환값과 동일하다. 등록해두면
+# 조회가 실패해도 컬렉터가 날조 상수(20.0°C/50%/1013hPa) 대신 이 실측으로
+# 내려간다 — 2026-08-19 Streamlit Cloud 발신 IP 가 막혔을 때 화면에 날조값이
+# 실측처럼 표시된 사고의 재발 방지책이다. 12개 관측소가 모두 채워져 있으므로
+# 대상 관측소(Z축)뿐 아니라 이웃 보간(Re축)까지 실측으로 복원된다.
+#
+# load_merged_history() 는 5분 캐시라 여기서 먼저 불러도 추가 비용이 없다.
+set_offline_fallback(list(load_merged_history().values()))
+
 try:
     model, ckpt = get_model(ckpt_fingerprint())
     result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], model, ckpt)
@@ -559,13 +584,26 @@ st.markdown(
 # 아래 컴포넌트의 JS가 이 요소를 실제로 그 줄로 재배치한다.
 with st.container(key="status_badge"):
     status = result["data_status"]
+    # '실측이 아닌 것'과 '지금 것이 아닌 것'을 구분해 표시한다(2026-08-19).
+    # 종전에는 폴백을 한 덩어리로 묶어 "수신 실패"라고만 했는데, 그 안에는
+    # 실측(묵은 관측)과 날조 상수가 섞여 있었다 — 후자가 훨씬 심각하므로
+    # 경고 수준을 달리한다.
+    _age = observed_age_hours(result["observed_at"])
+    _age_txt = f" · {_age:.0f}시간 전 관측" if _age is not None and _age >= 1 else ""
     if status == "SUCCESS_LIVE":
         st.success(f"실시간 관측 데이터 · {result['observed_at']}", icon="✅")
-    elif status.startswith("FALLBACK"):
+    elif status in ("FALLBACK_WINDOW", "FALLBACK_CACHED"):
+        _src = "저장소 갱신분" if status == "FALLBACK_WINDOW" else "직전 조회분"
         st.warning(
-            f"실시간 데이터 수신 실패 — 대체 데이터 사용 중 ({status}) · "
-            f"{result['observed_at']}",
+            f"실시간 조회 실패 — {_src} 실측으로 대체 · "
+            f"관측 {result['observed_at']}{_age_txt}",
             icon="⚠️",
+        )
+    elif status == "FALLBACK_DEFAULT":
+        st.error(
+            "실측 데이터가 없다 — 아래 '현재' 수치는 관측이 아니라 자리표시자이며, "
+            "그것으로 계산한 출력값도 근거가 없다.",
+            icon="🚫",
         )
     else:
         st.info(f"{status} · {result['observed_at']}")
@@ -578,6 +616,33 @@ if str(result.get("data_status", "")).startswith("FALLBACK"):
     if st.button("🔄 실시간 조회 다시 시도", help="캐시된 결과를 폐기하고 API를 재호출한다."):
         cached_predict.clear()
         st.rerun()
+
+    # 연결 진단 — 왜 실패했는지를 화면에서 바로 판별하기 위한 정보다
+    # (2026-08-19 추가). 이 저장소 코드는 프록시를 설정하지도 읽지도 않으므로,
+    # 프록시 항목에 값이 잡히면 그건 전부 호스팅 플랫폼이 주입한 것이다 —
+    # requests 가 그 변수를 자동으로 신뢰하므로 연결이 엉뚱한 경로로 나갔을
+    # 수 있고, 그 가설은 배포 환경의 환경변수를 직접 봐야만 판별된다.
+    with st.expander("연결 진단 정보"):
+        _conn = connection_state()
+        _off = offline_fallback_state()
+        _proxy = network_env_report()
+        st.write(
+            {
+                "연결 차단 감지": _conn["blocked"],
+                "쿨다운 잔여(초)": _conn["cooldown_remaining"],
+                "연결 실패 횟수": _conn["failures"],
+                "마지막 오류": _conn["last_error"] or "(없음)",
+                "저장소 폴백 관측소 수": _off["stations"],
+                "저장소 폴백 최신 관측": _off["latest"] or "(없음)",
+                "프록시 환경변수": _proxy or "(주입된 값 없음)",
+            }
+        )
+        st.caption(
+            "연결 차단 감지가 참이면 컬렉터가 쿨다운 동안 조회를 건너뛴다 — "
+            "12개 관측소가 각자 재시도 한도를 소진해 화면이 8분간 멈추던 것을 "
+            "막기 위한 장치다. 프록시 환경변수는 이 저장소가 설정하지 않으므로, "
+            "값이 보이면 호스팅 플랫폼이 주입한 것이다."
+        )
 
 # 대상 관측소 조회가 성공해도 이웃(Re축)·과거(Im축) 조회가 실패하면 출력값의
 # 근거가 제한된다 — 그 축 입력이 중립값으로 채워지기 때문이다. 배지 하나로는

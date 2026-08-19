@@ -20,7 +20,9 @@ from datetime import datetime, timedelta
 import numpy as np
 import torch
 
-from weather_collector import RobustWeatherCollector, STATIONS, STATION_COORDS
+from weather_collector import (
+    RobustWeatherCollector, STATIONS, STATION_COORDS, is_real_observation,
+)
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector, LAGS_HOURS
 from text_collector import SimulatedTextCollector
@@ -207,20 +209,17 @@ def predict(stn: str = "108",
         model, ckpt = load_model(checkpoint_path, device)
     lead_hours = ckpt["lead_hours"]
 
-    # 대상 관측소 + 보간용 이웃 11개 — 전부 같은 시각(현재) 스냅샷이 필요하다.
+    # 대상 관측소 + 보간용 이웃 11개 — 전부 **같은 시각** 스냅샷이 필요하다.
     #
-    # 이웃은 SUCCESS_LIVE 만 보간장에 넣는다. 폴백 레코드를 그대로 쓰면
-    # FALLBACK_CACHED 는 "직전 값의 복제(+미세 노이즈)"를, FALLBACK_DEFAULT 는
-    # 합성 기본값(20.0°C / 1013hPa)을 실측 관측인 양 IDW 에 태우게 된다 —
     # 가짜 데이터를 입력으로 쓰지 않는다는 규칙(CLAUDE.md 1절 5항, Re축이
-    # 정보량 0이었던 바로 그 원인)에 정면으로 어긋난다. 빼면 컬렉터가
-    # 설계대로 "정보 없음"으로 처리한다(이웃이 하나도 없으면 중립값 0.5).
+    # 정보량 0이었던 바로 그 원인)이 여기 걸린다. 다만 '실측이 아닌 것'과
+    # '지금 것이 아닌 것'은 구분해야 한다 — 전자만 배제한다.
     #
     # 대상 관측소 자신의 레코드는 폴백이어도 그대로 쓴다 — Z축 입력이 아예
     # 없으면 예보를 만들 수 없고, 그 상태는 data_status 로 호출부에 전달돼
     # 화면 상단 배지에 경고로 표시된다.
     record = None
-    neighbor_records = []
+    fetched = []
     for other_stn in STATIONS.values():
         try:
             r = RobustWeatherCollector(stn=other_stn).fetch()
@@ -228,12 +227,28 @@ def predict(stn: str = "108",
             continue
         if other_stn == stn:
             record = r
-        if r.get("status") == "SUCCESS_LIVE":
-            neighbor_records.append(r)
+        fetched.append(r)
     if record is None:
         record = RobustWeatherCollector(stn=stn).fetch()
-        if record.get("status") == "SUCCESS_LIVE":
-            neighbor_records.append(record)
+        fetched.append(record)
+
+    # 보간장에 넣을 이웃을 고른다. 두 조건을 함께 건다(2026-08-19 개편).
+    #
+    #  ① 실측일 것 — is_real_observation() 이 날조 기본값(FALLBACK_DEFAULT)만
+    #     걸러낸다. 저장소 창에서 온 값(FALLBACK_WINDOW)은 관측 시각이 과거일
+    #     뿐 실제 관측이므로 받는다. 종전에는 SUCCESS_LIVE 만 받아, API 연결이
+    #     막히면 이웃이 0곳이 되어 Re축 전체가 중립값(0.5)으로 죽었다.
+    #
+    #  ② 대상 레코드와 같은 관측 시각일 것 — IDW 는 '같은 시각의 공간 분포'를
+    #     전제한다. 실측이라도 시각이 다른 값을 섞으면 실제로 존재한 적 없는
+    #     공간장을 만든다. 연결이 막혀 저장소 창으로 내려가면 12곳이 같은
+    #     시각으로 채워지므로 이 조건에서 그대로 살아남는다.
+    snapshot_ts = str(record.get("timestamp", ""))[:12]
+    neighbor_records = [
+        r for r in fetched
+        if is_real_observation(r.get("status"))
+        and str(r.get("timestamp", ""))[:12] == snapshot_ts
+    ]
     # get_image() 는 대상 관측소를 스스로 제외하므로, 실제 보간에 쓰이는 건
     # 여기서 자신을 뺀 수다.
     live_neighbors = sum(1 for r in neighbor_records if str(r.get("stn")) != stn)
@@ -256,12 +271,16 @@ def predict(stn: str = "108",
                     (now_ts - timedelta(hours=lag)).strftime("%Y%m%d%H00"))
             except Exception:
                 continue
-            # 과거 시각도 SUCCESS_LIVE 만 받는다. 폴백은 요청한 시각의
-            # 타임스탬프를 달고 오므로 그대로 넣으면 TendencyCollector 가
-            # "그 시각에 실제 관측이 있었다"고 믿고 차분을 계산한다 —
-            # FALLBACK_CACHED 는 변화량 ≈ 0 을, FALLBACK_DEFAULT 는 거대한
-            # 가짜 변화량을 만들어낸다. 빼면 설계대로 0(변화 정보 없음)이 된다.
-            if past.get("status") == "SUCCESS_LIVE":
+            # 과거 시각도 실측만 받는다. 날조 기본값을 넣으면
+            # TendencyCollector 가 "그 시각에 실제 관측이 있었다"고 믿고
+            # 거대한 가짜 변화량을 만들어낸다 — 빼면 설계대로 0(변화 정보
+            # 없음)이 된다.
+            #
+            # 저장소 창에서 온 값(FALLBACK_WINDOW)은 받는다. fetch_at 이
+            # exact_time=True 로 폴백하므로 **요청한 바로 그 시각의 실측**만
+            # 돌아온다 — 타임스탬프가 요청 시각과 일치함이 보장되므로 차분이
+            # 실제 관측 간의 변화량이 된다.
+            if is_real_observation(past.get("status")):
                 tendency_records.append(past)
         live_lags = len(tendency_records) - 1
         txt_vec = TendencyCollector(tendency_records).encode_single(record)
