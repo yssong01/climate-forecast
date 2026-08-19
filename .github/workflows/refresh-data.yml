@@ -113,7 +113,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add cache/recent_window.json cache/accuracy_log.json
+          git add cache/recent_window.json cache/accuracy_log.json cache/api_usage_daily.json
           if git diff --cached --quiet; then
             echo "변경 없음 — 커밋 생략 (이미 최신이거나 신규 관측 0건)"
             exit 0

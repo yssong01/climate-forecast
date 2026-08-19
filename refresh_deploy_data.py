@@ -66,6 +66,47 @@ CONCURRENCY = 6
 # ASOS 발표 지연을 감안해도 이 안에 들어와야 한다.
 MAX_STALE_HOURS = int(os.getenv("MAX_STALE_HOURS", "3"))
 
+# 인증키 유출 대응 모니터링(2026-08-19 추가) — KMA 포털의 "API 호출 현황"이
+# 실제 총 호출량의 원본이지만, 그건 사람이 직접 봐야 한다. 이 저장소가 스스로
+# 아는 "우리가 쓴 것으로 확실한 만큼"을 저장소에 남겨두면, 포털 수치와
+# 비교했을 때 크게 벌어지는 경우(=우리가 모르는 호출)를 사람이 알아챌 수
+# 있다. 이 워크플로(GitHub Actions)의 호출량만 기록한다 — Streamlit 서빙
+# 프로세스의 호출량은 컨테이너가 자주 재시작돼(2시간마다 자동 재배포) 이
+# 파일에 안전하게 누적 기록하기 어렵다. app.py 는 "이 프로세스 시작 이후"
+# 값을 별도로 표시하고, 두 값의 합을 포털 수치와 비교하라고 안내한다.
+USAGE_LOG_FILE = "./cache/api_usage_daily.json"
+
+
+def _record_usage(source: str, count_this_run: int) -> None:
+    """오늘(KST) 이 소스가 사용한 것으로 확인된 호출 수를 저장소에 누적한다."""
+    import tempfile
+
+    today = datetime.now(KST).strftime("%Y%m%d")
+    data = {"date": today, "sources": {}}
+    if os.path.exists(USAGE_LOG_FILE):
+        try:
+            with open(USAGE_LOG_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if existing.get("date") == today:
+                data = existing
+        except Exception:
+            pass   # 손상된 파일이면 오늘 자로 새로 시작한다
+    data["sources"][source] = data["sources"].get(source, 0) + count_this_run
+    data["total"] = sum(data["sources"].values())
+
+    directory = os.path.dirname(USAGE_LOG_FILE) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix="api_usage_daily.json.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, USAGE_LOG_FILE)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    print(f"사용량 기록: 오늘({today}) {source} {data['sources'][source]}건 "
+          f"— 저장소 총합 {data['total']}건")
+
 
 def _obs_hour_ceiling() -> datetime:
     """
@@ -206,6 +247,7 @@ def main():
     calls = api_call_stats()
     print(f"API 호출: {calls['count']}건 (예산 {calls['budget']}건, "
           f"차단 {calls['blocked']}건)")
+    _record_usage("refresh_workflow", calls["count"])
 
     # ── 신선도 게이트 — 조용한 실패를 CI 빨간불로 바꾼다 ─────────────────
     # 지금까지는 성공/실패 개수를 출력만 하고 종료 코드는 항상 0이었다.

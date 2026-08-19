@@ -40,6 +40,7 @@ env/
 cache/*
 !cache/recent_window.json
 !cache/accuracy_log.json
+!cache/api_usage_daily.json
 *.json.bak
 *.log
 

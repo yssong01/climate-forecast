@@ -405,6 +405,34 @@ st.sidebar.caption(
     "상태를 표시한다."
 )
 
+# 인증키 유출 대응 — 사용량 이상 감시(2026-08-19 추가).
+#
+# 이 저장소가 "확실히 우리가 쓴 것"으로 아는 두 수치를 합쳐 보여준다.
+#   · 이 프로세스(위 캡션) — 재시작마다 리셋되어 하루 전체를 담지 못한다.
+#   · GitHub Actions(아래) — refresh_deploy_data.py 가 저장소에 커밋하므로
+#     재시작과 무관하게 오늘 하루 누적이 보존된다.
+# 이 합은 여전히 우리 시스템이 정상적으로 쓴 하한선일 뿐이다. 두 프로세스
+# 바깥(다른 곳에서 이 키로 직접 호출)에서 쓴 건 여기 잡히지 않는다 — 그건
+# API허브 마이페이지의 "API 호출 현황"만이 볼 수 있는 진짜 원본이다. 그래서
+# 비교 대상을 명시해 안내한다.
+try:
+    with open("./cache/api_usage_daily.json", "r", encoding="utf-8") as f:
+        _usage_log = json.load(f)
+    _today_kst = datetime.now(KST).strftime("%Y%m%d")
+    if _usage_log.get("date") == _today_kst:
+        st.sidebar.caption(
+            f"GitHub Actions(저장소 기준) 오늘 {_usage_log.get('total', 0)}건 "
+            "— 재시작과 무관하게 보존됨."
+        )
+    else:
+        st.sidebar.caption("GitHub Actions 사용량 기록 없음(오늘 아직 미실행이거나 오래됨).")
+except Exception:
+    pass
+st.sidebar.caption(
+    "⚠️ 위 두 수치의 합보다 API허브 마이페이지의 실제 호출 현황이 크게 높다면 "
+    "이 키가 다른 곳에서도 쓰이고 있다는 뜻이다 — 그쪽 숫자가 최종 근거다."
+)
+
 
 # ── 메인 ──────────────────────────────────────────────────────────
 
