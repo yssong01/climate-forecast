@@ -5,6 +5,7 @@ API 장애 시 2단계 Fallback: 디스크 캐시 → Safe Default.
 SHA-256 기반 중복 인코딩 방지 (논문 §V 캐시 설계 적용).
 """
 import os
+import re
 import json
 import time
 import hashlib
@@ -114,11 +115,48 @@ CONN_FAIL_COOLDOWN = float(os.getenv("KMA_CONN_FAIL_COOLDOWN", "120"))
 _conn_lock = threading.Lock()
 _conn_state = {"blocked_until": 0.0, "last_error": "", "failures": 0}
 
+# requests 의 ConnectTimeout/ConnectionError 는 str() 에 요청 URL 전체를
+# 그대로 담는다(쿼리스트링 포함) — 즉 authKey=... 가 오류 메시지 안에 평문으로
+# 박힌다. 이 상태(_conn_state)는 app.py 의 "연결 진단 정보"로 화면에 그대로
+# 나가는데 이 앱은 공개 배포판이라, 마스킹 없이 쓰면 인증키가 불특정 다수에게
+# 노출된다(2026-08-19 실제로 노출된 뒤 발견). 저장하기 **전에** 지운다 —
+# 화면에서 가리는 방식은 이미 상태에 박힌 값을 신뢰해야 해서 안전하지 않다.
+# [?&] 접두사를 요구하지 않는다 — 오류 메시지 포맷이 항상 URL 그대로라는
+# 보장이 없으므로("authKey: xxx" 처럼 나올 수도 있다), authKey= 가 어디에
+# 나오든 잡도록 넓게 잡는다. 값 구분자로 흔한 문자(공백·따옴표·괄호·& )에서
+# 멈춘다. 이건 **보조 방어선**이다 — 주 방어선은 아래 redact_secrets() 의 리터럴
+# 치환이며, 패턴에 안 맞는 미지의 포맷까지 잡으려고 이중으로 둔다.
+_AUTHKEY_RE = re.compile(r"(authKey=)[^&\s'\")]*", re.IGNORECASE)
 
-def _note_conn_failure(err: Exception) -> None:
+
+def redact_secrets(text: str, *extra_keys: str) -> str:
+    """
+    텍스트에서 인증키를 지운다. 공개 배포판이라 오류 메시지가 화면(연결 진단
+    정보, st.error 등)과 로그(Streamlit Cloud "Manage app")에 그대로 나갈 수
+    있어 **표시·저장하기 전에** 지운다(2026-08-19 — 실제로 노출된 뒤 추가).
+    이 저장소에서 외부로 나갈 수 있는 오류 문자열은 전부 이 함수를 거쳐야
+    한다 — weather_collector 내부뿐 아니라 app.py 의 st.error() 도 마찬가지다.
+
+    두 겹으로 막는다.
+      ① `KMA_API_KEY` 환경변수 값(+ 호출부가 아는 다른 키가 있으면 그것도)을
+         리터럴 치환 — "authKey=" 뒤가 아니어도, 오류 메시지 포맷이 무엇이든
+         그 값이 텍스트 어디에 있든 잡는다. 가장 확실한 방어선이다.
+      ② authKey=... 패턴 치환 — 환경변수가 비어 있거나(로컬 미설정 등) ①이
+         놓친 경우를 위한 보조 방어선이다.
+    """
+    env_key = os.getenv("KMA_API_KEY", "")
+    for k in (env_key, *extra_keys):
+        if k:
+            text = text.replace(k, "***")
+    return _AUTHKEY_RE.sub(r"\1***", text)
+
+
+def _note_conn_failure(err: Exception, api_key: str = "") -> None:
     with _conn_lock:
         _conn_state["blocked_until"] = time.monotonic() + CONN_FAIL_COOLDOWN
-        _conn_state["last_error"] = f"{type(err).__name__}: {str(err)[:200]}"
+        _conn_state["last_error"] = redact_secrets(
+            f"{type(err).__name__}: {str(err)[:200]}", api_key
+        )
         _conn_state["failures"] += 1
 
 
@@ -416,14 +454,14 @@ class RobustWeatherCollector:
                         return parsed
             except (requests.exceptions.ConnectTimeout,
                     requests.exceptions.ConnectionError) as e:
-                _note_conn_failure(e)
+                _note_conn_failure(e, self.api_key)
                 print(f"[WARN] fetch_at {tm} 연결 실패 — 이후 "
                       f"{CONN_FAIL_COOLDOWN:.0f}초간 조회를 건너뛴다 "
                       f"({type(e).__name__})")
                 break
             except Exception as e:
                 if attempt == retries:
-                    print(f"[WARN] fetch_at {tm} 실패: {e}")
+                    print(f"[WARN] fetch_at {tm} 실패: {redact_secrets(str(e), self.api_key)}")
             if attempt < retries:
                 time.sleep(0.5)
 
@@ -501,7 +539,7 @@ class RobustWeatherCollector:
                 # 연결이 안 되는 것은 관측소를 바꾸거나 재시도해도 결과가
                 # 같다 — 이 관측소의 남은 재시도를 접고, 쿨다운 동안 다른
                 # 관측소 조회도 건너뛴다.
-                _note_conn_failure(e)
+                _note_conn_failure(e, self.api_key)
                 print(f"[WARN] 연결 실패 (관측소 {self.stn}) — 이후 "
                       f"{CONN_FAIL_COOLDOWN:.0f}초간 조회를 건너뛴다 "
                       f"({type(e).__name__})")
@@ -510,7 +548,7 @@ class RobustWeatherCollector:
                 # ReadTimeout — 서버에는 닿았으므로 재시도할 값어치가 있다.
                 print(f"[WARN] 응답 지연 (시도 {attempt}/{retries})")
             except Exception as e:
-                print(f"[WARN] 오류 (시도 {attempt}/{retries}): {e}")
+                print(f"[WARN] 오류 (시도 {attempt}/{retries}): {redact_secrets(str(e), self.api_key)}")
             if attempt < retries:
                 time.sleep(2)
 

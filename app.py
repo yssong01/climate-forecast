@@ -34,7 +34,7 @@ from streamlit_autorefresh import st_autorefresh
 from weather_collector import (
     STATIONS, STATION_COORDS, api_call_stats,
     set_offline_fallback, offline_fallback_state,
-    connection_state, network_env_report,
+    connection_state, network_env_report, redact_secrets,
 )
 from predict import (
     load_model, predict, CHECKPOINT, event_threshold, PRECIP_CLIP_THRESH,
@@ -431,7 +431,7 @@ try:
     model, ckpt = get_model(ckpt_fingerprint())
     result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], model, ckpt)
 except Exception as e:
-    st.error(f"예측 실패: {e}")
+    st.error(f"예측 실패: {redact_secrets(str(e))}")
     st.stop()
 
 # 이번 실행의 조회분까지 반영해 사이드바 사용량을 채운다(위 api_usage_slot 참고).
@@ -866,7 +866,10 @@ with tab_trend:
         except Exception as e:
             # +6h(배포 필수 경로)와 달리 +12h 는 2차 산출값이라 없어도 앱
             # 전체가 멈출 이유는 없다 — 실패하면 +6h 로 조용히 대체한다.
-            st.error(f"+12시간 산출값을 불러오지 못해 +6시간으로 대신 표시한다: {e}")
+            st.error(
+                "+12시간 산출값을 불러오지 못해 +6시간으로 대신 표시한다: "
+                f"{redact_secrets(str(e))}"
+            )
             model_disp, ckpt_disp, result_disp = model, ckpt, result
         else:
             st.caption(
