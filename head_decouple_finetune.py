@@ -84,6 +84,28 @@ def masked_bce(logit, target, mask, pos_weight=None):
     return (raw * mask).sum() / mask.sum().clamp_min(1)
 
 
+# probability_calibration_fit.py 와 같은 값 — 같은 재분할 관례를 따른다.
+CALIB_SEED = 1234
+
+
+def split_calib_eval(idx, seed=CALIB_SEED, calib_frac=0.5):
+    """idx 를 보정용/평가용으로 무작위 절반씩 나눈다(2026-08-19 추가).
+
+    왜 필요한가 — 중첩 전이학습 재실행(README '재시도 결과' 절)에서 F1이
+    초반 몇 에폭에 치솟았다가 가라앉는 곡선이 나왔다. "어느 에폭에서 멈출까"
+    를 그 곡선 자체로 고르면, 확률 임계값을 검증셋 전체로 고르고 그 검증셋
+    으로 다시 채점하던 것과 같은 순환 논리가 된다(CLAUDE.md 2절이 이미 금지
+    하는 패턴). 이 함수는 val_idx 를 한 번만 갈라, 정지 에폭은 보정용 곡선
+    으로 고르고 그 성능은 한 번도 안 본 평가용에서만 잰다.
+    """
+    rng = np.random.RandomState(seed)
+    idx = list(idx)
+    is_calib = rng.rand(len(idx)) < calib_frac
+    calib = [i for i, m in zip(idx, is_calib) if m]
+    ev = [i for i, m in zip(idx, is_calib) if not m]
+    return calib, ev
+
+
 def evaluate(model, ds, idx, device):
     model.eval()
     temp_abs, precip_abs = [], []
@@ -140,6 +162,10 @@ def main():
     # 실행자가 어느 쪽에 의존하는지 헷갈릴 필요가 없게 한다.
     ap.add_argument("ckpt", nargs="?", default=CHECKPOINT,
                     help="기반 체크포인트 경로(생략 시 CHECKPOINT_PATH 환경변수 또는 배포 경로)")
+    ap.add_argument("--calib-eval-split", action="store_true",
+                    help="검증셋을 보정용/평가용으로 나눠 에폭마다 두 F1을 함께 찍는다. "
+                         "정지 에폭을 보정용 곡선으로 고르고 평가용에서 순이득을 확인할 때 "
+                         "쓴다 — 같은 곡선으로 고르고 채점하는 순환 논리를 피한다.")
     args = ap.parse_args()
     heads = [h.strip() for h in args.heads.split(",") if h.strip()]
     for h in heads:
@@ -175,6 +201,11 @@ def main():
     train_ds, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True)
     train_idx = list(train_ds.indices)
     val_idx = list(val_ds.indices)
+    calib_idx = eval_idx = None
+    if args.calib_eval_split:
+        calib_idx, eval_idx = split_calib_eval(val_idx)
+        print(f"보정용/평가용 분할 — 보정 {len(calib_idx):,}개 / 평가 {len(eval_idx):,}개 "
+              f"(seed={CALIB_SEED})")
 
     n_tunable = freeze_trunk(model, heads)
     print(f"헤드만 미세조정 — 학습 가능 파라미터 {n_tunable:,}개 "
@@ -258,6 +289,14 @@ def main():
         hf = m["heatwave"]["f1"]; cf = m["coldwave"]["f1"]; df = m["dust"]["f1"]
         print(f"{epoch:4d} | {total_loss/n_batches:8.4f} | {temp_mae:8.4f} | "
               f"{precip_mae:8.4f} | {hf:7.3f} | {cf:7.3f} | {df:7.3f}")
+
+        if args.calib_eval_split:
+            # 정지 에폭은 이 보정용 F1 곡선만 보고 고를 것 — 아래 평가용 F1은
+            # 그 결정이 끝난 뒤에만 들여다본다(순환 논리 방지).
+            _, _, m_c = evaluate(model, ds, calib_idx, DEVICE)
+            _, _, m_e = evaluate(model, ds, eval_idx, DEVICE)
+            print(f"       보정용 한파F1={m_c['coldwave']['f1']:.3f}  "
+                  f"평가용 한파F1={m_e['coldwave']['f1']:.3f}")
 
         # 선택 기준 — 미세조정 대상 헤드들의 F1(또는 강수 MAE)만 평균해
         # 고른다. 안 건드리는 헤드는 어차피 상수라 기준에 넣어도 무의미하다.
