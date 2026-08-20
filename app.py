@@ -13,7 +13,9 @@ st.metric의 help 툴팁으로 함께 표시한다 — "이 값이 왜 이렇게
 화면만 보고 답할 수 있어야 한다는 원칙(2026-08-09 확정)을 따른다.
 """
 import json
+import math
 import os
+import pandas as pd
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -911,40 +913,36 @@ tab_trend, tab_extreme, tab_perf, tab_model = st.tabs(
 # ── 탭 1: 출력값 추이 ──────────────────────────────────────────────
 
 with tab_trend:
-    # +12h 2차 산출값 토글(2026-08-18). 이 탭 안에서만 쓰는 지역 변수
-    # (f_disp/c_disp/lead_disp/result_disp)로 분리한다 — 전역 f/c/lead 를
-    # 여기서 재할당하면 '성능 검증' 탭이 뒤에서 그 값을 다시 읽으므로
-    # (lead, f["temperature"] 등) 토글이 다른 탭까지 조용히 물들인다.
-    lead_choice = st.radio(
-        "예측 리드타임", ["+6시간(기본)", "+12시간(2차 산출값)"],
-        horizontal=True, key="lead_choice",
-        help="+12시간은 2차 산출값이다. 절대오차가 +6시간보다 크다(기온 "
-             "1.30→1.66°C, 검증셋 평균) — '성능 검증' 탭 수치는 +6시간 "
-             "기준이며 이 토글의 영향을 받지 않는다.",
-    )
-    if lead_choice.startswith("+12"):
-        try:
-            model_disp, ckpt_disp = get_model_at(
-                CHECKPOINT_12H, ckpt_fingerprint(CHECKPOINT_12H))
-            result_disp = cached_predict(
-                stn, obs_hour_key(), ckpt_disp["lead_hours"], model_disp, ckpt_disp)
-        except Exception as e:
-            # +6h(배포 필수 경로)와 달리 +12h 는 2차 산출값이라 없어도 앱
-            # 전체가 멈출 이유는 없다 — 실패하면 +6h 로 조용히 대체한다.
-            st.error(
-                "+12시간 산출값을 불러오지 못해 +6시간으로 대신 표시한다: "
-                f"{redact_secrets(str(e))}"
-            )
-            model_disp, ckpt_disp, result_disp = model, ckpt, result
-        else:
-            st.caption(
-                "⚠️ +12시간 출력값은 2차 산출값이다 — 계절 오탐 검증이 배포본"
-                "(0.06%)보다 높게 나왔다(5.41%, 차단 기준 10% 미만이라 채택). "
-                "폭염·강수는 +6시간과 비슷하게 유지되나 한파·황사는 리드타임이 "
-                "늘수록 더 크게 흔들린다."
-            )
-    else:
-        model_disp, ckpt_disp, result_disp = model, ckpt, result
+    # +6h/+12h 동시 표시(2026-08-20 개편). 예전에는 라디오로 하나만 골라
+    # 보여줬는데, 둘을 한 화면에서 바로 비교할 수 있어야 한다는 요청에 따라
+    # 토글을 없애고 항상 둘 다 계산해 차트·표에 함께 그린다.
+    #
+    # 이 탭 안에서만 쓰는 지역 변수(result_12h 등)로 분리한다 — 전역
+    # f/c/lead 를 여기서 재할당하면 '성능 검증' 탭이 뒤에서 그 값을 다시
+    # 읽으므로(lead, f["temperature"] 등) +12h 계산이 다른 탭까지 조용히
+    # 물들인다.
+    result_12h = None
+    try:
+        model_12h, ckpt_12h = get_model_at(
+            CHECKPOINT_12H, ckpt_fingerprint(CHECKPOINT_12H))
+        result_12h = cached_predict(
+            stn, obs_hour_key(), ckpt_12h["lead_hours"], model_12h, ckpt_12h)
+    except Exception as e:
+        # +6h(배포 필수 경로)와 달리 +12h 는 2차 산출값이라 없어도 앱
+        # 전체가 멈출 이유는 없다 — 실패하면 그 부분만 빠진 채 표시한다.
+        st.caption(
+            f"⚠️ +12시간 출력값을 불러오지 못했다: {redact_secrets(str(e))}"
+        )
+        ckpt_12h = None
+    if result_12h is not None:
+        st.caption(
+            "+12시간은 2차 산출값이다 — 절대오차가 +6시간보다 크고(기온 "
+            "1.30→1.66°C, 검증셋 평균), 계절 오탐 검증도 배포본(0.06%)보다 "
+            "높게 나왔다(5.41%, 차단 기준 10% 미만이라 채택). 폭염·강수는 "
+            "+6시간과 비슷하게 유지되나 한파·황사는 리드타임이 늘수록 더 크게 "
+            "흔들린다. '성능 검증' 탭 수치는 +6시간 기준이며 이 값의 영향을 "
+            "받지 않는다."
+        )
 
     history = load_merged_history()
     series = recent_series(history, stn, hours=72)
@@ -977,9 +975,18 @@ with tab_trend:
     # else 안에서 할당하면 관측 창이 비었을 때(len(series)<2) NameError 로
     # 앱 전체가 죽는다 — 갱신 경로가 72시간 넘게 끊기면 실제로 발생하는
     # 조건이고(a1329e7 참고), 그때야말로 화면이 살아 있어야 한다.
-    f_disp = result_disp["forecast"]
-    c_disp = result_disp["current"]
-    lead_disp = result_disp["forecast_lead_hours"]
+    # +6h 는 항상 전역 f/c/lead(위쪽에서 이미 계산됨)를 그대로 쓴다 — 배포
+    # 필수 경로라 실패 시 이미 st.stop() 으로 앱이 멈춘 뒤이므로 여기 도달한
+    # 시점엔 반드시 존재한다.
+    f6, c6, lead6 = f, c, lead
+    # 아래 표(모델 출력값)는 series 길이와 무관하게 항상 그리므로, f12 등도
+    # 차트를 그리는 else 절 안이 아니라 여기서 미리 꺼낸다 — 관측 창이 비어
+    # 차트를 건너뛰어도(len(series)<2) 표는 여전히 +12h 값을 참조한다.
+    if result_12h is not None:
+        f12, c12, lead12 = (result_12h["forecast"], result_12h["current"],
+                            result_12h["forecast_lead_hours"])
+    else:
+        f12 = c12 = lead12 = None
 
     if len(series) < 2:
         st.caption("최근 추이를 표시하기에 로컬 캐시의 데이터가 부족하다"
@@ -990,7 +997,7 @@ with tab_trend:
         precs = [r["precipitation"] for r in series]
         hums  = [r["humidity"] for r in series]
         press = [r["pressure"] for r in series]
-        tgt_x = datetime.strptime(result_disp["target_time"][:12], "%Y%m%d%H%M")
+        tgt_x6 = datetime.strptime(result["target_time"][:12], "%Y%m%d%H%M")
 
         fig = make_subplots(
             rows=2, cols=2,
@@ -1000,17 +1007,35 @@ with tab_trend:
 
         fig.add_trace(go.Scatter(x=xs, y=temps, mode="lines", name="실측 기온",
                                  line=dict(color="#4C78A8", width=2)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=[xs[-1], tgt_x], y=[temps[-1], f_disp["temperature"]],
-                                 mode="lines+markers", name="모델 출력값",
+        # +6h(기본)는 꽉 찬 별, +12h(2차 산출값)는 속 빈 별이다(2026-08-20) —
+        # 둘을 동시에 그리므로 심벌로 바로 구분돼야 한다. 목표 시각(tgt_x6 vs
+        # tgt_x12)도 서로 달라 리드타임 차이가 x축 위치로도 드러난다.
+        fig.add_trace(go.Scatter(x=[xs[-1], tgt_x6], y=[temps[-1], f6["temperature"]],
+                                 mode="lines+markers", name="+6h 출력값",
                                  line=dict(color="#E2954F", width=1.5, dash="dot"),
                                  marker=dict(size=[0, 10], symbol="star")),
                      row=1, col=1)
 
         fig.add_trace(go.Bar(x=xs, y=precs, name="실측 강수",
                              marker_color="#4C78A8", showlegend=False), row=1, col=2)
-        fig.add_trace(go.Scatter(x=[tgt_x], y=[f_disp["precipitation"]], mode="markers",
-                                 name="모델 출력값(강수)", marker=dict(size=10, symbol="star",
+        fig.add_trace(go.Scatter(x=[tgt_x6], y=[f6["precipitation"]], mode="markers",
+                                 name="+6h 출력값(강수)", marker=dict(size=10, symbol="star",
                                  color="#E2954F"), showlegend=False), row=1, col=2)
+
+        _prec_vals = list(precs) + [f6["precipitation"]]
+
+        if result_12h is not None:
+            tgt_x12 = datetime.strptime(result_12h["target_time"][:12], "%Y%m%d%H%M")
+            fig.add_trace(go.Scatter(x=[xs[-1], tgt_x12], y=[temps[-1], f12["temperature"]],
+                                     mode="lines+markers", name="+12h 출력값",
+                                     line=dict(color="#B25FE0", width=1.5, dash="dot"),
+                                     marker=dict(size=[0, 10], symbol="star-open")),
+                         row=1, col=1)
+            fig.add_trace(go.Scatter(x=[tgt_x12], y=[f12["precipitation"]], mode="markers",
+                                     name="+12h 출력값(강수)", marker=dict(size=10,
+                                     symbol="star-open", color="#B25FE0"), showlegend=False),
+                         row=1, col=2)
+            _prec_vals.append(f12["precipitation"])
 
         fig.add_trace(go.Scatter(x=xs, y=hums, mode="lines", name="습도",
                                  line=dict(color="#54A24B", width=2),
@@ -1024,50 +1049,64 @@ with tab_trend:
             showlegend=True, legend=dict(orientation="h", y=1.14, x=0),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         )
-        # 강수·습도·기압은 음수가 있을 수 없는 값이다 — 자동범위 여백 때문에
-        # (예: 강수가 거의 0이면) 세로축이 0 밑으로 살짝 내려가 보이던 것을
-        # 막는다. 기온만 음수(영하)가 실제로 가능하므로 그대로 자동범위를 둔다.
-        fig.update_yaxes(rangemode="nonnegative", row=1, col=2)   # 강수
+        # 습도·기압은 음수가 있을 수 없는 값이다 — 자동범위 여백 때문에
+        # 세로축이 0 밑으로 살짝 내려가 보이던 것을 막는다. 기온만 음수(영하)가
+        # 실제로 가능하므로 그대로 자동범위를 둔다.
         fig.update_yaxes(rangemode="nonnegative", row=2, col=1)   # 습도
         fig.update_yaxes(rangemode="nonnegative", row=2, col=2)   # 기압
-        st.plotly_chart(fig, width="stretch")
-        st.caption(
-            f"선과 막대는 실측값이다 — 최근 72시간 중 관측이 있는 {len(series)}개 "
-            f"시점. ★ 표시는 이번 +{lead_disp}시간 후 예측값이다. 예측 대상은 기온·강수 "
-            f"두 항목이며, 습도·기압은 참고용 실측값으로 예측 대상이 아니다."
-        )
 
-    st.markdown("#### +%d시간 후 모델 출력값" % lead_disp)
-    _val_temp_mae = ckpt_disp.get("val_temp_mae")
-    _val_precip_mae = ckpt_disp.get("val_precip_mae")
-    fc1, fc2 = st.columns(2)
-    fc1.metric(
-        "기온 출력값", f"{f_disp['temperature']:.1f} °C",
-        delta=f"{f_disp['temperature'] - c_disp['temperature']:+.1f} °C (현재 대비)",
-        help="모델은 절대 기온을 직접 산출하지 않고, '현재 기온 대비 변화량(Δ)'을 "
-             "계산하여 더한다. 평균적으로 '성능 검증' 탭의 기온 평균절대오차(MAE)"
-             "만큼 오차가 발생한다.",
-    )
-    if _val_temp_mae is not None:
-        fc1.markdown(
-            f"<span style='font-size:0.8em; color:gray;'>(오차범위 ±{_val_temp_mae:.2f} °C "
-            f"— 검증셋 평균오차이며, 이 예측 1건의 신뢰구간이 아니다)</span>",
-            unsafe_allow_html=True,
+        # 강수 축은 하한을 -0.1로 살짝 내려 막대·별 심벌이 0선에 바로 붙지
+        # 않게 하고(2026-08-20), 눈금 간격은 0.5로 고정한다. 상한은 실제 표시
+        # 데이터(실측 막대 + 예측 별, +12h 포함)에 맞춰 0.5 배수로 자동 계산한다.
+        _prec_max = max(_prec_vals) if _prec_vals else 0.0
+        _prec_upper = max(0.5, math.ceil((_prec_max + 0.05) / 0.5) * 0.5)
+        fig.update_yaxes(range=[-0.1, _prec_upper], dtick=0.5, row=1, col=2)
+        st.plotly_chart(fig, width="stretch")
+        _star_caption = (
+            f"선과 막대는 실측값이다 — 최근 72시간 중 관측이 있는 {len(series)}개 "
+            f"시점. 꽉 찬 ★ 는 +{lead6}시간 후 예측값이다."
         )
-    fc2.metric(
-        "강수 출력값", f"{f_disp['precipitation']:.1f} mm",
-        delta=f"{f_disp['precipitation'] - c_disp['precipitation']:+.1f} mm (현재 대비)",
-        delta_color="inverse",
-        help=f"강수 확률과 강수량 추정치를 곱하여 산출한 값이다(허들(Hurdle) 구조 "
-             f"— '모델 구조' 탭에 상세 설명). 확률이 낮으면 추정량이 커도 최종값은 "
-             f"0에 수렴한다. {PRECIP_CLIP_THRESH}mm 미만은 0으로 반올림한다.",
-    )
-    if _val_precip_mae is not None:
-        fc2.markdown(
-            f"<span style='font-size:0.8em; color:gray;'>(오차범위 ±{_val_precip_mae:.3f} mm "
-            f"— 검증셋 평균오차이며, 이 예측 1건의 신뢰구간이 아니다)</span>",
-            unsafe_allow_html=True,
+        if result_12h is not None:
+            _star_caption += f" 속 빈 ☆ 는 +{lead12}시간 후 예측값(2차 산출값)이다."
+        _star_caption += " 예측 대상은 기온·강수 두 항목이며, 습도·기압은 참고용 실측값으로 예측 대상이 아니다."
+        st.caption(_star_caption)
+
+    st.markdown("#### 모델 출력값")
+    _val_temp_mae6 = ckpt.get("val_temp_mae")
+    _val_precip_mae6 = ckpt.get("val_precip_mae")
+    _rows = [
+        {
+            "항목": "기온 출력값",
+            "+6시간(기본)": f"{f6['temperature']:.1f} °C ({f6['temperature'] - c6['temperature']:+.1f} 현재 대비)"
+                          + (f" ±{_val_temp_mae6:.2f}" if _val_temp_mae6 is not None else ""),
+        },
+        {
+            "항목": "강수 출력값",
+            "+6시간(기본)": f"{f6['precipitation']:.1f} mm ({f6['precipitation'] - c6['precipitation']:+.1f} 현재 대비)"
+                          + (f" ±{_val_precip_mae6:.3f}" if _val_precip_mae6 is not None else ""),
+        },
+    ]
+    if result_12h is not None:
+        _val_temp_mae12 = ckpt_12h.get("val_temp_mae")
+        _val_precip_mae12 = ckpt_12h.get("val_precip_mae")
+        _rows[0]["+12시간(2차 산출값)"] = (
+            f"{f12['temperature']:.1f} °C ({f12['temperature'] - c12['temperature']:+.1f} 현재 대비)"
+            + (f" ±{_val_temp_mae12:.2f}" if _val_temp_mae12 is not None else "")
         )
+        _rows[1]["+12시간(2차 산출값)"] = (
+            f"{f12['precipitation']:.1f} mm ({f12['precipitation'] - c12['precipitation']:+.1f} 현재 대비)"
+            + (f" ±{_val_precip_mae12:.3f}" if _val_precip_mae12 is not None else "")
+        )
+    else:
+        _rows[0]["+12시간(2차 산출값)"] = "불러오기 실패"
+        _rows[1]["+12시간(2차 산출값)"] = "불러오기 실패"
+    st.dataframe(pd.DataFrame(_rows).set_index("항목"), width="stretch")
+    st.caption(
+        "기온은 '현재 기온 대비 변화량(Δ)'을 더한 값이고, 강수는 강수 확률과 "
+        "강수량 추정치를 곱한 값이다(허들(Hurdle) 구조 — '모델 구조' 탭에 상세 "
+        f"설명). {PRECIP_CLIP_THRESH}mm 미만은 0으로 반올림한다. '±' 뒤 숫자는 "
+        "검증셋 평균절대오차(MAE)이며 이 예측 1건의 신뢰구간이 아니다."
+    )
     st.caption(
         "⚠️ 강수량 출력값은 본 프로젝트에서 가장 취약한 부분이다 — '성능 검증' "
         "탭의 강수 MAE 설명을 함께 참조한다."
