@@ -254,6 +254,12 @@ _MAP_OCEAN = "rgba(128, 140, 158, 0.08)"
 _MAP_LINE = "rgba(128, 140, 158, 0.85)"
 _MAP_MARKER_EDGE = "rgba(128, 140, 158, 0.9)"
 
+# 리드타임 색(2026-08-20). '출력값 추이' 탭의 차트 별 심벌과 그 아래 표의
+# 열 제목이 같은 색을 써야 어느 열이 어느 별인지 곧바로 이어진다 — 두 곳에
+# 색을 따로 적어두면 한쪽만 바뀌어도 대응이 조용히 깨지므로 상수로 묶는다.
+_LEAD6_COLOR = "#E2954F"    # 꽉 찬 별(★) — +6시간
+_LEAD12_COLOR = "#B25FE0"   # 속 빈 별(☆) — +12시간
+
 
 def render_station_map(stations: dict, selected_stn: str) -> str | None:
     """
@@ -1012,7 +1018,7 @@ with tab_trend:
         # tgt_x12)도 서로 달라 리드타임 차이가 x축 위치로도 드러난다.
         fig.add_trace(go.Scatter(x=[xs[-1], tgt_x6], y=[temps[-1], f6["temperature"]],
                                  mode="lines+markers", name="+6h 출력값",
-                                 line=dict(color="#E2954F", width=1.5, dash="dot"),
+                                 line=dict(color=_LEAD6_COLOR, width=1.5, dash="dot"),
                                  marker=dict(size=[0, 10], symbol="star")),
                      row=1, col=1)
 
@@ -1020,7 +1026,7 @@ with tab_trend:
                              marker_color="#4C78A8", showlegend=False), row=1, col=2)
         fig.add_trace(go.Scatter(x=[tgt_x6], y=[f6["precipitation"]], mode="markers",
                                  name="+6h 출력값(강수)", marker=dict(size=10, symbol="star",
-                                 color="#E2954F"), showlegend=False), row=1, col=2)
+                                 color=_LEAD6_COLOR), showlegend=False), row=1, col=2)
 
         _prec_vals = list(precs) + [f6["precipitation"]]
 
@@ -1033,12 +1039,12 @@ with tab_trend:
             # 부채꼴로 뻗어나가야 두 예측이 각자 독립적이라는 게 정확히 전달된다.
             fig.add_trace(go.Scatter(x=[xs[-1], tgt_x12], y=[temps[-1], f12["temperature"]],
                                      mode="lines+markers", name="+12h 출력값",
-                                     line=dict(color="#B25FE0", width=1.5, dash="dot"),
+                                     line=dict(color=_LEAD12_COLOR, width=1.5, dash="dot"),
                                      marker=dict(size=[0, 10], symbol="star-open")),
                          row=1, col=1)
             fig.add_trace(go.Scatter(x=[tgt_x12], y=[f12["precipitation"]], mode="markers",
                                      name="+12h 출력값(강수)", marker=dict(size=10,
-                                     symbol="star-open", color="#B25FE0"), showlegend=False),
+                                     symbol="star-open", color=_LEAD12_COLOR), showlegend=False),
                          row=1, col=2)
             _prec_vals.append(f12["precipitation"])
 
@@ -1126,13 +1132,30 @@ with tab_trend:
             lambda d: "color:#C0392B" if d > 0 else ("color:#1E8449" if d < 0 else "")
         )
 
-    st.dataframe(_out_df.style.apply(_color_by_delta, axis=None), width="stretch")
+    # st.dataframe 이 아니라 st.table 을 쓴다(2026-08-20) — 전자는 캔버스로
+    # 그려서 글자 크기도 열 제목 색도 지정할 수 없다. 열 제목을 차트의 별
+    # 심벌과 같은 색으로 맞추려면 Styler 의 set_table_styles 가 필요하고,
+    # 그건 HTML 로 렌더되는 st.table 에서만 먹는다.
+    _tbl_styles = [
+        {"selector": "th, td", "props": [("font-size", "1.05rem")]},
+        {"selector": "th.col_heading.level0.col0",
+         "props": [("color", _LEAD6_COLOR)]},
+        {"selector": "th.col_heading.level0.col1",
+         "props": [("color", _LEAD12_COLOR)]},
+    ]
+    st.table(
+        _out_df.style
+        .apply(_color_by_delta, axis=None)
+        .set_table_styles(_tbl_styles)
+    )
     st.caption(
         "기온은 '현재 기온 대비 변화량(Δ)'을 더한 값이고, 강수는 강수 확률과 "
         "강수량 추정치를 곱한 값이다(허들(Hurdle) 구조 — '모델 구조' 탭에 상세 "
         f"설명). {PRECIP_CLIP_THRESH}mm 미만은 0으로 반올림한다. '±' 뒤 숫자는 "
         "검증셋 평균절대오차(MAE)이며 이 예측 1건의 신뢰구간이 아니다. 빨간 "
-        "글자는 현재 대비 상승, 초록 글자는 하강 전망이다."
+        "글자는 현재 대비 상승, 초록 글자는 하강 전망이다. 열 제목 색은 위 "
+        "차트의 별 색과 같다 — 주황이 꽉 찬 별(+6시간), 보라가 속 빈 "
+        "별(+12시간)이다."
     )
     st.caption(
         "⚠️ 강수량 출력값은 본 프로젝트에서 가장 취약한 부분이다 — '성능 검증' "
