@@ -1026,6 +1026,11 @@ with tab_trend:
 
         if result_12h is not None:
             tgt_x12 = datetime.strptime(result_12h["target_time"][:12], "%Y%m%d%H%M")
+            # 보라 점선은 마지막 실측점(xs[-1])에서 +12h 별표로 잇는다(2026-08-20,
+            # 원복) — +12h는 +6h 예측을 이어받아 계산하는 게 아니라 같은 현재
+            # 관측값을 입력받는 독립된 체크포인트의 출력이다. 별표끼리 이으면
+            # 연쇄 계산처럼 보여 오해를 준다 — +6h 선과 마찬가지로 '현재'에서
+            # 부채꼴로 뻗어나가야 두 예측이 각자 독립적이라는 게 정확히 전달된다.
             fig.add_trace(go.Scatter(x=[xs[-1], tgt_x12], y=[temps[-1], f12["temperature"]],
                                      mode="lines+markers", name="+12h 출력값",
                                      line=dict(color="#B25FE0", width=1.5, dash="dot"),
@@ -1074,38 +1079,60 @@ with tab_trend:
     st.markdown("#### 모델 출력값")
     _val_temp_mae6 = ckpt.get("val_temp_mae")
     _val_precip_mae6 = ckpt.get("val_precip_mae")
+    _d_temp6 = f6["temperature"] - c6["temperature"]
+    _d_precip6 = f6["precipitation"] - c6["precipitation"]
     _rows = [
         {
             "항목": "기온 출력값",
-            "+6시간(기본)": f"{f6['temperature']:.1f} °C ({f6['temperature'] - c6['temperature']:+.1f} 현재 대비)"
+            "+6시간(기본)": f"{f6['temperature']:.1f} °C ({_d_temp6:+.1f} 현재 대비)"
                           + (f" ±{_val_temp_mae6:.2f}" if _val_temp_mae6 is not None else ""),
         },
         {
             "항목": "강수 출력값",
-            "+6시간(기본)": f"{f6['precipitation']:.1f} mm ({f6['precipitation'] - c6['precipitation']:+.1f} 현재 대비)"
+            "+6시간(기본)": f"{f6['precipitation']:.1f} mm ({_d_precip6:+.1f} 현재 대비)"
                           + (f" ±{_val_precip_mae6:.3f}" if _val_precip_mae6 is not None else ""),
         },
     ]
+    # 상승/하강 방향에 따른 글자색(2026-08-20) — 현재 대비 증가는 빨강,
+    # 감소는 초록. 표 셀 문자열에서 부호를 다시 파싱하지 않도록, 델타 부호를
+    # 같은 모양의 별도 표에 담아 pandas Styler 로 입힌다.
+    _deltas = [{"항목": "기온 출력값", "+6시간(기본)": _d_temp6},
+               {"항목": "강수 출력값", "+6시간(기본)": _d_precip6}]
     if result_12h is not None:
         _val_temp_mae12 = ckpt_12h.get("val_temp_mae")
         _val_precip_mae12 = ckpt_12h.get("val_precip_mae")
+        _d_temp12 = f12["temperature"] - c12["temperature"]
+        _d_precip12 = f12["precipitation"] - c12["precipitation"]
         _rows[0]["+12시간(2차 산출값)"] = (
-            f"{f12['temperature']:.1f} °C ({f12['temperature'] - c12['temperature']:+.1f} 현재 대비)"
+            f"{f12['temperature']:.1f} °C ({_d_temp12:+.1f} 현재 대비)"
             + (f" ±{_val_temp_mae12:.2f}" if _val_temp_mae12 is not None else "")
         )
         _rows[1]["+12시간(2차 산출값)"] = (
-            f"{f12['precipitation']:.1f} mm ({f12['precipitation'] - c12['precipitation']:+.1f} 현재 대비)"
+            f"{f12['precipitation']:.1f} mm ({_d_precip12:+.1f} 현재 대비)"
             + (f" ±{_val_precip_mae12:.3f}" if _val_precip_mae12 is not None else "")
         )
+        _deltas[0]["+12시간(2차 산출값)"] = _d_temp12
+        _deltas[1]["+12시간(2차 산출값)"] = _d_precip12
     else:
         _rows[0]["+12시간(2차 산출값)"] = "불러오기 실패"
         _rows[1]["+12시간(2차 산출값)"] = "불러오기 실패"
-    st.dataframe(pd.DataFrame(_rows).set_index("항목"), width="stretch")
+        _deltas[0]["+12시간(2차 산출값)"] = 0.0
+        _deltas[1]["+12시간(2차 산출값)"] = 0.0
+    _out_df = pd.DataFrame(_rows).set_index("항목")
+    _delta_df = pd.DataFrame(_deltas).set_index("항목")
+
+    def _color_by_delta(_ignored):
+        return _delta_df.map(
+            lambda d: "color:#C0392B" if d > 0 else ("color:#1E8449" if d < 0 else "")
+        )
+
+    st.dataframe(_out_df.style.apply(_color_by_delta, axis=None), width="stretch")
     st.caption(
         "기온은 '현재 기온 대비 변화량(Δ)'을 더한 값이고, 강수는 강수 확률과 "
         "강수량 추정치를 곱한 값이다(허들(Hurdle) 구조 — '모델 구조' 탭에 상세 "
         f"설명). {PRECIP_CLIP_THRESH}mm 미만은 0으로 반올림한다. '±' 뒤 숫자는 "
-        "검증셋 평균절대오차(MAE)이며 이 예측 1건의 신뢰구간이 아니다."
+        "검증셋 평균절대오차(MAE)이며 이 예측 1건의 신뢰구간이 아니다. 빨간 "
+        "글자는 현재 대비 상승, 초록 글자는 하강 전망이다."
     )
     st.caption(
         "⚠️ 강수량 출력값은 본 프로젝트에서 가장 취약한 부분이다 — '성능 검증' "

@@ -64,6 +64,16 @@ checkpoints/*
 # ChromaDB 로컬 저장소
 chroma_db/
 
+# Cloudflare Worker(cloudflare-worker/) 로컬 빌드·시크릿 —
+# GITHUB_PAT 은 `wrangler secret put` 으로만 등록한다(파일로 저장 금지).
+cloudflare-worker/node_modules/
+cloudflare-worker/.wrangler/
+cloudflare-worker/.dev.vars
+# 어느 위치에 만들든 걸리도록 범용 규칙도 둔다(경로를 착각해 저장소
+# 최상위에 만들어진 사례가 실제로 있었다, 2026-08-20).
+.dev.vars
+**/.dev.vars
+
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
