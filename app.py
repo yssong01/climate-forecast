@@ -67,10 +67,10 @@ def _now_kst_naive() -> datetime:
 HIST_FILES = ["./cache/recent_window.json"]
 
 # recent_window.json 을 로컬 디스크가 아니라 GitHub raw 로 직접 읽는다
-# (2026-08-20 — 재배포와 신선도 분리). refresh-data.yml 이 이제 main 이
+# (2026-08-20 — 재배포와 최신성 분리). refresh-data.yml 이 이제 main 이
 # 아니라 data 브랜치에 커밋한다 — Streamlit Cloud 는 main 만 감시하므로
 # data 브랜치에 15분마다 커밋해도 재배포가 안 걸린다. 대신 이 앱이 직접
-# 그 브랜치의 최신 파일을 끌어와야 신선도가 반영된다.
+# 그 브랜치의 최신 파일을 끌어와야 최신성이 반영된다.
 #
 # 실패(네트워크 문제, 저장소 구조 변경 등)하면 로컬 디스크(HIST_FILES)로
 # 폴백한다 — 그건 이 앱이 마지막으로 재배포됐을 시점의 스냅숏이라 최신은
@@ -949,7 +949,7 @@ with tab_trend:
     history = load_merged_history()
     series = recent_series(history, stn, hours=72)
 
-    # 관측 이력 창의 신선도를 명시한다. 배포 환경에서는 앱이 이 파일을
+    # 관측 이력 창의 최신성을 명시한다. 배포 환경에서는 앱이 이 파일을
     # 유지할 수 없고(컨테이너 파일시스템 휘발), 저장소를 갱신하는
     # GitHub Actions(refresh-data.yml)가 유일한 공급자다. 그 경로가 끊기면
     # 차트가 원인 표시 없이 비어가는 대신 왜 비는지 화면에서 말하게 한다.
