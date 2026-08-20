@@ -443,9 +443,18 @@ st.sidebar.caption(
 # 바깥(다른 곳에서 이 키로 직접 호출)에서 쓴 건 여기 잡히지 않는다 — 그건
 # API허브 마이페이지의 "API 호출 현황"만이 볼 수 있는 진짜 원본이다. 그래서
 # 비교 대상을 명시해 안내한다.
+#
+# 로컬 디스크가 아니라 data 브랜치 raw 를 읽는다(2026-08-20) — 이 파일도
+# refresh_deploy_data.py 가 이제 main 이 아니라 data 브랜치에 커밋하므로,
+# 로컬 디스크를 읽으면 재배포가 끊긴 뒤로 영원히 얼어붙은 값을 보여주게
+# 된다(recent_window.json 과 같은 이유, 위 RAW_WINDOW_URL 주석 참고).
 try:
-    with open("./cache/api_usage_daily.json", "r", encoding="utf-8") as f:
-        _usage_log = json.load(f)
+    resp = requests.get(
+        "https://raw.githubusercontent.com/yssong01/climate-forecast/"
+        "data/cache/api_usage_daily.json",
+        timeout=8,
+    )
+    _usage_log = resp.json() if resp.status_code == 200 else {}
     _today_kst = datetime.now(KST).strftime("%Y%m%d")
     if _usage_log.get("date") == _today_kst:
         st.sidebar.caption(
@@ -952,13 +961,14 @@ with tab_trend:
             "Refresh deploy data 워크플로(workflow)가 이 파일을 채운다.",
             icon="⚠️",
         )
-    elif _age > 12:
+    elif _age > 2:
         st.warning(
-            f"관측 이력 창의 최신 데이터가 {_age:.0f}시간 전 값이다 — 갱신 경로가 "
-            "중단되었을 가능성이 있다(갱신 주기는 6시간이며, 스케줄 지연을 감안해 "
-            "12시간을 넘을 때만 이 경고를 띄운다). 차트의 '현재'는 "
-            "상단 헤더의 실시간 관측값이며, 아래 곡선은 이 창의 데이터로 그린다. "
-            "GitHub Actions의 Refresh deploy data 실행 이력을 확인해야 한다.",
+            f"관측 이력 창의 최신 데이터가 {_age:.1f}시간 전 값이다 — 갱신 경로가 "
+            "중단되었을 가능성이 있다(갱신 주기는 15분이며, ASOS 공개 지연과 "
+            "스케줄 지연을 감안해 2시간을 넘을 때만 이 경고를 띄운다). 차트의 "
+            "'현재'는 상단 헤더의 실시간 관측값이며, 아래 곡선은 이 창의 데이터로 "
+            "그린다. GitHub Actions의 Refresh deploy data 실행 이력(data 브랜치 "
+            "커밋 여부)을 확인해야 한다.",
             icon="⚠️",
         )
 
