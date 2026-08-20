@@ -14,6 +14,7 @@ st.metric의 help 툴팁으로 함께 표시한다 — "이 값이 왜 이렇게
 """
 import json
 import os
+import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -64,6 +65,20 @@ def _now_kst_naive() -> datetime:
 # (docker stats 실측, 2026-08-08). build_recent_window.py 가 미리 추려낸
 # 파일만 읽는다 — 배포 저장소에는 이 파일만 포함시키고 원본은 제외한다.
 HIST_FILES = ["./cache/recent_window.json"]
+
+# recent_window.json 을 로컬 디스크가 아니라 GitHub raw 로 직접 읽는다
+# (2026-08-20 — 재배포와 신선도 분리). refresh-data.yml 이 이제 main 이
+# 아니라 data 브랜치에 커밋한다 — Streamlit Cloud 는 main 만 감시하므로
+# data 브랜치에 15분마다 커밋해도 재배포가 안 걸린다. 대신 이 앱이 직접
+# 그 브랜치의 최신 파일을 끌어와야 신선도가 반영된다.
+#
+# 실패(네트워크 문제, 저장소 구조 변경 등)하면 로컬 디스크(HIST_FILES)로
+# 폴백한다 — 그건 이 앱이 마지막으로 재배포됐을 시점의 스냅숏이라 최신은
+# 아니지만, 완전히 끊기지는 않는다.
+RAW_WINDOW_URL = (
+    "https://raw.githubusercontent.com/yssong01/climate-forecast/data/"
+    "cache/recent_window.json"
+)
 
 st.set_page_config(
     page_title="Tri-CHEF 기후 모델 출력값",
@@ -149,10 +164,23 @@ def cached_predict(stn: str, obs_hour: str, lead_hours: int, _model, _ckpt) -> d
 @st.cache_data(ttl=300, show_spinner=False)
 def load_merged_history() -> dict:
     """
-    (관측소, 시각) → 레코드. collect_year.py/collect_incremental.py 가 만드는
-    두 캐시 파일을 합친다. 5분 캐시라 백그라운드 수집이 새 데이터를 채워도
-    페이지가 곧 따라잡는다 — 매 새로고침마다 두 JSON을 다시 읽지는 않는다.
+    (관측소, 시각) → 레코드. 5분 캐시라 data 브랜치가 그사이 더 갱신돼도
+    페이지가 곧 따라잡는다 — 매 새로고침마다 다시 받지는 않는다.
+
+    GitHub raw 를 먼저 시도하고, 실패하면 로컬 디스크로 폴백한다(위
+    RAW_WINDOW_URL 주석 참고). 이 함수 자체는 실측 여부를 판정하지 않는다
+    — status 필드를 그대로 전달할 뿐이며, "실측인가"는 이 데이터를 쓰는
+    쪽(weather_collector.is_real_observation 등)이 판단한다.
     """
+    try:
+        resp = requests.get(RAW_WINDOW_URL, timeout=8)
+        if resp.status_code == 200:
+            records = resp.json()
+            return {(r["stn"], r["timestamp"]): r for r in records}
+        print(f"[WARN] raw 창 조회 실패 HTTP {resp.status_code} — 로컬 폴백")
+    except Exception as e:
+        print(f"[WARN] raw 창 조회 실패({type(e).__name__}) — 로컬 폴백")
+
     merged = {}
     for path in HIST_FILES:
         if not os.path.exists(path):
