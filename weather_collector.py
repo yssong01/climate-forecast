@@ -533,7 +533,8 @@ class RobustWeatherCollector:
                     time.sleep(wait)
                     continue
                 else:
-                    print(f"[WARN] HTTP {resp.status_code}: {resp.text[:150]}")
+                    print(f"[WARN] HTTP {resp.status_code}: "
+                          f"{redact_secrets(resp.text[:150], self.api_key)}")
             except (requests.exceptions.ConnectTimeout,
                     requests.exceptions.ConnectionError) as e:
                 # 연결이 안 되는 것은 관측소를 바꾸거나 재시도해도 결과가
@@ -585,7 +586,8 @@ class RobustWeatherCollector:
             if "활용신청" in text or "403" in text:
                 print("[ERROR] 활용신청이 필요합니다. apihub.kma.go.kr → 마이페이지 → 지상관측 → API활용신청")
             else:
-                print(f"[WARN] 데이터 라인 없음. 응답: {text[:200]}")
+                print("[WARN] 데이터 라인 없음. 응답: "
+                      f"{redact_secrets(text[:200], self.api_key)}")
             return None
 
         vals = data_line.split()
@@ -759,4 +761,4 @@ if __name__ == "__main__":
     print(f"기압:     {data.get('pressure')} hPa")
 
     vec = collector.to_model_vector(data)
-    print(f"\n모델 입력 벡터 (12차원): {[round(v, 3) for v in vec]}")
+    print(f"\n모델 입력 벡터 (14차원): {[round(v, 3) for v in vec]}")

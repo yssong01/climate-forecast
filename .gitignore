@@ -1,6 +1,12 @@
 # 환경변수 / 비밀키
-.env
-.env.local
+# .env* 로 넓게 잡는다(2026-08-21) — .env.production 처럼 변형을 새로 만들면
+# 종전 규칙(.env, .env.local)에 안 걸려 그대로 커밋됐다. 공개 저장소라 한 번
+# 새면 되돌릴 수 없으므로 열거보다 패턴으로 막는다.
+.env*
+!.env.example
+# Streamlit 로컬 비밀 설정 — README 가 이 파일에 KMA_API_KEY 를 넣으라고
+# 안내하므로 반드시 제외한다.
+.streamlit/secrets.toml
 
 # Python
 __pycache__/

@@ -672,7 +672,7 @@ class TriCHEFPipeline(nn.Module):
 
         # Hurdle: P(비) × 강수량. softplus 단독으로는 못 냈던 정확한 0을
         # P(비)→0 극한에서 연속적으로 표현한다(위 head_rain 주석 참고).
-        # clamp(x,0,·) 대신 softplus 를 양(量) 헤드에 쓰는 이유는 여전히
+        # clamp(x,0,·) 대신 softplus 를 양(amount) 헤드에 쓰는 이유는 여전히
         # Phase 3-3 과 동일 — x<0 에서 gradient 0 이 되는 dying-clamp을
         # 피한다.
         _reg_in = (torch.cat([magnitude, v_z], dim=-1)

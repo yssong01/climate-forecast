@@ -1,6 +1,24 @@
+# 연구·확장용 의존성. 배포(requirements.txt)와 학습(requirements-app.txt)에는
+# 들어가지 않는다 — 여기 있는 것은 저장소에 코드가 남아 있으나 서빙 경로에서는
+# 쓰지 않는 선택적 경로다.
+#
+# 2026-08-21 정리: 폐기된 멀티모달 설계(음성·위성·RAG·강화학습·문서파싱)의
+# 잔재 7개를 걷어냈다 — openai-whisper·librosa·sentinelsat·chromadb·
+# stable-baselines3·gymnasium·pdfplumber. 저장소 전체에서 import 0건이었고,
+# 해당 축은 CLAUDE.md 5절이 "되돌릴 수 없는 결정"으로 서빙에서 제외했다.
+# Pillow·transformers 도 직접 import 가 없어 함께 제외했다.
+
 # 핵심 프레임워크
 torch>=2.2.0
+
+# 위성 인코더 — pipeline_model.py 의 compact=False 경로에서 지연 임포트한다.
+# 기여도가 정확히 0으로 실측돼 서빙에서는 쓰지 않으나, 재현을 위해 코드와
+# 함께 남겨둔다(CLAUDE.md 5절).
 torchvision>=0.17.0
+
+# 텍스트 인코더 — text_collector.py 가 지연 임포트한다. 현행 체크포인트는
+# im_dim=12 라 TendencyCollector 만 쓰므로 서빙에서는 읽히지 않는다.
+sentence-transformers>=3.0.0
 
 # 웹 대시보드
 streamlit>=1.35.0
@@ -12,25 +30,3 @@ numpy>=1.26.0
 pandas>=2.2.0
 requests>=2.31.0
 python-dotenv>=1.0.0
-
-# 텍스트 인코더 (Im 축 — Phase 3)
-sentence-transformers>=3.0.0
-transformers>=4.40.0
-
-# 음성 처리 (Phase 3)
-openai-whisper>=20240930
-librosa>=0.10.0
-
-# 위성 이미지 (Phase 3)
-sentinelsat>=1.3.0
-Pillow>=10.0.0
-
-# 벡터 DB / RAG (Phase 3)
-chromadb>=0.5.0
-
-# 강화학습 (Phase 3)
-stable-baselines3>=2.3.0
-gymnasium>=0.29.0
-
-# 문서 파싱 (Phase 3)
-pdfplumber>=0.11.0

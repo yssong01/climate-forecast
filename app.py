@@ -456,13 +456,22 @@ st.sidebar.caption(
 # refresh_deploy_data.py 가 이제 main 이 아니라 data 브랜치에 커밋하므로,
 # 로컬 디스크를 읽으면 재배포가 끊긴 뒤로 영원히 얼어붙은 값을 보여주게
 # 된다(recent_window.json 과 같은 이유, 위 RAW_WINDOW_URL 주석 참고).
-try:
+# 캐시를 씌운다(2026-08-21) — Streamlit 은 위젯 조작·자동 갱신마다 스크립트
+# 전체를 다시 돌리므로, 캐시 없이 모듈 최상단에서 호출하면 매 재실행이 최대
+# 8초(timeout) 동안 이 요청에 묶인다. 이 값은 하루 단위 집계라 5분 캐시로
+# 충분하다(같은 이유로 recent_window.json 도 ttl=300 을 쓴다).
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_usage_log() -> dict:
     resp = requests.get(
         "https://raw.githubusercontent.com/yssong01/climate-forecast/"
         "data/cache/api_usage_daily.json",
         timeout=8,
     )
-    _usage_log = resp.json() if resp.status_code == 200 else {}
+    return resp.json() if resp.status_code == 200 else {}
+
+
+try:
+    _usage_log = _fetch_usage_log()
     _today_kst = datetime.now(KST).strftime("%Y%m%d")
     if _usage_log.get("date") == _today_kst:
         st.sidebar.caption(
@@ -490,7 +499,7 @@ if not os.path.exists(CHECKPOINT):
 
 # API 연결이 막혔을 때 쓸 폴백 재료를 컬렉터에 등록한다(2026-08-19 추가).
 #
-# 저장소 창(recent_window.json)은 GitHub Actions(refresh-data.yml)가 2시간마다
+# 저장소 창(recent_window.json)은 GitHub Actions(refresh-data.yml)가 15분마다
 # 갱신하는 **실측**이고, 레코드 형식이 컬렉터 반환값과 동일하다. 등록해두면
 # 조회가 실패해도 컬렉터가 날조 상수(20.0°C/50%/1013hPa) 대신 이 실측으로
 # 내려간다 — 2026-08-19 Streamlit Cloud 발신 IP 가 막혔을 때 화면에 날조값이
@@ -1242,7 +1251,8 @@ with tab_extreme:
             "이전 모델에서는 부산 폭염에만 전용 임계값(0.33)을 적용했다. 현행 "
             "모델에서 재검증한 결과 부산 전용값의 순이득이 −0.0033으로 오히려 전역 "
             "0.5보다 나빠(부산 F1 0.574) 제거했다 — 검증을 통과하지 못한 예외는 "
-            "두지 않는다."
+            "두지 않는다. 반대로 전주(146) 한파는 같은 분리 검증에서 순이득 "
+            "+0.0689로 기준을 넘어 전용 임계값(0.33)을 적용 중이다(2026-08-19)."
         )
         st.caption(
             "호우(강수)는 이 탭에 게이지가 없다 — '출력값 추이' 탭의 강수량 값이 "
@@ -1467,9 +1477,9 @@ with tab_perf:
             "보정은 단조 증가 변환이지만 순증가는 아니다 — 등온 회귀 결과는 계단 "
             "모양이라 평탄 구간에서 서로 다른 확률이 같은 값으로 접힌다. 따라서 "
             "원본 임계값을 곡선으로 옮기는 것만으로는 판정이 보존되지 않는다. "
-            "폭염은 보존되어 옮긴 값을 그대로 쓰고, 한파는 F1이 0.4566에서 "
-            "0.4484로 떨어져 판정선을 보정 공간에서 다시 골랐다(0.4608, 순이득 "
-            "+0.0125). 재선정도 고르는 표본과 채점하는 표본을 분리한다."
+            "폭염은 보존되어 옮긴 값을 그대로 쓰고, 한파는 F1이 0.5054에서 "
+            "0.4948로 떨어져 판정선을 보정 공간에서 다시 골랐다(0.5071, 순이득 "
+            "+0.0124). 재선정도 고르는 표본과 채점하는 표본을 분리한다."
         )
         # 보정 전 열은 검증셋 전체(probability_calibration_check.py), 보정 후 열과
         # F1 은 평가용 절반(probability_calibration_fit.py)에서 잰 값이다. 두 열의
@@ -1478,15 +1488,18 @@ with tab_perf:
         # 으로 갈렸다. 헤드마다 다른 표본을 섞어 적은 것이 원인이었다).
         _rows = ["| 사건 | 보정 전 ECE | 보정 후 ECE | F1 변화 |", "|---|---|---|---|"]
         for _k, _ko, _e0, _e1, _f in (
+            # 승격할 때마다 사람이 갱신해야 하는 값이다 —
+            # `probability_calibration_fit.py`(--apply 없이 실행)의 요약표에서
+            # 그대로 옮긴다. 2026-08-21 한파 헤드 승격 후 재측정본.
             ("heatwave", "🔥 폭염", 0.0340, 0.0048, "0.8144 → 0.8144"),
-            ("coldwave", "🥶 한파", 0.0497, 0.0024, "0.4566 → 0.4608"),
+            ("coldwave", "🥶 한파", 0.0397, 0.0015, "0.5054 → 0.5071"),
         ):
             if _k in _cal:
                 _rows.append(f"| {_ko} | {_e0:.4f} | **{_e1:.4f}** | {_f} |")
         st.markdown("\n".join(_rows))
         st.caption(
             "ECE(Expected Calibration Error)는 구간별 '표시 확률 − 실제 빈도'의 "
-            "차이를 표본 수로 가중평균한 값이다. 0에 가까울수록 표시된 확률을 "
+            "차이를 표본 수로 가중평균한 값이다. 0에 가까울수록 "
             "표시값을 그대로 신뢰할 수 있다. 보정 전 열은 검증셋 전체에서, 보정 후 "
             "열과 F1은 곡선 적합에 쓰지 않은 평가용 절반에서 측정했다 — 표본이 "
             "달라 소수점 셋째 자리에서 차이가 날 수 있다."

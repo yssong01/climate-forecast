@@ -5,7 +5,7 @@ calibrated_threshold_check.py — 판정 임계값을 '보정 곡선으로 옮�
 배경(2026-08-17). `predict.event_threshold()`는 원본 임계값을 확률 보정
 곡선에 통과시켜 판정선으로 쓴다. 근거는 "보정은 단조 증가 함수이므로 순위가
 보존되고, 임계값도 같은 곡선으로 옮기면 판정이 그대로다"였다. 이 논리는
-곡선이 **순증가**일 때만 성립한다. 등장성 회귀(isotonic regression)의 결과는
+곡선이 **순증가**일 때만 성립한다. 등온 회귀(isotonic regression)의 결과는
 계단 모양이라 평탄 구간(plateau)을 갖는다 — 원본 확률이 서로 다른 표본들이
 같은 보정값으로 접힌다. 임계값이 그 평탄 구간 안에 떨어지면 구간 전체가
 한쪽으로 몰려 판정되므로, 실효 임계값이 의도한 위치에서 벗어난다.
@@ -37,7 +37,7 @@ from predict import CHECKPOINT, EXTREME_EVENT_THRESH, event_threshold
 KO = {"rain": "강수", "heatwave": "폭염", "coldwave": "한파", "dust": "황사"}
 
 # 서빙에서 보정을 적용하는 헤드만 본다 — 강수는 확률이 아니라 mm 로 나가고
-# 양(量) 헤드가 보정 전 확률과 곱해지도록 학습돼 서빙 경로에서 보정하지 않는다.
+# 양(amount) 헤드가 보정 전 확률과 곱해지도록 학습돼 서빙 경로에서 보정하지 않는다.
 SERVED_HEADS = ("heatwave", "coldwave", "dust")
 
 
