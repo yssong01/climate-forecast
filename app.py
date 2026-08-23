@@ -15,6 +15,7 @@ st.metric의 help 툴팁으로 함께 표시한다 — "이 값이 왜 이렇게
 import json
 import math
 import os
+import time
 import pandas as pd
 import requests
 from datetime import datetime, timedelta
@@ -163,26 +164,83 @@ def cached_predict(stn: str, obs_hour: str, lead_hours: int, _model, _ckpt) -> d
     return predict(stn=stn, model=_model, ckpt=_ckpt)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_merged_history() -> dict:
+@st.cache_resource(show_spinner=False)
+def _history_last_good_store() -> dict:
     """
-    (관측소, 시각) → 레코드. 5분 캐시라 data 브랜치가 그사이 더 갱신돼도
-    페이지가 곧 따라잡는다 — 매 새로고침마다 다시 받지는 않는다.
+    이 프로세스가 최근에 성공한 raw 조회 결과를 담아두는 그릇.
 
-    GitHub raw 를 먼저 시도하고, 실패하면 로컬 디스크로 폴백한다(위
+    cache_resource 라 프로세스 생애 동안 하나의 dict 객체가 유지된다 —
+    load_merged_history() 가 매 성공마다 이 안의 "data" 를 갈아 끼운다.
+    로컬 디스크 스냅숏(HIST_FILES)은 main 브랜치가 더 이상 갱신하지 않아
+    며칠씩 묵을 수 있는 반면, 이 값은 최악의 경우에도 "이 프로세스가 뜬
+    이후 raw 조회가 한 번이라도 성공했던 시점"까지만 묵는다 — 컨테이너가
+    오래 떠 있었다면 로컬 스냅숏보다 훨씬 최신일 가능성이 높다.
+    """
+    return {"data": None}
+
+
+def _fetch_raw_window(retries: int = 1, backoff_sec: float = 1.0) -> dict | None:
+    """RAW_WINDOW_URL 조회. 성공하면 dict, 모든 시도 실패 시 None.
+
+    재시도를 넣는 이유(2026-08-23) — Streamlit Cloud 의 발신 네트워크는
+    KMA API 쪽에서 이미 간헐적 타임아웃 이력이 있다(CLAUDE.md 4절).
+    raw.githubusercontent.com 도 같은 공유 네트워크를 타므로 순간적인
+    타임아웃 하나로 곧장 폴백까지 내려가지 않도록, 짧은 대기 후 한 번만
+    더 시도한다. 여러 번 재시도하지 않는 이유는 이 함수가 페이지 렌더링을
+    막고 있어(동기 호출) 과도한 재시도가 체감 지연으로 바로 이어지기
+    때문이다.
+    """
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(RAW_WINDOW_URL, timeout=8)
+            if resp.status_code == 200:
+                records = resp.json()
+                return {(r["stn"], r["timestamp"]): r for r in records}
+            print(f"[WARN] raw 창 조회 실패 HTTP {resp.status_code} "
+                  f"(시도 {attempt + 1}/{retries + 1})")
+        except Exception as e:
+            print(f"[WARN] raw 창 조회 실패({type(e).__name__}) "
+                  f"(시도 {attempt + 1}/{retries + 1})")
+        if attempt < retries:
+            time.sleep(backoff_sec)
+    return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_merged_history() -> tuple[dict, str]:
+    """
+    (관측소, 시각) → 레코드, 그리고 그 출처.
+    "raw"(정상) / "last_good_fallback"(이 프로세스의 마지막 성공값 재사용)
+    / "local_fallback"(그마저 없어 main 브랜치 스냅숏 사용) 중 하나다.
+    5분 캐시라 data 브랜치가 그사이 더 갱신돼도 페이지가 곧 따라잡는다 —
+    매 새로고침마다 다시 받지는 않는다.
+
+    GitHub raw 를 먼저 시도하고(재시도 1회 포함), 실패하면 이 프로세스가
+    마지막으로 성공했던 값으로, 그것도 없으면 로컬 디스크로 폴백한다(위
     RAW_WINDOW_URL 주석 참고). 이 함수 자체는 실측 여부를 판정하지 않는다
     — status 필드를 그대로 전달할 뿐이며, "실측인가"는 이 데이터를 쓰는
     쪽(weather_collector.is_real_observation 등)이 판단한다.
-    """
-    try:
-        resp = requests.get(RAW_WINDOW_URL, timeout=8)
-        if resp.status_code == 200:
-            records = resp.json()
-            return {(r["stn"], r["timestamp"]): r for r in records}
-        print(f"[WARN] raw 창 조회 실패 HTTP {resp.status_code} — 로컬 폴백")
-    except Exception as e:
-        print(f"[WARN] raw 창 조회 실패({type(e).__name__}) — 로컬 폴백")
 
+    출처를 함께 돌려주는 이유(2026-08-23) — 로컬 디스크(HIST_FILES)는
+    main 브랜치의 스냅숏이라, refresh-data.yml 이 data 브랜치로 옮겨간
+    이후로는 이 앱이 마지막 재배포됐을 시점에 영원히 멈춰 있다. raw 조회가
+    타임아웃·일시 오류로 단 한 번만 실패해도 이 폴백으로 조용히 넘어가고,
+    그 결과를 "data 브랜치 자체가 몇 시간 뒤처졌다"와 똑같은 문구로
+    보여주면 원인을 구분할 수 없다 — 실제로는 며칠 묵은 값일 수 있는데도.
+    호출부가 출처를 보고 경고 문구를 갈라 쓴다.
+    """
+    store = _history_last_good_store()
+
+    fetched = _fetch_raw_window()
+    if fetched is not None:
+        store["data"] = fetched
+        return fetched, "raw"
+
+    if store["data"] is not None:
+        print("[WARN] raw 창 조회 실패 — 이 프로세스의 마지막 성공값으로 대체")
+        return store["data"], "last_good_fallback"
+
+    print("[WARN] raw 창 조회 실패, 이 프로세스에 성공 기록 없음 — 로컬 폴백")
     merged = {}
     for path in HIST_FILES:
         if not os.path.exists(path):
@@ -190,7 +248,7 @@ def load_merged_history() -> dict:
         with open(path, "r", encoding="utf-8") as f:
             for r in json.load(f):
                 merged[(r["stn"], r["timestamp"])] = r
-    return merged
+    return merged, "local_fallback"
 
 
 def recent_series(history: dict, stn: str, hours: int = 72) -> list:
@@ -507,7 +565,7 @@ if not os.path.exists(CHECKPOINT):
 # 대상 관측소(Z축)뿐 아니라 이웃 보간(Re축)까지 실측으로 복원된다.
 #
 # load_merged_history() 는 5분 캐시라 여기서 먼저 불러도 추가 비용이 없다.
-set_offline_fallback(list(load_merged_history().values()))
+set_offline_fallback(list(load_merged_history()[0].values()))
 
 try:
     model, ckpt = get_model(ckpt_fingerprint())
@@ -959,19 +1017,49 @@ with tab_trend:
             "받지 않는다."
         )
 
-    history = load_merged_history()
+    history, history_source = load_merged_history()
     series = recent_series(history, stn, hours=72)
 
     # 관측 이력 창의 최신성을 명시한다. 배포 환경에서는 앱이 이 파일을
     # 유지할 수 없고(컨테이너 파일시스템 휘발), 저장소를 갱신하는
     # GitHub Actions(refresh-data.yml)가 유일한 공급자다. 그 경로가 끊기면
     # 차트가 원인 표시 없이 비어가는 대신 왜 비는지 화면에서 말하게 한다.
+    #
+    # 경고를 두 갈래로 나눈다(2026-08-23) — history_source 가
+    # "local_fallback"이면 원인이 "data 브랜치 자체가 뒤처짐"이 아니라
+    # "raw.githubusercontent.com 조회가 실패해 로컬 디스크로 대체됨"이다.
+    # 이 둘을 같은 문구로 보여주면 사람이 매번 원인을 추측해야 한다 —
+    # 로컬 폴백은 main 브랜치의 스냅숏이라 2026-08-20 이후로는 갱신되지
+    # 않고 재배포 시점에 멈춰 있으므로, "몇 시간 지연"이 아니라 "조회가
+    # 순간적으로 실패했다"는 훨씬 더 흔하고 훨씬 덜 걱정할 원인일 수 있다.
     _age = history_age_hours(history)
     if _age is None:
         st.warning(
             f"관측 이력 창(`{HIST_FILES[0]}`)이 비어 있다. 로컬 환경에서는 "
             "`python refresh_deploy_data.py`, 배포 환경에서는 GitHub Actions의 "
             "Refresh deploy data 워크플로(workflow)가 이 파일을 채운다.",
+            icon="⚠️",
+        )
+    elif _age > 2 and history_source == "local_fallback":
+        st.warning(
+            f"GitHub raw(`data` 브랜치) 관측 이력 창 조회가 재시도 후에도 실패해 "
+            f"로컬 디스크 스냅숏(`{HIST_FILES[0]}`)으로 대체했다 — 이 스냅숏의 "
+            f"최신 데이터는 {_age:.1f}시간 전 값이며, 이 프로세스가 뜬 이후 raw "
+            "조회가 한 번도 성공하지 못했다는 뜻이다. 배포 환경에서는 이 파일을 "
+            "refresh-data.yml이 더 이상 갱신하지 않는다(2026-08-20부터 data "
+            "브랜치 전용) — 마지막 재배포 시점에 멈춰 있으므로 갱신 경로 지연이 "
+            "아니라 이 조회 자체가 실패하고 있다는 뜻이다. 다음 자동 새로고침(5분 "
+            "캐시)에서 raw 조회가 다시 성공하면 정상화된다 — 반복되면 Streamlit "
+            "Cloud 에서 raw.githubusercontent.com 접근 자체를 점검해야 한다.",
+            icon="⚠️",
+        )
+    elif _age > 2 and history_source == "last_good_fallback":
+        st.warning(
+            f"GitHub raw 관측 이력 창 조회가 재시도 후에도 실패해 이 프로세스가 "
+            f"마지막으로 성공했던 값을 대신 쓰고 있다 — 그 값도 이제 {_age:.1f}시간 "
+            "전 것이다. 최근 성공 기록조차 이만큼 묵었다는 것은 순간적인 blip이 "
+            "아니라 raw 조회가 상당 시간 계속 실패 중이라는 뜻이다 — Streamlit "
+            "Cloud 에서 raw.githubusercontent.com 접근을 점검해야 한다.",
             icon="⚠️",
         )
     elif _age > 2:
