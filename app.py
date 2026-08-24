@@ -1163,12 +1163,42 @@ with tab_trend:
         fig.update_yaxes(rangemode="nonnegative", row=2, col=1)   # 습도
         fig.update_yaxes(rangemode="nonnegative", row=2, col=2)   # 기압
 
+        # 세로축 눈금 간격을 표시 범위에 맞춰 계산한다(2026-08-25) — 예전에는
+        # 넷 다(강수는 명시적으로, 나머지는 Plotly 자동선택이 우연히) 0.5
+        # 근처에 머물러, 값 변동폭이 커지면 눈금이 촘촘히 밀집됐다. 범위가
+        # 좁으면 축별 최소 간격(min_step)을 쓰고, 넓어지면 1·2·5 배수로 키운다.
+        def _nice_dtick(vmin, vmax, min_step, target_ticks=6):
+            raw_step = max(vmax - vmin, 0.0) / target_ticks
+            if raw_step <= min_step:
+                return min_step
+            magnitude = 10 ** math.floor(math.log10(raw_step))
+            for mult in (1, 2, 5, 10):
+                step = mult * magnitude
+                if step >= raw_step:
+                    return step
+            return 10 * magnitude
+
+        _temp_vals = list(temps) + [f6["temperature"]]
+        if result_12h is not None:
+            _temp_vals.append(f12["temperature"])
+        fig.update_yaxes(
+            dtick=_nice_dtick(min(_temp_vals), max(_temp_vals), 0.5), row=1, col=1)
+        fig.update_yaxes(
+            dtick=_nice_dtick(min(hums, default=0.0), max(hums, default=0.0), 5),
+            row=2, col=1)
+        fig.update_yaxes(
+            dtick=_nice_dtick(min(press, default=0.0), max(press, default=0.0), 1),
+            row=2, col=2)
+
         # 강수 축은 하한을 -0.1로 살짝 내려 막대·별 심벌이 0선에 바로 붙지
-        # 않게 하고(2026-08-20), 눈금 간격은 0.5로 고정한다. 상한은 실제 표시
-        # 데이터(실측 막대 + 예측 별, +12h 포함)에 맞춰 0.5 배수로 자동 계산한다.
+        # 않게 한다(2026-08-20). 상한은 실제 표시 데이터(실측 막대 + 예측 별,
+        # +12h 포함)에 맞춰 0.5 배수로 자동 계산하고, 눈금 간격도 그 범위에
+        # 맞춰 커진다 — 큰 비가 와도 눈금이 촘촘해지지 않는다.
         _prec_max = max(_prec_vals) if _prec_vals else 0.0
         _prec_upper = max(0.5, math.ceil((_prec_max + 0.05) / 0.5) * 0.5)
-        fig.update_yaxes(range=[-0.1, _prec_upper], dtick=0.5, row=1, col=2)
+        fig.update_yaxes(
+            range=[-0.1, _prec_upper], dtick=_nice_dtick(0.0, _prec_upper, 0.5),
+            row=1, col=2)
         st.plotly_chart(fig, width="stretch")
         _star_caption = (
             f"선과 막대는 실측값이다 — 최근 72시간 중 관측이 있는 {len(series)}개 "
