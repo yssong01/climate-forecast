@@ -30,7 +30,7 @@ import numpy as np
 
 import eval_cache
 from predict import (CHECKPOINT, EXTREME_EVENT_THRESH, calibrate_prob,
-                     event_threshold, PRECIP_CLIP_THRESH)
+                     event_threshold, PRECIP_PROB_GATE, PRECIP_PROB_GATE_BY_LEAD)
 
 OUT_PNG = "./docs/images/metrics_report.png"
 OUT_JSON = "./cache/metrics_report.json"
@@ -73,7 +73,7 @@ def reliability(prob, label, n_bins=10):
     return rows, float(ece), float(mce), brier
 
 
-def accuracy_block(d):
+def accuracy_block(d, ckpt=None):
     """① 정확도 — 회귀. 기준선은 반드시 같은 표본에서 계산한다."""
     tp_, tt = d["temp_pred"], d["temp_true"]
     pp, pt = d["precip_pred"], d["precip_true"]
@@ -82,9 +82,16 @@ def accuracy_block(d):
     precip_mae = float(np.abs(pp - pt).mean())
     precip_naive = float(np.abs(pt).mean())                    # 상시 0mm
 
-    # 서빙 후처리(0.2mm 미만 → 0)를 반영한 값도 함께 잰다 — 문서의 MAE 는
-    # 후처리 전 값이라, 화면에 실제로 나가는 값과 다르다는 점을 드러낸다.
-    pp_served = np.where(pp < PRECIP_CLIP_THRESH, 0.0, pp)
+    # 서빙 후처리(rain_prob < PRECIP_PROB_GATE 면 0)를 반영한 값도 함께
+    # 잰다 — 문서의 MAE 는 후처리 전 값이라, 화면에 실제로 나가는 값과
+    # 다르다는 점을 드러낸다. 2026-08-29부터 매그니튜드(mm) 임계값 대신
+    # 확률 공간에서 게이팅한다(predict.py PRECIP_PROB_GATE 주석 참고,
+    # precip_prob_gate_sweep.py 실측 근거). 게이트 값은 리드타임마다 다르게
+    # 선정했으므로(+6h/+12h 분포가 달라 공유 상수를 쓰면 안 됨, predict.py
+    # 주석 참고) 체크포인트의 lead_hours 로 고른다.
+    prob_gate = (PRECIP_PROB_GATE_BY_LEAD.get(ckpt.get("lead_hours"), PRECIP_PROB_GATE)
+                 if ckpt is not None else PRECIP_PROB_GATE)
+    pp_served = np.where(d["rain_prob"] < prob_gate, 0.0, pp)
     precip_mae_served = float(np.abs(pp_served - pt).mean())
 
     hit_temp = float((np.abs(tp_ - tt) <= HIT_TEMP_TOL).mean())
@@ -315,7 +322,7 @@ def main():
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
     d = eval_cache.load(args.ckpt, args.batch)
 
-    acc = accuracy_block(d)
+    acc = accuracy_block(d, ckpt)
     pre = precision_block(d, ckpt)
     cal = calibration_block(d, ckpt)
     print_report(acc, pre, cal)

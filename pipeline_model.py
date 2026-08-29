@@ -77,6 +77,37 @@ def _pairwise_abs_cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return F.cosine_similarity(a, b, dim=-1).abs().mean().item()
 
 
+def hurdle_gamma_median(p: torch.Tensor, alpha: torch.Tensor, rate: torch.Tensor) -> torch.Tensor:
+    """허들 혼합분포(Y=0 확률 1-p, Y~Gamma(alpha,rate) 확률 p, x>0)의 중앙값.
+
+    2026-08-18 Gamma NLL 실험이 −147.5%로 실패한 원인은 최종 점추정으로
+    p×E[Y|wet](조건부 평균)을 썼기 때문이다 — 이는 0에 확률질량이 몰린
+    혼합분포에서 절대오차(MAE)를 최소화하는 점추정이 아니다. MAE 최적
+    점추정은 중앙값이며, 닫힌 형태는 다음과 같다(gamma_median_test.py 에서
+    몬테카를로 대조로 검증, 최대 상대오차 0.2%):
+      F(x) = (1-p) + p·Gamma_CDF(x) 이므로
+      p ≤ 0.5 → 중앙값 0 (F(0)=1-p 가 이미 0.5 이상)
+      p > 0.5 → Gamma_분위수함수(1 - 0.5/p; alpha, rate)
+
+    torch.special 에는 Gamma 분위수함수(불완전감마함수의 역함수)가 없어
+    scipy.special.gammaincinv 로 CPU에서 계산한다 — 미분 가능성이 필요
+    없는 순수 점추정 후처리이므로(NLL 손실은 이 함수를 거치지 않고
+    log_prob 로 직접 계산된다) 문제되지 않는다.
+
+    scipy는 지연 임포트한다(torchvision과 같은 이유 — 위 SatelliteEncoder
+    주석 참고) — precip_gamma_nll=False(기본값, 배포 체크포인트)면 이
+    함수 자체가 호출되지 않는데, 모듈 상단에서 무조건 import하면 scipy가
+    requirements.txt(Streamlit Cloud 배포판, 최소 의존성 원칙)에 없어
+    predict.py→pipeline_model.py 임포트 체인 전체가 깨진다.
+    """
+    from scipy.special import gammaincinv
+    device = p.device
+    q = torch.clamp(1.0 - 0.5 / p.clamp(min=1e-6), min=1e-6, max=1.0 - 1e-6)
+    x = gammaincinv(alpha.detach().cpu().numpy(), q.detach().cpu().numpy())
+    cont_median = torch.as_tensor(x, dtype=p.dtype, device=device) / rate
+    return torch.where(p <= 0.5, torch.zeros_like(p), cont_median)
+
+
 def _head_layers(in_dim: int, dropout: float = 0.0, out_dim: int = 1) -> list:
     """
     헤드 공통 층 구성. dropout>0 일 때만 Dropout 을 끼운다.
@@ -685,10 +716,22 @@ class TriCHEFPipeline(nn.Module):
             mu    = F.softplus(_precip_out[:, 0:1]) + 1e-6
             alpha = F.softplus(_precip_out[:, 1:2]) + 1e-3
             self._last_precip_mu, self._last_precip_alpha = mu, alpha
-            amount = mu
+            if self.training:
+                # 학습 중엔 이 열이 손실 계산에 쓰이지 않는다(train.py 가
+                # _last_precip_mu/_last_precip_alpha 로 NLL을 직접 계산) —
+                # 그런데도 매 스텝 scipy CPU 왕복을 시키면 학습 루프만
+                # 느려진다. 저렴하지만 틀린 값(곱셈 점추정)으로 채워
+                # forward() shape만 맞춘다.
+                precip_pred = rain_prob * mu
+            else:
+                # 추론/검증 시점엔 hurdle_gamma_median() 이 계산하는 올바른
+                # (MAE 최적) 점추정을 쓴다 — 위 함수 docstring 참고.
+                rate = alpha / mu
+                precip_pred = hurdle_gamma_median(rain_prob.squeeze(-1), alpha.squeeze(-1),
+                                                   rate.squeeze(-1)).unsqueeze(-1)
         else:
             amount = F.softplus(self.head_precip(_reg_in))
-        precip_pred = rain_prob * amount
+            precip_pred = rain_prob * amount
 
         # 극한기상 경보 확률 — 회귀 출력(temp_pred/precip_pred)과 별개로
         # 학습·추론 시 model._last_*_logit / extreme_event_probs() 로 읽는다.

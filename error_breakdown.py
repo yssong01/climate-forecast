@@ -25,7 +25,7 @@ import os
 import numpy as np
 
 import eval_cache
-from predict import CHECKPOINT, PRECIP_CLIP_THRESH
+from predict import CHECKPOINT, PRECIP_PROB_GATE, PRECIP_PROB_GATE_BY_LEAD
 
 OUT_PNG = "./docs/images/error_breakdown.png"
 OUT_JSON = "./cache/error_breakdown.json"
@@ -111,25 +111,30 @@ def print_table(title, rows, unit, total_gap):
           f"{sum(r['contrib_gap'] for r in rows):>+11.5f}")
 
 
-def clip_sweep(pp_raw, pt, seed=1234, n_grid=61):
-    """후처리 클리핑 임계값을 재산출한다.
+def gate_sweep(pp_raw, pt, rain_prob, current_tau, seed=1234, n_grid=61):
+    """강수 후처리 게이팅 임계값을 재산출한다.
 
-    무강수 구간이 격차의 대부분을 만든다면, 그 구간의 미세 출력을 0으로
-    반올림하는 임계값이 얼마여야 하는지가 직접적인 처방이 된다. 다만 검증셋
-    전체에서 고르고 같은 데이터로 채점하면 허수가 섞이므로, 임계값 선정
-    규약과 동일하게 보정용/평가용을 나누고 순이득이 기준에 못 미치면
-    채택하지 않는다(`threshold_validation.py` 참고).
+    2026-08-29 이전에는 rain_prob×amount 곱 자체를 매그니튜드(mm) 임계값으로
+    잘랐다 — 그러면 강수 발생 판정 F1(같은 곱을 0.1mm로 이진화한 값)과 knob이
+    묶여, MAE를 이기려고 임계값을 올리면 F1이 무너졌다(t=2.95에서 F1
+    0.430→0.103, 이 함수의 이전 버전인 clip_sweep()의 실측). rain_prob 자체에
+    별도 임계값을 걸면(매그니튜드와 분리) 이 트레이드오프가 사라진다는 것을
+    precip_prob_gate_sweep.py 가 먼저 확인했고, 여기서도 같은 결과가 재현되는지
+    검산한다. 임계값 선정 규약과 동일하게 보정용/평가용을 나누고 채점한다
+    (`threshold_validation.py` 참고).
     """
     rng = np.random.RandomState(seed)
     m = rng.rand(len(pt)) < 0.5
-    grid = np.linspace(0.0, 3.0, n_grid)
+    grid = np.linspace(0.0, 0.99, n_grid)
 
-    def mae(t, sel):
-        return float(np.abs(np.where(pp_raw[sel] < t, 0.0, pp_raw[sel]) - pt[sel]).mean())
+    def mae(tau, sel):
+        gated = np.where(rain_prob[sel] < tau, 0.0, pp_raw[sel])
+        return float(np.abs(gated - pt[sel]).mean())
 
-    def wet_f1(t, sel):
+    def wet_f1(tau, sel):
         """강수 발생 판정(0.1mm 기준)의 F1 — MAE 최적화가 이 능력을 없애는지 본다."""
-        pred = np.where(pp_raw[sel] < t, 0.0, pp_raw[sel]) >= 0.1
+        gated = np.where(rain_prob[sel] < tau, 0.0, pp_raw[sel])
+        pred = gated >= 0.1
         true = pt[sel] >= 0.1
         tp = int((pred & true).sum()); fp = int((pred & ~true).sum())
         fn = int((~pred & true).sum())
@@ -137,19 +142,24 @@ def clip_sweep(pp_raw, pt, seed=1234, n_grid=61):
         r = tp / (tp + fn) if tp + fn else 0.0
         return 2 * p * r / (p + r) if p + r else 0.0
 
-    best_t = min(grid, key=lambda t: mae(t, m))
+    # 채택 기준은 precip_prob_gate_sweep.py 와 동일 — F1을 현행(τ=current_tau)
+    # 이상으로 유지하는 후보 중 MAE가 최소인 값. 순수 MAE 최솟값을 그대로
+    # 쓰면 F1을 해치는 절벽 쪽으로 끌리기 때문이다.
+    f1_current = wet_f1(current_tau, m)
+    candidates = [t for t in grid if wet_f1(t, m) >= f1_current]
+    best_t = min(candidates, key=lambda t: mae(t, m)) if candidates else current_tau
     base = float(np.abs(pt[~m]).mean())
     return {
-        "current": PRECIP_CLIP_THRESH,
+        "current": current_tau,
         "picked": float(best_t),
-        "eval_mae_current": mae(PRECIP_CLIP_THRESH, ~m),
+        "eval_mae_current": mae(current_tau, ~m),
         "eval_mae_picked": mae(best_t, ~m),
         "eval_mae_raw": mae(0.0, ~m),
         "eval_baseline": base,
         # MAE 만 보면 "거의 항상 0" 이 이긴다 — 표본의 93.8% 가 무강수이기
         # 때문이다. 그 해가 강수 발생 판정을 없애버리는지 함께 잰다.
         "wet_f1_raw": wet_f1(0.0, ~m),
-        "wet_f1_current": wet_f1(PRECIP_CLIP_THRESH, ~m),
+        "wet_f1_current": wet_f1(current_tau, ~m),
         "wet_f1_picked": wet_f1(best_t, ~m),
         "n_calib": int(m.sum()), "n_eval": int((~m).sum()),
     }
@@ -216,13 +226,17 @@ def main():
     ap.add_argument("ckpt", nargs="?", default=CHECKPOINT)
     ap.add_argument("--batch", type=int, default=eval_cache.DEFAULT_BATCH)
     ap.add_argument("--served", action="store_true",
-                    help="서빙 후처리(0.2mm 미만 → 0)를 적용한 값으로 분해한다")
+                    help="서빙 후처리(rain_prob < PRECIP_PROB_GATE 면 0)를 적용한 값으로 분해한다")
     args = ap.parse_args()
+
+    import torch
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+    prob_gate = PRECIP_PROB_GATE_BY_LEAD.get(ckpt.get("lead_hours"), PRECIP_PROB_GATE)
 
     d = eval_cache.load(args.ckpt, args.batch)
     pp = d["precip_pred"]
     if args.served:
-        pp = np.where(pp < PRECIP_CLIP_THRESH, 0.0, pp)
+        pp = np.where(d["rain_prob"] < prob_gate, 0.0, pp)
     pt, tp_, tt = d["precip_true"], d["temp_pred"], d["temp_true"]
 
     err_p_model = np.abs(pp - pt)
@@ -267,31 +281,32 @@ def main():
           f"{totals['precip_gap']:+.6f} — "
           f"{'일치' if abs(chk - totals['precip_gap']) < 1e-6 else '★불일치★'}")
 
-    # ── 후처리 임계값 재산출 ─────────────────────────────────
-    sw = clip_sweep(d["precip_pred"], pt)
+    # ── 후처리 게이팅 임계값 재산출 ───────────────────────────
+    sw = gate_sweep(d["precip_pred"], pt, d["rain_prob"], prob_gate)
     gain = sw["eval_mae_current"] - sw["eval_mae_picked"]
-    print(f"\n{'─' * 92}\n  후처리 클리핑 임계값 재산출 "
+    print(f"\n{'─' * 92}\n  후처리 확률 게이팅 임계값 재산출 "
           f"(보정용 {sw['n_calib']:,} / 평가용 {sw['n_eval']:,})\n{'─' * 92}")
     print(f"  {'설정':<22}{'평가용 MAE':>12}{'기준선 대비':>12}{'강수 발생 F1':>14}")
     for tag, t, mae_v, f1_v in (
-            ("후처리 없음(t=0)", 0.0, sw["eval_mae_raw"], sw["wet_f1_raw"]),
-            (f"현행 t={sw['current']:.2f}", sw["current"],
+            ("후처리 없음(τ=0)", 0.0, sw["eval_mae_raw"], sw["wet_f1_raw"]),
+            (f"현행 τ={sw['current']:.2f}", sw["current"],
              sw["eval_mae_current"], sw["wet_f1_current"]),
-            (f"보정용 선정 t={sw['picked']:.2f}", sw["picked"],
+            (f"보정용 선정 τ={sw['picked']:.2f}", sw["picked"],
              sw["eval_mae_picked"], sw["wet_f1_picked"])):
         print(f"  {tag:<22}{mae_v:>12.4f}"
               f"{(mae_v / sw['eval_baseline'] - 1) * 100:>11.1f}%{f1_v:>14.3f}")
     f1_drop = sw["wet_f1_current"] - sw["wet_f1_picked"]
     print(f"\n  MAE 순이득 {gain:+.5f}mm · 강수 발생 F1 변화 {-f1_drop:+.3f}")
-    if gain > 1e-4 and f1_drop > 0.02:
-        print("  판정: 채택하지 않는다 — MAE 이득이 '거의 항상 0'으로 기준선을")
-        print("        흉내 내서 얻어진 것이고, 그 대가로 강수 발생 판정이 무너진다.")
-        print("        표본의 93.8%가 무강수라 MAE 단독 최적화는 이 방향으로 끌린다.")
+    # gate_sweep() 이 이미 "F1이 현행 이상인 후보 중 MAE 최소"로 골랐으므로,
+    # 여기서 F1이 떨어지면 그 자체가 이상 신호다(선정 로직 결함 의심).
+    if f1_drop > 1e-6:
+        print("  주의: F1 유지 제약을 걸었는데도 F1이 떨어짐 — gate_sweep() 선정")
+        print("        로직이나 분할 시드를 재점검할 것.")
     elif gain > 1e-4:
-        print("  판정: 검토 대상 — 발생 판정을 크게 해치지 않으면서 MAE가 개선된다.")
+        print("  판정: 검토 대상 — 발생 판정을 해치지 않으면서 MAE가 개선된다.")
     else:
         print("  판정: 현행 유지.")
-    out["clip_sweep"] = sw
+    out["gate_sweep"] = sw
 
     plot(precip_rows, temp_rows, totals, OUT_PNG)
     os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)

@@ -41,7 +41,8 @@ from weather_collector import (
     connection_state, network_env_report, redact_secrets,
 )
 from predict import (
-    load_model, predict, CHECKPOINT, event_threshold, PRECIP_CLIP_THRESH,
+    load_model, predict, CHECKPOINT, event_threshold,
+    PRECIP_PROB_GATE, PRECIP_PROB_GATE_BY_LEAD,
 )
 import accuracy
 
@@ -1291,7 +1292,10 @@ with tab_trend:
     st.caption(
         "기온은 '현재 기온 대비 변화량(Δ)'을 더한 값이고, 강수는 강수 확률과 "
         "강수량 추정치를 곱한 값이다(허들(Hurdle) 구조 — '모델 구조' 탭에 상세 "
-        f"설명). {PRECIP_CLIP_THRESH}mm 미만은 0으로 반올림한다. '±' 뒤 숫자는 "
+        f"설명). 강수 확률이 +6시간은 {PRECIP_PROB_GATE_BY_LEAD[6]:.0%}, "
+        f"+12시간은 {PRECIP_PROB_GATE_BY_LEAD[12]:.0%} 미만이면 강수량을 0으로 "
+        "반올림한다(리드타임마다 확률 분포가 달라 임계값을 따로 골랐다). "
+        "'±' 뒤 숫자는 "
         "검증셋 평균절대오차(MAE)이며 이 예측 1건의 신뢰구간이 아니다. 빨간 "
         "글자는 현재 대비 상승, 초록 글자는 하강 전망이다. 열 제목 색은 위 "
         "차트의 별 색과 같다 — 주황이 꽉 찬 별(+6시간), 보라가 속 빈 "
@@ -1952,8 +1956,13 @@ with tab_model:
         "수렴한다. \"강수 발생 여부\"와 \"발생 시 강수량\"을 하나의 수식에 담는 "
         "구조이며, 무강수가 대부분인 데이터에서 정확한 0을 산출하기 위한 "
         "장치다.\n"
-        f"- 마지막으로 {PRECIP_CLIP_THRESH}mm 미만은 0으로 반올림한다(미세 "
-        f"노이즈 억제)."
+        f"- 마지막으로 강수 확률이 "
+        f"{PRECIP_PROB_GATE_BY_LEAD.get(ckpt.get('lead_hours'), PRECIP_PROB_GATE):.0%} "
+        "미만이면 강수량을 0으로 반올림한다(리드타임마다 확률 분포가 달라 "
+        "체크포인트별로 임계값을 따로 골랐다 — 위 표 캡션 참고) — 매그니튜드"
+        "(mm) 임계값 대신 확률 자체로 자르면 강수 발생 판정 F1을 해치지 "
+        "않으면서 무강수 구간의 잔여 오차를 줄일 수 있음을 실측했다"
+        "(precip_prob_gate_sweep.py, 2026-08-29)."
     )
 
     st.markdown("---")

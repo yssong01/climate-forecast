@@ -43,12 +43,30 @@ from train import record_to_vec, STATION_NAMES
 CHECKPOINT = os.getenv("CHECKPOINT_PATH", "./checkpoints/numerical_trichef.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 강수 후처리 클리핑 — precip_breakdown.py 실측: 극한기상 헤드가 늘어날수록
-# (폭염→한파→황사) 공유 magnitude 표현을 두고 헤드들이 경쟁하면서 Hurdle의
-# 무강수 억제력이 약해졌다. EXTREME_BCE_WEIGHT 하향(1.0→0.3, train.py)으로
-# 근본 원인을 완화했지만(-25.6%→-19.3%), 남은 손해를 이 클리핑으로 마저
-# 줄인다.
-PRECIP_CLIP_THRESH = 0.2  # mm — 이 미만 예측은 0으로 반올림
+# 강수 후처리 게이팅 — precip_prob_gate_sweep.py 실측(2026-08-29, 검증셋
+# 평가용 절반·보정용 절반 분리): 매그니튜드(mm) 임계값은 강수 발생 판정
+# F1과 같은 knob을 공유해(둘 다 rain_prob×amount 곱을 자름) MAE를 올리려
+# 임계값을 키우면 F1이 무너졌다(t=2.95에서 F1 0.430→0.103, README
+# '후처리 임계값을 올리면 이기지만, 채택하지 않는다' 참고). rain_prob 자체에
+# 별도 임계값을 걸면(매그니튜드와 분리) F1·MAE가 동시에 개선되는 구간을
+# 찾았다. τ가 오를수록 정밀도↑재현율↓ 트레이드오프가 있고, F1이 다시
+# 기준선 아래로 꺾이는 절벽이 있어 절벽에서 떨어진 값을 쓴다.
+#
+# +6h 체크포인트에서 고른 값(0.85)을 +12h에 그대로 쓰면 안 된다 — rain_prob
+# 분포 자체가 리드타임마다 달라서(+12h는 90백분위가 0.75에 그침) 같은
+# 상수가 그 체크포인트에서는 F1을 오히려 깎았다(0.3560→0.3497, 실측). 두
+# 체크포인트 모두 독립적으로 보정용/평가용 분할에서 재선정했다(규약 9번 —
+# 헤드를 다시 조정하면 그 시점 표본에서 임계값도 다시 고른다).
+#   +6h  — 평가용 F1 0.4296→0.4637, MAE 기준선 대비 +5.9%→+3.8%
+#   +12h — 평가용 F1 0.3591→0.3805, MAE 기준선 대비 +17.7%→+17.2%
+PRECIP_PROB_GATE_BY_LEAD = {6: 0.85, 12: 0.75}
+PRECIP_PROB_GATE = PRECIP_PROB_GATE_BY_LEAD[6]  # lead_hours 미상일 때 기본값
+
+# 구버전 체크포인트(Phase 3-7 hurdle 헤드 도입 전, head_rain 없음) 호환용
+# 폴백 — extreme_event_probs()["rain"] 이 None이면 rain_prob 게이팅을 쓸 수
+# 없으므로 예전 매그니튜드 클리핑으로 되돌아간다(precip_breakdown.py 실측
+# 근거는 그대로 유효).
+PRECIP_CLIP_THRESH = 0.2  # mm — head_rain 없는 구버전 체크포인트 전용 폴백
 
 # 극한기상 헤드 판정 임계값 — threshold_validation.py 재실측(2026-08-17,
 # signed seed7 체크포인트 기준: 13년·그룹분할·14차원·극한기상 헤드에 부호
@@ -304,13 +322,28 @@ def predict(stn: str = "108",
 
     temp_pred   = pred[0, 0].item()
     precip_pred = max(0.0, pred[0, 1].item())
-    if precip_pred < PRECIP_CLIP_THRESH:
-        precip_pred = 0.0
-    gate = model.axis_weights()   # dynamic_gate=False 면 {"alpha":..,"phi":..}
 
     # Phase 3-8/3-9 극한기상 확률 — 구버전 체크포인트(헤드 추가 전)는
     # extreme_event_probs() 가 전부 None 을 반환하므로 결과에서 빠진다.
     extreme = model.extreme_event_probs()
+
+    # 강수 후처리 게이팅 — rain_prob 이 있으면(head_rain 도입 이후 체크포인트)
+    # 그 확률 공간에서 자르고, 없으면(구버전) 매그니튜드로 폴백한다. rain_prob
+    # 은 보정하지 않은 원본 값을 그대로 쓴다 — 강수 헤드에는 확률 보정을
+    # 적용하지 않는다(README '확률 보정' 절, 회귀 헤드라 곱셈 구조가 보정
+    # 전 확률과 맞물려 학습됐기 때문).
+    if extreme["rain"] is not None:
+        rain_prob = extreme["rain"][0].item()
+        prob_gate = PRECIP_PROB_GATE_BY_LEAD.get(ckpt.get("lead_hours"), PRECIP_PROB_GATE)
+        if rain_prob < prob_gate:
+            precip_pred = 0.0
+    else:
+        rain_prob = None
+        if precip_pred < PRECIP_CLIP_THRESH:
+            precip_pred = 0.0
+
+    gate = model.axis_weights()   # dynamic_gate=False 면 {"alpha":..,"phi":..}
+
     # 확률 보정을 여기서 적용한다 — 호출자(app.py·CLI)가 받는 값이 곧 화면에
     # 나가므로, 보정되지 않은 값이 밖으로 새어 나가지 않게 한 곳에서 처리한다.
     heatwave_prob = (calibrate_prob(extreme["heatwave"][0].item(), "heatwave", ckpt)
