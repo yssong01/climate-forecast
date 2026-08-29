@@ -163,23 +163,32 @@ def part2_advection(stns, precip, hour_idx):
 
     lag_grid = list(range(0, 13))
     best = []
+    # 시차별 (src, tgt) 인덱스 쌍은 hour_idx 와 lag 에만 의존하고 관측소
+    # 쌍(i, j)과는 무관하다 — 루프 안에서 만들면 132쌍 × 13시차 = 1,716번
+    # 똑같은 계산을 반복한다(실제 필요량의 132배). 한 번만 만들어 재사용한다.
+    lag_pairs = {}
+    for lag in lag_grid:
+        src, tgt = [], []
+        for t, h in enumerate(hour_idx):
+            t2 = pos.get(h + lag)
+            if t2 is not None:
+                src.append(t)
+                tgt.append(t2)
+        lag_pairs[lag] = (np.array(src), np.array(tgt))
+
     for i in range(S):
         for j in range(S):
             if i == j:
                 continue
             d = haversine(STATION_COORDS[stns[i]], STATION_COORDS[stns[j]])
             b = bearing(STATION_COORDS[stns[i]], STATION_COORDS[stns[j]])
-            curve = []
-            for lag in lag_grid:
-                src, tgt = [], []
-                for t, h in enumerate(hour_idx):
-                    t2 = pos.get(h + lag)
-                    if t2 is not None:
-                        src.append(t)
-                        tgt.append(t2)
-                r = corr_pair(wet[np.array(src), i], wet[np.array(tgt), j])
-                curve.append(r)
-            curve = np.array(curve)
+            curve = np.array([
+                corr_pair(wet[lag_pairs[lag][0], i], wet[lag_pairs[lag][1], j])
+                for lag in lag_grid])
+            # 유효 표본이 모자라 전 시차가 NaN 이면 nanargmax 가 ValueError 로
+            # 죽는다 — 그 쌍은 건너뛴다(2026-08-29 가드 추가).
+            if np.all(np.isnan(curve)):
+                continue
             k = int(np.nanargmax(curve))
             best.append(dict(i=i, j=j, d=d, b=b, lag=lag_grid[k], r=float(curve[k]),
                              r0=float(curve[0])))
@@ -208,24 +217,18 @@ def part2_advection(stns, precip, hour_idx):
         print(f"  {STATION_NAMES[stns[x['i']]] + '→' + STATION_NAMES[stns[x['j']]]:<16}"
               f"{x['d']:8.0f}{x['b']:7.0f}{x['lag']:10d}{x['r']:9.3f}{x['r0']:9.3f}")
 
-    # 방향 비대칭 vs 동향 성분 — 표본이 66쌍뿐이라 min_n 을 낮춰 계산한다.
-    lookup = {(x["i"], x["j"]): x for x in best}
+    # 방향 비대칭 vs 동향 성분. 여기 쓰는 인덱스 쌍은 위에서 이미 만든
+    # lag_pairs[LEAD_HOURS] 와 같다 — 66쌍마다 다시 만들지 않고 재사용한다.
+    src, tgt = lag_pairs[LEAD_HOURS]
     a_vals, e_vals = [], []
     for i in range(S):
         for j in range(i + 1, S):
-            f, r = lookup[(i, j)], lookup[(j, i)]
-            src, tgt = [], []
-            for t, h in enumerate(hour_idx):
-                t2 = pos.get(h + LEAD_HOURS)
-                if t2 is not None:
-                    src.append(t)
-                    tgt.append(t2)
-            src, tgt = np.array(src), np.array(tgt)
             fwd = corr_pair(wet[src, i], wet[tgt, j])
             bwd = corr_pair(wet[src, j], wet[tgt, i])
             if not (np.isnan(fwd) or np.isnan(bwd)):
                 a_vals.append(fwd - bwd)
-                e_vals.append(math.sin(math.radians(f["b"])))
+                e_vals.append(math.sin(math.radians(
+                    bearing(STATION_COORDS[stns[i]], STATION_COORDS[stns[j]]))))
     a_vals, e_vals = np.array(a_vals), np.array(e_vals)
     r_dir = float(np.corrcoef(a_vals, e_vals)[0, 1])
     print(f"\n  +{LEAD_HOURS}h 방향 비대칭 vs 동향 성분 sin(방위): r = {r_dir:+.3f} "

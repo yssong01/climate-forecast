@@ -60,8 +60,17 @@ PM10_MATCHED_RAW = {"108", "119", "146", "156", "143", "93"}  # 우리 12개 중
 
 
 def _read_tsv(path: str) -> list[dict]:
+    # errors="replace" 는 유지하되(바이트 하나 때문에 전체가 죽지 않도록)
+    # 치환이 실제로 일어났는지 **헤더에서** 반드시 확인한다. 이 파서는
+    # 컬럼을 이름으로 찾으므로(r.get("폭염특보(O/X)") 등), 헤더가 깨지면
+    # 모든 조회가 조용히 None 을 돌려주고 행이 통째로 스킵된다 — 예외도
+    # 로그도 없이 표본만 줄어든다(2026-08-29 총점검에서 가시화).
     with open(path, encoding="euc-kr", errors="replace") as f:
         header = next(f).rstrip("\n").split("\t")
+        if any("�" in h for h in header):
+            raise ValueError(
+                f"헤더 디코딩 실패(EUC-KR 아님?): {os.path.basename(path)} — "
+                f"깨진 컬럼 {[h for h in header if chr(0xFFFD) in h]}")
         rows = []
         for line in f:
             parts = line.rstrip("\n").split("\t")
@@ -156,7 +165,15 @@ def parse_dust_pm10(out: dict) -> int:
     daily_max: dict[tuple[str, str], float] = {}
     for fp in glob.glob(os.path.join(PM10_DIR, "ENV_YDST_*_HR_*.csv")):
         with open(fp, encoding="euc-kr", errors="replace") as f:
-            next(f, None)  # 헤더
+            # 이 파서는 컬럼을 위치(parts[0..2])로 읽어 헤더 이름에 의존하지
+            # 않지만, 헤더가 깨졌다는 것은 파일 전체의 인코딩 가정이 틀렸다는
+            # 신호다 — 값(관측소 코드·시각)도 함께 깨졌을 수 있으므로 조용히
+            # 넘기지 않고 알린다(2026-08-29 추가).
+            _hdr = next(f, None)
+            if _hdr and "�" in _hdr:
+                print(f"  [경고] 헤더 디코딩 실패(EUC-KR 아님?) — 건너뜀: "
+                      f"{os.path.basename(fp)}")
+                continue
             for line in f:
                 parts = line.rstrip("\n").split(",")
                 if len(parts) != 3:

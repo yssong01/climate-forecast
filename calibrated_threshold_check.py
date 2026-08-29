@@ -110,6 +110,10 @@ def main():
           f"{'F1 범위':>10}{'동점 표본':>11}{'판정':>10}")
     worst = 0.0
     for key, t_raw, t_mapped, t_pick, f_ideal, f_current, f_picked, pe_cal, le in rows:
+        # "108"(서울)을 넘기는 것은 관측소별 예외가 없는 **전역** 판정선을
+        # 뽑기 위함이다 — 이 표는 전역 동작점의 민감도를 재는 것이므로
+        # 의도된 선택이다(2026-08-29 명시). 관측소별 예외까지 반영해
+        # 채점하는 것은 metrics_report.py 의 precision_block() 쪽이다.
         t_dep = event_threshold(key, "108", ckpt)
         f_dep = prf(pe_cal, le, t_dep)[2]
         f_lo = prf(pe_cal, le, max(0.0, t_dep - 0.02))[2]

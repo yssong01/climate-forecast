@@ -132,11 +132,22 @@ def _fit_one(name, y_true, y_pred, group, group_label, calib_mask, alpha,
                              "fallback_global": fallback}
         lo_strat[g_all] = y_pred[g_all] + ql
         hi_strat[g_all] = y_pred[g_all] + qh
-        lo_g = np.clip(lo_strat[g_all], clip_min, None) if clip_min is not None else lo_strat[g_all]
+        # 그룹별 진단 커버리지도 **상한·하한을 모두** clip 한 값으로 잰다.
+        # 종전에는 하한만 clip 하고 상한은 원본을 썼는데, 그러면 아래 전역
+        # clip 주석이 설명하는 바로 그 뒤집힌 구간([0, 음수]) 문제가 이
+        # 진단 출력에만 그대로 남는다 — 무강수 층처럼 상한 분위수가 음수인
+        # 층에서 커버리지가 실제보다 낮게(극단적으로 0.000) 찍혀 "이 층이
+        # 깨졌다"는 오판을 부른다(2026-08-29 총점검에서 발견).
+        # 채택 판정에 쓰이는 cov_strat 은 전역 clip 이후 값이라 영향 없었다.
+        if clip_min is not None:
+            lo_g = np.clip(lo_strat[g_all], clip_min, None)
+            hi_g = np.clip(hi_strat[g_all], clip_min, None)
+        else:
+            lo_g, hi_g = lo_strat[g_all], hi_strat[g_all]
         g_eval_local = ee[g_all]
         group_eval_cov[gname] = (
             float(((y_true[g_all][g_eval_local] >= lo_g[g_eval_local])
-                   & (y_true[g_all][g_eval_local] <= hi_strat[g_all][g_eval_local])).mean())
+                   & (y_true[g_all][g_eval_local] <= hi_g[g_eval_local])).mean())
             if g_eval_local.sum() else float("nan"))
     if clip_min is not None:
         # 상한도 함께 clip 한다 — 아래만 clip 하면 상한이 clip_min 보다 작은

@@ -30,7 +30,8 @@ import numpy as np
 import torch
 
 from predict import CHECKPOINT, load_model
-from train import (WeatherDataset, collect_historical, make_split, WET_THRESH)
+from train import (WeatherDataset, collect_historical, make_split, WET_THRESH,
+                   DATA_CACHE)
 from weather_collector import STATION_COORDS
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
@@ -46,7 +47,7 @@ DEFAULT_BATCH = 8192
 
 def cache_signature(ckpt_path: str, ckpt: dict) -> dict:
     st = os.stat(ckpt_path)
-    return {
+    sig = {
         "ckpt_path": ckpt_path,
         "ckpt_mtime": float(st.st_mtime),
         "ckpt_size": int(st.st_size),
@@ -54,6 +55,55 @@ def cache_signature(ckpt_path: str, ckpt: dict) -> dict:
         "num_features": int(ckpt["num_features"]),
         "lead_hours": int(ckpt["lead_hours"]),
     }
+    # 학습 데이터 파일도 서명에 넣는다(2026-08-29 추가). 종전에는 체크포인트
+    # 속성만 봤는데, build() 는 매번 collect_historical() 로 이 파일을 다시
+    # 읽으므로 파일이 바뀌면 캐시 내용이 실제와 어긋난다 — 특히 make_split
+    # 의 그룹 분할이 **고유 날짜 수**에 의존해(torch.randperm(len(uniq)))
+    # 데이터가 늘면 같은 SEED 로도 검증셋 구성이 통째로 달라진다(실측:
+    # 날짜가 1개만 늘어도 검증셋 겹침이 20%). 파일이 바뀌면 최소한 캐시를
+    # 다시 만들게 해서, 아래 _assert_split_matches_checkpoint() 의 대조가
+    # 반드시 한 번은 실행되도록 한다.
+    try:
+        dst = os.stat(DATA_CACHE)
+        sig["data_mtime"] = float(dst.st_mtime)
+        sig["data_size"] = int(dst.st_size)
+    except OSError:
+        sig["data_mtime"] = 0.0
+        sig["data_size"] = 0
+    return sig
+
+
+def _assert_split_matches_checkpoint(ds, val_idx, ckpt) -> None:
+    """재구성한 검증셋이 학습 당시의 그것과 같은지 기준선으로 대조한다.
+
+    make_split 의 그룹 분할은 고유 날짜 수에 의존하므로, 학습 이후 데이터가
+    누적되면 같은 SEED·같은 split_mode 여도 다른 검증셋이 나온다. 그러면
+    "학습 때 본 적 없는 표본"이라는 전제가 깨진 채 지표가 산출되는데,
+    지표 자체는 멀쩡해 보여서 눈치채기 어렵다.
+
+    체크포인트에 저장된 val_temp_naive_mae / val_precip_naive_mae 는 학습
+    당시 검증셋에서 계산한 값이다 — 지금 재구성한 검증셋에서 같은 값이
+    나오지 않으면 표본이 달라졌다는 뜻이므로 즉시 멈춘다. CLAUDE.md 2절이
+    사람에게 수동으로 요구하던 대조를 자동화한 것이다(2026-08-29 추가).
+    """
+    checks = (
+        ("val_temp_naive_mae", float(ds.temp_persist_abs[val_idx].mean()), "기온 퍼시스턴스"),
+        ("val_precip_naive_mae", float(ds.y[val_idx, 1].abs().mean()), "강수 상시 0"),
+    )
+    for key, got, ko in checks:
+        want = ckpt.get(key)
+        if want is None:
+            continue                      # 구버전 체크포인트 — 대조 불가
+        if abs(float(want) - got) > 1e-4:
+            raise RuntimeError(
+                f"검증셋이 학습 당시와 다르다 — {ko} 기준선 저장값 {float(want):.6f} "
+                f"vs 재구성값 {got:.6f}.\n"
+                f"  원인: make_split 의 그룹 분할이 고유 날짜 수에 의존하는데 "
+                f"{DATA_CACHE} 가 학습 이후 변경됐을 가능성이 높다.\n"
+                f"  이 상태의 지표는 '학습에 쓰인 표본'을 검증셋에 섞어 산출한 "
+                f"값일 수 있으므로 신뢰할 수 없다.\n"
+                f"  조치: 이 체크포인트를 학습할 때 쓴 데이터 파일로 되돌리거나, "
+                f"현재 데이터로 재학습할 것.")
 
 
 def is_fresh(path: str, sig: dict) -> bool:
@@ -93,7 +143,11 @@ def build(ckpt_path: str, batch: int):
     )
     _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True)
     val_idx = np.array(val_ds.indices)
-    print(f"검증 표본 {len(val_idx):,}개 · 배치 {batch:,} · 장치 {DEVICE}")
+    # 재구성한 검증셋이 학습 당시와 같은지 먼저 대조한다 — 다르면 여기서
+    # 멈춘다. 이 확인 없이 추론을 돌리면 누수된 지표가 나와도 알 수 없다.
+    _assert_split_matches_checkpoint(ds, val_idx, ckpt)
+    print(f"검증 표본 {len(val_idx):,}개 · 배치 {batch:,} · 장치 {DEVICE}"
+          f" · 검증셋 대조 통과")
 
     temp_pred, precip_pred = [], []
     rain_p, heat_p, cold_p, dust_p = [], [], [], []

@@ -166,8 +166,18 @@ def obs_hour_key() -> str:
 # 확인) — model/ckpt 가 해시 대상에서 빠지므로, 이 인자가 없으면 캐시 키가
 # (stn, obs_hour) 뿐이라 +6h 호출과 +12h 호출이 같은 항목을 공유해 버린다.
 # 먼저 계산된 쪽의 결과를 나중 호출이 그대로 돌려받는 사고가 난다.
+#
+# ckpt_fp(체크포인트 지문)도 같은 이유로 반드시 넣는다(2026-08-29 총점검에서
+# 발견). 위 lead_hours 와 get_model_at() 의 fingerprint 는 각각 고쳤으면서
+# 이 함수의 모델 신원만 빠져 있었다 — 프로세스가 살아 있는 동안 체크포인트가
+# 교체되면(promote_checkpoint.py 는 배포 경로를 제자리에서 덮어쓴다)
+# get_model_at() 은 지문 변화를 감지해 새 모델을 로드하지만, 이 캐시는
+# (stn, obs_hour, lead_hours) 가 같아 **옛 모델이 만든 예측을 그대로**
+# 돌려준다. 화면은 새 모델이라 믿고 옛 수치를 보여주게 되며, 이는 2026-08-11
+# get_model() 사고와 정확히 같은 유형이다.
 @st.cache_data(ttl=3600, show_spinner="관측 조회 중... (12개 관측소)")
-def cached_predict(stn: str, obs_hour: str, lead_hours: int, _model, _ckpt) -> dict:
+def cached_predict(stn: str, obs_hour: str, lead_hours: int, ckpt_fp: str,
+                   _model, _ckpt) -> dict:
     return predict(stn=stn, model=_model, ckpt=_ckpt)
 
 
@@ -575,8 +585,9 @@ if not os.path.exists(CHECKPOINT):
 set_offline_fallback(list(load_merged_history()[0].values()))
 
 try:
-    model, ckpt = get_model(ckpt_fingerprint())
-    result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], model, ckpt)
+    _fp6 = ckpt_fingerprint()
+    model, ckpt = get_model(_fp6)
+    result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], _fp6, model, ckpt)
 except Exception as e:
     st.error(f"예측 실패: {redact_secrets(str(e))}")
     st.stop()
@@ -1003,10 +1014,10 @@ with tab_trend:
     # 물들인다.
     result_12h = None
     try:
-        model_12h, ckpt_12h = get_model_at(
-            CHECKPOINT_12H, ckpt_fingerprint(CHECKPOINT_12H))
+        _fp12 = ckpt_fingerprint(CHECKPOINT_12H)
+        model_12h, ckpt_12h = get_model_at(CHECKPOINT_12H, _fp12)
         result_12h = cached_predict(
-            stn, obs_hour_key(), ckpt_12h["lead_hours"], model_12h, ckpt_12h)
+            stn, obs_hour_key(), ckpt_12h["lead_hours"], _fp12, model_12h, ckpt_12h)
     except Exception as e:
         # +6h(배포 필수 경로)와 달리 +12h 는 2차 산출값이라 없어도 앱
         # 전체가 멈출 이유는 없다 — 실패하면 그 부분만 빠진 채 표시한다.

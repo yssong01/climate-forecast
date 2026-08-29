@@ -43,7 +43,18 @@ EVENTS = [("heatwave", "폭염"), ("coldwave", "한파"), ("dust", "황사")]
 
 # ── 지표 계산 ────────────────────────────────────────────────
 def prf(prob, label, t):
-    pred = (prob >= t).astype(int)
+    """스칼라 임계값 하나로 채점한다."""
+    return prf_vec(prob, label, np.full(len(prob), float(t)))
+
+
+def prf_vec(prob, label, t_vec):
+    """표본마다 다른 임계값으로 채점한다.
+
+    관측소별 판정선 예외(predict.STATION_EVENT_THRESH_OVERRIDES)가 있으면
+    같은 헤드라도 표본마다 임계값이 다르다 — 서빙과 같은 방식으로 채점하려면
+    벡터 임계값이 필요하다(2026-08-29 추가). prf() 는 이 함수의 특수한 경우다.
+    """
+    pred = (prob >= t_vec).astype(int)
     tp = int(((pred == 1) & (label == 1)).sum())
     fp = int(((pred == 1) & (label == 0)).sum())
     fn = int(((pred == 0) & (label == 1)).sum())
@@ -138,20 +149,37 @@ def precision_block(d, ckpt):
     """② 정밀도 — 분류. 원본 0.5 기준과 서빙 판정선 기준을 함께 낸다."""
     out = {}
     for key, ko in EVENTS:
-        mask = d[f"{key.replace('heatwave', 'heat').replace('coldwave', 'cold')}_mask"].astype(bool)
-        prob = d[f"{key.replace('heatwave', 'heat').replace('coldwave', 'cold')}_prob"][mask]
+        short = key.replace('heatwave', 'heat').replace('coldwave', 'cold')
+        mask = d[f"{short}_mask"].astype(bool)
+        prob = d[f"{short}_prob"][mask]
         label = d[f"y_{key}"][mask].astype(int)
         if len(prob) == 0:
             continue
         t_raw = EXTREME_EVENT_THRESH.get(key, 0.5)
         prob_cal = np.array([calibrate_prob(float(p), key, ckpt) for p in prob])
-        t_served = event_threshold(key, "108", ckpt)
+        # 판정선은 표본의 **실제 관측소별로** 구한다(2026-08-29 총점검에서 수정).
+        # 종전에는 event_threshold(key, "108", ckpt) 로 서울 기준 하나만 써서
+        # 전 관측소 표본을 채점했는데, predict.STATION_EVENT_THRESH_OVERRIDES
+        # 에 관측소별 예외가 있으면(현재 ("146","coldwave"): 0.33) 그 관측소
+        # 표본이 실제 서빙과 다른 임계값으로 채점된다 — "화면에 나가는 판정과
+        # 문서의 F1 이 다른 값을 가리키는 일을 막는다"는 이 파일의 목적과
+        # 정면으로 어긋난다. app.py 는 event_threshold(event, stn, ckpt) 로
+        # 실제 관측소를 넘긴다.
+        stns = d["stn"].astype(str)[mask]
+        t_by_stn = {s: event_threshold(key, s, ckpt) for s in np.unique(stns)}
+        t_served_vec = np.array([t_by_stn[s] for s in stns])
+        # 표에는 한 값만 적어야 하므로 최빈 임계값을 대표로 쓰고, 그와 다른
+        # 임계값이 적용된 표본 수를 함께 남겨 예외의 존재를 드러낸다.
+        t_repr = float(max(set(t_served_vec.tolist()),
+                           key=lambda v: int((t_served_vec == v).sum())))
         out[key] = {
             "ko": ko,
             "n": int(mask.sum()),
             "n_pos": int(label.sum()),
             "raw": {"threshold": float(t_raw), **prf(prob, label, t_raw)},
-            "served": {"threshold": float(t_served), **prf(prob_cal, label, t_served)},
+            "served": {"threshold": t_repr,
+                       "n_station_overrides": int((t_served_vec != t_repr).sum()),
+                       **prf_vec(prob_cal, label, t_served_vec)},
         }
     return out
 
@@ -210,9 +238,16 @@ def print_report(acc, pre, cal):
     for key, m in pre.items():
         for tag, label in (("raw", "원본"), ("served", "서빙")):
             b = m[tag]
+            # 관측소별 예외가 적용된 표본이 있으면 임계값 옆에 표시한다 —
+            # 표에 찍힌 한 값이 전 표본에 쓰인 것처럼 보이면 안 된다.
+            n_ovr = b.get("n_station_overrides", 0)
+            mark = f"*{n_ovr:,}" if n_ovr else ""
             print(f"  {m['ko'] if tag == 'raw' else '':<6}{label:<8}{b['threshold']:>8.3f}"
                   f"{b['precision']:>9.1%}{b['recall']:>9.1%}{b['f1']:>9.3f}"
-                  f"{b['tp']:>8,}{b['fp']:>8,}{b['fn']:>8,}")
+                  f"{b['tp']:>8,}{b['fp']:>8,}{b['fn']:>8,}  {mark}")
+    if any(m["served"].get("n_station_overrides") for m in pre.values()):
+        print("  * 관측소별 판정선 예외가 적용된 표본 수"
+              "(predict.STATION_EVENT_THRESH_OVERRIDES)")
 
     print(f"\n{'=' * 78}\n ③ 신뢰도(calibration) — 확률 자체\n{'=' * 78}")
     print(f"  {'사건':<6}{'표본':>10}{'양성률':>9}{'ECE 전':>9}{'ECE 후':>9}"

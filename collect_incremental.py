@@ -31,7 +31,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
-from weather_collector import RobustWeatherCollector, STATIONS, KST
+from weather_collector import (RobustWeatherCollector, STATIONS, KST,
+                               api_call_stats)
 from collect_year import load_existing, atomic_save, OUT_FILE, LEGACY_CACHE
 
 CONCURRENCY = 6
@@ -113,8 +114,12 @@ def main():
         print("\n수집할 신규 시간 없음 — 이미 최신 상태입니다.")
         return
 
-    print(f"\n총 {len(targets)}건 요청 예정 (일일 한도의 "
-          f"{len(targets)/10000*100:.1f}% 수준)\n")
+    # 분모는 실제 호출 예산(weather_collector.DAILY_CALL_BUDGET)을 쓴다 —
+    # 종전에는 근거 없는 리터럴 10000 으로 나눠, 예산이 3000 인데도 여유가
+    # 3배 넉넉한 것처럼 표시됐다(2026-08-29 총점검에서 수정).
+    _budget = api_call_stats().get("budget", 0)
+    _pct = f"{len(targets) / _budget * 100:.1f}% 수준" if _budget > 0 else "예산 무제한"
+    print(f"\n총 {len(targets)}건 요청 예정 (일일 예산 {_budget:,}건의 {_pct})\n")
 
     collectors = {stn: RobustWeatherCollector(stn=stn) for stn in args.stations}
     records = dict(existing)

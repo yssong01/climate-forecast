@@ -8,8 +8,8 @@ import os
 import re
 import json
 import time
-import hashlib
 import functools
+import tempfile
 import threading
 import requests
 import numpy as np
@@ -302,6 +302,28 @@ def is_real_observation(status) -> bool:
     return str(status) in REAL_STATUSES
 
 
+def _atomic_write_json(path: str, payload) -> None:
+    """고유 tmp + os.replace 로 JSON 을 원자적으로 저장한다(CLAUDE.md 1절 6항).
+
+    tmp 이름이 고정이면 두 스레드가 같은 tmp 를 쓰다가 한쪽이 os.replace
+    직전에 다른 쪽이 이미 옮겨간 tmp 를 찾지 못해 FileNotFoundError 가
+    난다(accuracy.py 2026-08-13 실측) — 호출마다 고유 tmp 로 회피한다.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # 주요 관측소 번호 참고
 STATIONS = {
     "서울": "108", "인천": "112", "수원": "119", "춘천": "101",
@@ -336,21 +358,22 @@ class RobustWeatherCollector:
         self.stn = str(stn or os.getenv("KMA_STN", "108"))
         self.cache_dir = cache_dir
         # 폴백 캐시는 관측소별로 나눈다 — 왜 그래야 하는지는
-        # _load_disk_cache() 주석 참고. hash_file 도 같은 이유로 나눈다
-        # (_is_duplicate 가 timestamp 만으로 키를 만들어, 파일을 공유하면
-        # 같은 시각의 다른 관측소 응답이 서로 중복으로 판정된다. 현재
-        # _is_duplicate 는 호출되는 곳이 없어 이 파일은 생성되지 않지만,
-        # 나중에 연결할 때 같은 함정을 밟지 않도록 지금 갈라둔다).
+        # _load_disk_cache() 주석 참고.
+        #
+        # SHA-256 중복 응답 방지 체인(hash_file·_content_hashes·_load_hashes·
+        # _save_hashes·_is_duplicate)은 2026-08-29 총점검에서 제거했다 —
+        # _is_duplicate 를 호출하는 곳이 저장소 어디에도 없어 실제로
+        # content_hashes_*.json 이 한 번도 생성된 적이 없었고(확인함),
+        # 그런데도 predict() 1회당 12~15개씩 만들어지는 이 클래스의
+        # __init__ 마다 _load_hashes() 가 존재하지 않는 파일을 확인하는
+        # 비용만 남아 있었다. 되살리려면 git 이력에서 꺼낼 것.
         self.cache_file = os.path.join(cache_dir, f"latest_weather_{self.stn}.json")
-        self.hash_file  = os.path.join(cache_dir, f"content_hashes_{self.stn}.json")
         # 관측소 구분이 없던 시절의 공유 파일. stn 이 일치할 때만 이어받는다.
         self.legacy_cache_file = os.path.join(cache_dir, "latest_weather.json")
         self._memory_cache: dict | None = None
-        self._content_hashes: dict = {}
 
         os.makedirs(self.cache_dir, exist_ok=True)
         self._load_disk_cache()
-        self._load_hashes()
 
     # ── 캐시 관리 ─────────────────────────────────────────────────
 
@@ -386,41 +409,18 @@ class RobustWeatherCollector:
 
     def _save_disk_cache(self, data: dict):
         self._memory_cache = data
+        # 고유 tmp + os.replace 로 원자적으로 쓴다(CLAUDE.md 1절 6항).
+        # 종전에는 고정 파일명에 직접 open(...,"w") 했는데, Streamlit Cloud 는
+        # 세션(탭)마다 스레드를 띄우고 기본 관측소(서울)를 여러 세션이 동시에
+        # 조회하므로 같은 파일에 쓰기가 겹칠 수 있다. 겹치면 잘린 JSON 이
+        # 남고 이후 _load_disk_cache() 가 조용히 실패해(예외를 삼킨다) 폴백
+        # 재료가 통째로 사라진다. accuracy._save() 가 2026-08-13 사고 뒤
+        # 같은 방식으로 이미 고쳐져 있었는데 이 파일만 빠져 있었다
+        # (2026-08-29 총점검에서 발견).
         try:
-            with open(self.cache_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            _atomic_write_json(self.cache_file, data)
         except Exception:
             pass
-
-    def _load_hashes(self):
-        if os.path.exists(self.hash_file):
-            try:
-                with open(self.hash_file, "r") as f:
-                    self._content_hashes = json.load(f)
-            except Exception:
-                self._content_hashes = {}
-
-    def _save_hashes(self):
-        try:
-            with open(self.hash_file, "w") as f:
-                json.dump(self._content_hashes, f, indent=2)
-        except Exception:
-            pass
-
-    def _is_duplicate(self, data: dict) -> bool:
-        """SHA-256으로 동일 응답 중복 인코딩 방지 (논문 §V)."""
-        key = data.get("timestamp", "")
-        content = json.dumps(
-            {k: v for k, v in data.items() if k != "status"}, sort_keys=True
-        )
-        sha = hashlib.sha256(content.encode()).hexdigest()
-        if self._content_hashes.get(key) == sha:
-            return True
-        self._content_hashes[key] = sha
-        if len(self._content_hashes) > 1000:
-            del self._content_hashes[next(iter(self._content_hashes))]
-        self._save_hashes()
-        return False
 
     # ── 시간 계산 ──────────────────────────────────────────────────
 
@@ -702,44 +702,12 @@ class RobustWeatherCollector:
             "stn": self.stn, "status": "FALLBACK_DEFAULT",
         }
 
-    # ── 모델 입력 벡터 ──────────────────────────────────────────────
-
-    def to_model_vector(self, data: dict) -> list[float]:
-        """
-        14차원 수치 벡터 반환 — train.record_to_vec 와 순서가 반드시 같아야 한다.
-        [기온, 강수량, 습도, 풍속, 풍향sin, 풍향cos, 기압, 강수형태,
-         시각sin, 시각cos, 위도, 경도, 연중시각sin, 연중시각cos]
-        """
-        wd_rad = np.deg2rad(data.get("wind_dir", 0.0))
-
-        ts = str(data.get("timestamp", ""))      # YYYYMMDDHHmm
-        hour = int(ts[8:10]) if len(ts) >= 10 else 0
-        h_rad = 2.0 * np.pi * hour / 24.0
-
-        if len(ts) >= 8:
-            doy = datetime.strptime(ts[:8], "%Y%m%d").timetuple().tm_yday
-        else:
-            doy = 1
-        y_rad = 2.0 * np.pi * doy / 365.25
-
-        lat, lon = STATION_COORDS.get(str(data.get("stn", self.stn)), _COORD_DEFAULT)
-
-        return [
-            data.get("temperature",   20.0),
-            data.get("precipitation",  0.0),
-            data.get("humidity",      50.0),
-            data.get("wind_speed",     1.5),
-            float(np.sin(wd_rad)),
-            float(np.cos(wd_rad)),
-            data.get("pressure",    1013.0),
-            float(data.get("precip_type", 0)),
-            float(np.sin(h_rad)),
-            float(np.cos(h_rad)),
-            lat,
-            lon,
-            float(np.sin(y_rad)),
-            float(np.cos(y_rad)),
-        ]
+    # 모델 입력 벡터를 만드는 to_model_vector() 는 2026-08-29 총점검에서
+    # 제거했다 — train.record_to_vec() 를 손으로 베낀 사본이었고, 아래
+    # __main__ 테스트 블록에서만 쓰였다. 서빙(predict.py)은 처음부터
+    # record_to_vec() 를 쓰고 있었으므로 이 사본은 "학습과 추론이 조용히
+    # 어긋나는" 위험만 남긴 상태였다(predict.py 상단이 경고하는 바로 그
+    # 패턴). 테스트 블록도 원본을 직접 부르도록 바꿨다.
 
 
 # ── 단독 실행 테스트 ─────────────────────────────────────────────────
@@ -760,5 +728,9 @@ if __name__ == "__main__":
     print(f"풍속:     {data.get('wind_speed')} m/s  풍향: {data.get('wind_dir')}°")
     print(f"기압:     {data.get('pressure')} hPa")
 
-    vec = collector.to_model_vector(data)
-    print(f"\n모델 입력 벡터 (14차원): {[round(v, 3) for v in vec]}")
+    # 학습·추론이 실제로 쓰는 바로 그 함수를 부른다(사본을 두지 않는다).
+    # train 은 여기서 지연 임포트한다 — train.py 가 이 모듈을 임포트하므로
+    # 최상단에 두면 순환 임포트가 된다.
+    from train import record_to_vec
+    vec = record_to_vec(data)
+    print(f"\n모델 입력 벡터 ({len(vec)}차원): {[round(v, 3) for v in vec]}")

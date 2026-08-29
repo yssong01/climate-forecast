@@ -675,6 +675,16 @@ def make_split(full_ds, mode: str, verbose: bool = True):
         train_idx, val_idx = perm[:n - n_val], perm[n - n_val:]
 
     elif mode == "group":
+        # ⚠ 이 분할은 SEED 를 고정해도 **고유 날짜 수가 바뀌면 재현되지 않는다**.
+        # torch.randperm(N) 은 N 이 1만 달라져도 완전히 다른 순열을 낸다
+        # (2026-08-29 실측: 날짜 4000→4001 일 때 검증셋 겹침 20.2%).
+        # 따라서 collect_incremental.py 로 데이터를 더 채운 뒤 옛 체크포인트를
+        # 진단하면, 학습 당시와 다른 검증셋에서 지표가 계산된다 — 학습에 쓴
+        # 표본이 검증셋에 섞여도 지표는 멀쩡해 보여 눈치채기 어렵다.
+        # eval_cache._assert_split_matches_checkpoint() 가 체크포인트에 저장된
+        # 기준선과 대조해 이 상황을 자동으로 잡는다(그 함수 docstring 참고).
+        # 근본 해결(날짜 문자열 해시 기반 배정)은 현행 체크포인트의 분할을
+        # 바꿔버리므로 다음 재학습 때 함께 처리한다.
         uniq = np.unique(dates)
         g = torch.Generator().manual_seed(SEED)
         order = torch.randperm(len(uniq), generator=g).tolist()
@@ -869,6 +879,17 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         print(f"  강수 상시 0 예측            : {precip_naive:.4f} mm   "
               f"[전체 {full_ds.precip_mean:.4f}]\n")
 
+    # ── 알려진 한계: 정규화·타깃 통계는 아직 전체 표본에서 계산된다 ──
+    # 아래 사전확률·가중치들은 규약대로 train_ds 에서만 산출하지만,
+    # WeatherDataset.__init__ 이 만드는 self.mean/std(입력 표준화)와
+    # temp_mean/temp_std/precip_mean(헤드 편향 초기화·손실 스케일)은
+    # make_split 이전에 **전체 표본**으로 계산된다 — 검증셋이 섞인 통계다.
+    # 표본이 138만 개라 수치 영향은 미미할 것으로 보이나 측정한 적은 없고,
+    # 원칙적으로는 누설이다(2026-08-29 총점검에서 확인).
+    # 지금 고치지 않는 이유: 정규화 통계를 바꾸면 현행 배포 체크포인트와
+    # 입력 스케일이 달라져 재학습이 강제되고, README 의 모든 수치가 무효가
+    # 된다. **다음 재학습 때 함께 고칠 항목**으로 남긴다.
+    #
     # hurdle 헤드 사전확률·클래스 불균형 가중치 — 학습 표본에서 직접 계산
     # (고정 상수 아님). 검증셋을 보면 데이터 누설이라 반드시 train_ds 에서만.
     train_precip = full_ds.y[train_ds.indices, 1]
