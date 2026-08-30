@@ -332,6 +332,7 @@ class TriCHEFPipeline(nn.Module):
                  feat_std:  list = None,
                  dynamic_gate: bool = False,
                  compact_satellite: bool = True,
+                 re_channels: int = 4,
                  im_dim: int = 384,
                  wet_prior: float = 0.067,
                  heatwave_prior: float = 0.01,
@@ -385,7 +386,8 @@ class TriCHEFPipeline(nn.Module):
             self.register_buffer("feat_std",  torch.tensor(feat_std,  dtype=torch.float32))
 
         # 3축 인코더
-        self.enc_re = SatelliteEncoder(4, embed_dim,
+        self.re_channels = re_channels
+        self.enc_re = SatelliteEncoder(re_channels, embed_dim,
                                        compact=compact_satellite)   # A: 위성
         # Im축 인코더 — im_dim=384 면 MiniLM 텍스트(기존), 12 면 시간 경향
         # 벡터(Phase 3-11). 체크포인트에 im_dim 을 저장해야 복원 시 아키텍처가

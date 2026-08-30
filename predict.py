@@ -177,6 +177,7 @@ def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
         # 구버전 체크포인트(이 키들 추가 전) 호환 — 당시 기본값과 동일
         dynamic_gate=ckpt.get("dynamic_gate", True),
         compact_satellite=ckpt.get("compact_satellite", True),
+        re_channels=ckpt.get("re_channels", 4),   # 4=구버전(강수 채널 없음)
         im_dim=ckpt.get("im_dim", 384),   # 384=MiniLM(구버전), 12=경향벡터
         # 없으면 False — 이 플래그 도입 이전 체크포인트는 헤드 입력이
         # embed_dim 이므로 그대로 복원해야 state_dict 이 맞는다.
@@ -271,7 +272,8 @@ def predict(stn: str = "108",
     # 여기서 자신을 뺀 수다.
     live_neighbors = sum(1 for r in neighbor_records if str(r.get("stn")) != stn)
 
-    field_collector = InterpolatedFieldCollector(neighbor_records, STATION_COORDS)
+    field_collector = InterpolatedFieldCollector(
+        neighbor_records, STATION_COORDS, n_bands=getattr(model, "re_channels", 4))
 
     # Im축 인코더 종류에 따라 분기 — im_dim=384 면 구버전(MiniLM 텍스트),
     # 12 면 신버전(시간 경향 벡터). 재학습 전환기 동안 두 체크포인트 모두

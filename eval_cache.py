@@ -136,7 +136,8 @@ def build(ckpt_path: str, batch: int):
     txt_collector = (TendencyCollector(records) if ckpt.get("im_dim", 384) < 128
                      else SimulatedTextCollector())
     ds = WeatherDataset(
-        records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
+        records, sat_collector=InterpolatedFieldCollector(
+            records, STATION_COORDS, n_bands=ckpt.get("re_channels", 4)),
         txt_collector=txt_collector, lead_hours=ckpt["lead_hours"],
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),

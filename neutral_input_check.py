@@ -40,7 +40,9 @@ from tendency_collector import TendencyCollector
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH = 4096
 CHANNELS = ["기온", "습도", "기압", "풍속"]
-# interp_field_collector._CHANNEL_SPEC 의 역함수 — 0.5 가 뜻하는 물리량
+# interp_field_collector._CHANNEL_SPEC_FULL[:4] 의 역함수 — 0.5 가 뜻하는 물리량.
+# 이 스크립트는 기본 호출(n_bands=4, 강수 채널 없음)만 다룬다 — 5채널
+# 체크포인트를 진단하려면 CHANNELS/INVERSE/UNITS 에 강수 항목을 추가할 것.
 INVERSE = [lambda x: x * 60 - 10, lambda x: x * 100,
            lambda x: x * 60 + 980, lambda x: x * 20]
 UNITS = ["°C", "%", "hPa", "m/s"]

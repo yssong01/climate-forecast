@@ -145,6 +145,15 @@ _REFERENCE_WARMUP_STEPS = 50 * (6837 // BATCH_SIZE)   # ≈ 10,650 (Phase 3-5 �
 _MIN_WARMUP_EPOCHS = 3   # 극단적으로 큰 데이터셋에서도 최소한의 학습 기회는 보장
 # 위성 인코더 용량. ResNet18(1,100만)은 표본 572개를 암기해 게이트를 왜곡시킨다.
 COMPACT_SATELLITE = True
+# Re축 IDW 격자 채널 수. 5채널(이웃 강수 추가)은 대조 실험 후 기각했다
+# (2026-08-30) — data_expansion_probe.py 의 단순 프로브는 "이웃 현재값"
+# 단계(강수 포함)에서 ΔAUC +0.0254 를 냈지만, 전체 파이프라인 재학습(동일
+# SEED=42, group split)에서는 기온 MAE 만 개선(1.3219→1.2644°C)됐고 강수·
+# 폭염·한파·황사 4개 지표가 전부 악화됐다(강수 -16.0%→-17.4%, 폭염 F1
+# 0.803→0.792, 한파 0.426→0.410, 황사 0.176→0.151) — 이득 1개 대 손해 4개라
+# 채택 기준(순이득)에 못 미친다. 코드는 재현 가능하도록 남겨두되 기본값은
+# 4(구버전, 강수 채널 없음)로 되돌린다.
+RE_CHANNELS = int(os.getenv("RE_CHANNELS", "4"))
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
 SEED          = 42     # 학습/검증 분할 고정 → ablation 비교 가능
 # 모델 초기화·학습 stochasticity(가중치 초기값, DataLoader 셔플 순서)만
@@ -797,10 +806,10 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         return {}
 
     if verbose:
-        print("Re축 공간보간장 생성 중 (12관측소 실측 IDW 보간, 4ch 32×32)...")
+        print(f"Re축 공간보간장 생성 중 (12관측소 실측 IDW 보간, {RE_CHANNELS}ch 32×32)...")
     # Phase 3-10 실험 — SimulatedSatelliteCollector(노이즈, 정보량 0 확인됨)
     # 대신 같은 시각 다른 11개 관측소 실측값을 IDW 보간한 필드를 Re축에 넣는다.
-    sat_collector = InterpolatedFieldCollector(records, STATION_COORDS)
+    sat_collector = InterpolatedFieldCollector(records, STATION_COORDS, n_bands=RE_CHANNELS)
     if verbose:
         print("Im축 시간 경향 벡터 생성 중 (기온·기압·습도·풍속 × 1h/3h/6h 차분)...")
     # Phase 3-11 실험 — SimulatedTextCollector(Z축 재포장, 중복정보 확인됨)
@@ -950,6 +959,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         persistence_residual=persistence_residual,
         feat_mean=full_ds.mean.tolist(), feat_std=full_ds.std.tolist(),
         dynamic_gate=dynamic_gate, compact_satellite=COMPACT_SATELLITE,
+        re_channels=RE_CHANNELS,
         wet_prior=wet_prior,
         heatwave_prior=heatwave_prior, coldwave_prior=coldwave_prior,
         dust_prior=dust_prior,
@@ -1224,6 +1234,9 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # load_state_dict 가 shape mismatch 로 실패한다.
                 "dynamic_gate": dynamic_gate,
                 "compact_satellite": COMPACT_SATELLITE,
+                # enc_re(SatelliteEncoder)의 in_channels 복원용 — 없으면 4(구버전)로
+                # 읽혀 기존 체크포인트가 그대로 로드된다(dynamic_gate 와 같은 이유).
+                "re_channels": RE_CHANNELS,
                 "im_dim":       TENDENCY_DIM,   # Im축 인코더 종류 복원용(384 vs 12)
                 # 극한기상 헤드 입력 폭 복원용 — True면 헤드가 embed_dim*2를
                 # 받는다. 없으면 False(구버전)로 읽혀 기존 체크포인트가 그대로

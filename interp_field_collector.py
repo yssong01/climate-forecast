@@ -14,8 +14,23 @@ interp_field_collector.py — Re축을 "가짜 위성"에서 "12개 관측소 �
 가진다 — 이웃 관측소의 기압강하·풍향변화 같은 "주변에서 다가오는" 신호를
 담을 수 있다.
 
-채널 설계(SimulatedSatelliteCollector와 동일 4채널, 물리량만 다름):
-  채널 0: 기온   채널 1: 습도   채널 2: 기압   채널 3: 풍속
+채널 설계(SimulatedSatelliteCollector와 동일 물리량 순서 + 강수 채널 추가):
+  채널 0: 기온   채널 1: 습도   채널 2: 기압   채널 3: 풍속   채널 4: 강수(선택)
+
+n_bands=4(기본값)면 강수 채널 없이 구버전과 완전히 동일하게 동작한다.
+강수 채널(n_bands=5)은 시도했다가 기각했다(2026-08-30) — 아래 참조.
+
+**강수 채널을 시도했다가 기각한 경위.** data_expansion_probe.py 의 절제
+실험에서 "이웃 현재값"(강수 포함) 단계의 증분이 ΔAUC +0.0254 로 국지
+경향 다음으로 컸는데, 그 신호가 이 4채널 격자에는 전혀 반영되지 않고
+있었다 — 강수는 채널 스펙에 없었다. 이 공백을 메우려 5채널로 늘려
+대조 실험(동일 SEED=42, group split, RE_CHANNELS 만 변경)을 돌렸으나,
+전체 파이프라인에서는 기온 MAE 만 개선(1.3219→1.2644°C)되고 강수·폭염·
+한파·황사 4개 지표가 전부 악화됐다(강수 -16.0%→-17.4%, 폭염 F1
+0.803→0.792, 한파 0.426→0.410, 황사 0.176→0.151). 단순 프로브의 ΔAUC
+가 예측한 이득은 실제로는 기온 축에만 나타났다. 이득 1개 대 손해 4개라
+기각. train.py 의 RE_CHANNELS 기본값은 4로 되돌렸다 — n_bands=5 경로는
+재현 가능하도록 코드에 남겨둔다.
 """
 import os
 import multiprocessing as mp
@@ -23,7 +38,7 @@ import multiprocessing as mp
 import numpy as np
 
 IMG_SIZE = 32
-N_BANDS = 4
+N_BANDS = 4   # 구버전 기본값 — 하위 호환을 위해 그대로 둔다
 IDW_POWER = 2.0
 GRID_HALF_SPAN_DEG = 3.0   # 대상 관측소 중심 ±3도(≈300km) 격자
 
@@ -32,12 +47,21 @@ def _norm_temp(v):  return float(np.clip((v + 10) / 60, 0, 1))
 def _norm_humid(v): return float(np.clip(v / 100, 0, 1))
 def _norm_pres(v):  return float(np.clip((v - 980) / 60, 0, 1))
 def _norm_wind(v):  return float(np.clip(v / 20, 0, 1))
+def _norm_precip(v):
+    # 선형 정규화는 대부분 0 근처에 몰리는 강수 분포에서 약한 비를 뭉갠다
+    # (historical_data_1y.json 실측: p99=4.0mm, p99.9=17.0mm, p99.99=39.9mm,
+    # 최대 86.2mm — 오른쪽으로 크게 치우침). sqrt 압축으로 저·중강도 구간의
+    # 해상도를 넓히고, 50mm/h 이상(상위 0.1% 미만)만 포화시킨다.
+    return float(np.clip(np.sqrt(max(v, 0.0)) / np.sqrt(50.0), 0, 1))
 
-_CHANNEL_SPEC = [
-    ("temperature", _norm_temp),
-    ("humidity",    _norm_humid),
-    ("pressure",    _norm_pres),
-    ("wind_speed",  _norm_wind),
+# 새 채널은 끝에 붙인다(기존 배열 인덱스가 안 밀리도록) — n_bands 로 앞에서부터
+# 몇 개를 쓸지 고른다.
+_CHANNEL_SPEC_FULL = [
+    ("temperature",   _norm_temp),
+    ("humidity",      _norm_humid),
+    ("pressure",      _norm_pres),
+    ("wind_speed",    _norm_wind),
+    ("precipitation", _norm_precip),
 ]
 
 
@@ -67,7 +91,7 @@ def _get_image_chunk_worker(keys):
     줄어든다(2026-08-16 실측: 16워커인데 단일 대비 4배에 그치던 원인).
     """
     c = _WORKER_COLLECTOR
-    out = np.empty((len(keys), N_BANDS, IMG_SIZE, IMG_SIZE), dtype=np.float16)
+    out = np.empty((len(keys), c.n_bands, IMG_SIZE, IMG_SIZE), dtype=np.float16)
     for i, (stn, ts) in enumerate(keys):
         out[i] = c.get_image_by_key(stn, ts)
     return out
@@ -85,8 +109,10 @@ class InterpolatedFieldCollector:
     # 메모리를 무한정 먹지 않도록 막아둔다(엔트리당 약 90KB).
     _W_CACHE_MAX = 512
 
-    def __init__(self, records: list[dict], station_coords: dict):
+    def __init__(self, records: list[dict], station_coords: dict, n_bands: int = N_BANDS):
         self.coords = station_coords
+        self.n_bands = n_bands
+        self.channel_spec = _CHANNEL_SPEC_FULL[:n_bands]
         self.by_time: dict[str, dict[str, dict]] = {}
         for r in records:
             ts = str(r["timestamp"])[:12]
@@ -149,19 +175,19 @@ class InterpolatedFieldCollector:
         if not neighbor_stns:
             # 같은 시각 이웃 관측 자체가 없는 드문 경우 — 노이즈가 아니라
             # "정보 없음"을 뜻하는 중립값(0.5)으로 채운다.
-            return np.full((N_BANDS, IMG_SIZE, IMG_SIZE), 0.5, dtype=np.float32)
+            return np.full((self.n_bands, IMG_SIZE, IMG_SIZE), 0.5, dtype=np.float32)
 
         w, w_sum = self._weights(stn, neighbor_stns)
 
         channels = []
-        for key, norm_fn in _CHANNEL_SPEC:
+        for key, norm_fn in self.channel_spec:
             n_vals = np.array([
                 norm_fn(snapshot[s].get(key, 0.0)) for s in neighbor_stns
             ])
             ch = (w * n_vals[None, None, :]).sum(axis=-1) / w_sum
             channels.append(ch.astype(np.float32))
 
-        return np.stack(channels, axis=0)   # (4, 32, 32)
+        return np.stack(channels, axis=0)   # (n_bands, 32, 32)
 
     def get_batch(self, records: list, n_workers: int = None) -> np.ndarray:
         """float16으로 직접 채운다 — records 개수가 많을 때(13년치, 130만+)
@@ -185,7 +211,7 @@ class InterpolatedFieldCollector:
             # 더 얹어도 안 빨라지는 지점부터는 다른 프로세스(다른 실험 등)에
             # 코어를 남겨주는 게 낫다.
             n_workers = min(16, max(1, (os.cpu_count() or 4) - 2))
-        out = np.empty((n, N_BANDS, IMG_SIZE, IMG_SIZE), dtype=np.float16)
+        out = np.empty((n, self.n_bands, IMG_SIZE, IMG_SIZE), dtype=np.float16)
         if n_workers <= 1 or n < 20_000:
             for i, r in enumerate(records):
                 out[i] = self.get_image(r)
