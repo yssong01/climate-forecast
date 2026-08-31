@@ -53,6 +53,9 @@ def cache_signature(ckpt_path: str, ckpt: dict) -> dict:
         "ckpt_mtime": float(st.st_mtime),
         "ckpt_size": int(st.st_size),
         "split_mode": str(ckpt.get("split_mode", "random")),
+        # 분할 알고리즘도 서명에 넣는다 — 같은 split_mode 라도 algo 가
+        # 다르면 검증셋이 완전히 달라지므로 캐시를 재사용하면 안 된다.
+        "split_algo": str(ckpt.get("split_algo", "randperm")),
         "num_features": int(ckpt["num_features"]),
         "lead_hours": int(ckpt["lead_hours"]),
     }
@@ -175,7 +178,11 @@ def build(ckpt_path: str, batch: int):
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True)
+    # ckpt 를 넘겨 그 체크포인트가 학습에 쓴 분할 알고리즘(split_algo)을
+    # 그대로 재현한다 — 넘기지 않으면 현행 기본값(hash)으로 갈려 구버전
+    # 체크포인트의 검증셋이 재현되지 않는다.
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True,
+                           ckpt=ckpt)
     val_idx = np.array(val_ds.indices)
     # 재구성한 검증셋이 학습 당시와 같은지 먼저 대조한다 — 다르면 여기서
     # 멈춘다. 이 확인 없이 추론을 돌리면 누수된 지표가 나와도 알 수 없다.

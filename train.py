@@ -692,20 +692,39 @@ class WeatherDataset(Dataset):
 
 # ── 3-b. 학습/검증 분할 ───────────────────────────────────────────
 
-def _compute_split_indices(dates: np.ndarray, n: int, mode: str) -> tuple[list[int], list[int]]:
+# 분할 알고리즘 식별자. 체크포인트에 `split_algo` 로 저장하고 복원 시 그대로
+# 되쓴다 — 키가 없는 구버전 체크포인트는 `randperm`(당시 동작)으로 읽는다.
+# CLAUDE.md 1절 7항("입력 차원을 바꾸면 구버전 체크포인트 호환을 함께
+# 처리한다")과 같은 원칙을 분할 알고리즘에 적용한 것이다.
+SPLIT_ALGO = "hash"
+SPLIT_ALGO_LEGACY = "randperm"
+
+
+def _compute_split_indices(dates: np.ndarray, n: int, mode: str,
+                           algo: str = SPLIT_ALGO) -> tuple[list[int], list[int]]:
     """분할 인덱스 계산의 단일 진실 공급원(single source of truth).
 
     make_split() 과 WeatherDataset.__init__() (정규화 통계를 학습 인덱스만
     으로 계산하기 위해) 양쪽에서 이 함수를 호출한다 — 로직을 두 곳에
     복제하면 조용히 어긋날 수 있다.
 
-    group 모드는 날짜 문자열 해시로 배정한다(2026-08-31, deferred-to-
-    next-retrain 정정). 종전엔 `torch.randperm(len(uniq))` 을 썼는데,
-    이 방식은 SEED 를 고정해도 **고유 날짜 수가 바뀌면 순열 자체가
-    통째로 달라진다**(2026-08-29 실측: 날짜 1개 추가에 검증셋 겹침
-    20.2%). 날짜 문자열 자체를 해시해 [0,1) 구간에 매핑하면 각 날짜의
-    배정이 다른 날짜의 존재 여부와 무관해진다 — collect_incremental.py
-    로 데이터가 계속 늘어도 기존 배정은 그대로 유지된다.
+    group 모드는 두 알고리즘을 지원한다.
+
+    · `hash`(현행, 2026-08-31~) — 날짜 문자열을 해시해 [0,1) 에 매핑한다.
+      각 날짜의 배정이 다른 날짜의 존재 여부와 무관하므로,
+      collect_incremental.py 로 데이터가 늘어도 기존 배정이 불변이다.
+
+    · `randperm`(구버전) — `torch.randperm(len(uniq))` 로 날짜 순열을 만든다.
+      SEED 를 고정해도 **고유 날짜 수가 바뀌면 순열이 통째로 달라진다**
+      (2026-08-29 실측: 날짜 1개 추가에 검증셋 겹침 20.2%). 이것이 hash 로
+      교체한 이유다.
+
+    구버전을 남겨둔 이유(2026-08-31 추가) — 교체 직후에는 "구 분할로 학습된
+    체크포인트는 현재 코드로 재현할 수 없다"고 판단했으나, 이 알고리즘은
+    (dates, SEED, VAL_RATIO) 에 대해 결정적이므로 **재구성할 수 있다.**
+    실제로 배포 체크포인트의 저장 기준선을 소수점 6자리까지 재현함을
+    확인했다(기온 3.345163, 강수 0.151494). 이걸 남겨두지 않으면 구 체크
+    포인트를 대상으로 한 진단·임계값 재선정이 영구히 불가능해진다.
     """
     if mode == "random":
         n_val = max(2, int(n * VAL_RATIO))
@@ -714,12 +733,20 @@ def _compute_split_indices(dates: np.ndarray, n: int, mode: str) -> tuple[list[i
         train_idx, val_idx = perm[:n - n_val], perm[n - n_val:]
 
     elif mode == "group":
-        def _date_frac(date_str: str) -> float:
-            h = hashlib.sha256(f"{SEED}:{date_str}".encode()).hexdigest()
-            return int(h[:8], 16) / 0xFFFFFFFF
-
         uniq = np.unique(dates)
-        val_days = {d for d in uniq if _date_frac(d) < VAL_RATIO}
+        if algo == SPLIT_ALGO_LEGACY:
+            g = torch.Generator().manual_seed(SEED)
+            order = torch.randperm(len(uniq), generator=g).tolist()
+            n_val_days = max(1, int(len(uniq) * VAL_RATIO))
+            val_days = {uniq[k] for k in order[:n_val_days]}
+        elif algo == SPLIT_ALGO:
+            def _date_frac(date_str: str) -> float:
+                h = hashlib.sha256(f"{SEED}:{date_str}".encode()).hexdigest()
+                return int(h[:8], 16) / 0xFFFFFFFF
+
+            val_days = {d for d in uniq if _date_frac(d) < VAL_RATIO}
+        else:
+            raise ValueError(f"알 수 없는 split_algo: {algo}")
         is_val = np.array([d in val_days for d in dates])
         train_idx = np.flatnonzero(~is_val).tolist()
         val_idx = np.flatnonzero(is_val).tolist()
@@ -802,7 +829,11 @@ def make_split(full_ds, mode: str, verbose: bool = True, ckpt: dict = None):
     n = len(full_ds)
     # 라벨 기준 날짜 = 타깃 시각의 날짜 (라벨이 붙는 단위와 일치시킨다)
     dates = np.array([str(ts)[:8] for ts in full_ds.tgt_timestamps])
-    train_idx, val_idx = _compute_split_indices(dates, n, mode)
+    # 체크포인트가 있으면 그 체크포인트가 학습에 쓴 분할 알고리즘을 따른다 —
+    # 키가 없는 구버전은 randperm(당시 동작). 이래야 옛 체크포인트의 검증셋을
+    # 그대로 재현해 진단할 수 있다(2026-08-31).
+    algo = (ckpt or {}).get("split_algo", SPLIT_ALGO_LEGACY) if ckpt else SPLIT_ALGO
+    train_idx, val_idx = _compute_split_indices(dates, n, mode, algo=algo)
 
     if ckpt is not None:
         assert_split_matches(full_ds, np.asarray(val_idx), ckpt, where="make_split()")
@@ -1367,6 +1398,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # 같은 검증셋에서 채점하려면 필요하다. 없으면(구버전)
                 # "random" 으로 읽는다.
                 "split_mode":   SPLIT_MODE,
+                # 분할 알고리즘 식별자 — 없으면 randperm(구버전)으로 읽힌다.
+                "split_algo":   SPLIT_ALGO,
                 "batch_size":   BATCH_SIZE,
                 "lr":           LR,
                 "extreme_label_masking": EXTREME_LABEL_MASKING,
