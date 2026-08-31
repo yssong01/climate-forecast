@@ -23,11 +23,8 @@ collect_year.py는 1회성 백필(과거 전체 구간)을 예산 캡을 걸고 
     python collect_incremental.py --stations 108   # 서울만
 """
 import argparse
-import json
-import os
 import signal
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 

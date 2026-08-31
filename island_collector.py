@@ -111,11 +111,20 @@ def fetch_live_snapshot(tm=None, timeout: int = 15) -> dict:
     확인, 0.21초·#7777END 완결성 마커 있음), 지점당이 아니라 호출 1회면
     된다. 실패하거나 응답에 없는 지점은 결측(None)으로 남긴다 — 날조하지
     않는다(CLAUDE.md 1절 5항).
+
+    **`weather_collector` 의 호출 예산·연결 차단 게이트를 함께 탄다**
+    (2026-08-31 추가). 종전에는 `requests.get` 을 직접 불러 두 장치를
+    모두 우회했다 — 그러면 ① 이 호출이 `api_call_stats()` 에 집계되지 않아
+    `refresh_deploy_data` 가 저장소에 남기는 일일 호출량과 어긋나고(README
+    '인증키 관리'가 그 대조를 유출 감시 근거로 쓴다), ② 2026-08-19 처럼
+    발신 IP 가 막히면 예보 1건마다 timeout 만큼 그대로 까먹는다(8분 정지
+    사고를 막으려 만든 서킷브레이커가 무력화된다).
     """
     import os
     from datetime import datetime
 
-    from weather_collector import KST, redact_secrets
+    from weather_collector import (KST, redact_secrets, _reserve_call,
+                                   _conn_blocked, _note_conn_failure)
 
     key = os.getenv("KMA_API_KEY", "")
     if tm is None:
@@ -127,6 +136,12 @@ def fetch_live_snapshot(tm=None, timeout: int = 15) -> dict:
         tm = datetime.strptime(str(tm)[:12], "%Y%m%d%H%M")
     snapshot = {stn: None for stn in ISLAND_STNS}
     if not key:
+        return snapshot
+    if _conn_blocked():
+        # 최근 연결 실패로 쿨다운 중 — 타임아웃을 또 까먹지 않고 즉시 결측 반환.
+        return snapshot
+    if not _reserve_call():
+        print("[WARN] 도서 AWS 조회 생략 — 일일 API 예산 초과, 전 지점 결측 처리")
         return snapshot
     params = {"tm": tm.strftime("%Y%m%d%H%M"), "stn": 0, "disp": 0, "help": 0,
               "authKey": key}
@@ -154,6 +169,11 @@ def fetch_live_snapshot(tm=None, timeout: int = 15) -> dict:
         # 예외 문자열에는 authKey 가 섞이므로 반드시 redact 후 출력한다.
         print(f"[WARN] 도서 AWS 조회 실패({tm:%Y%m%d%H%M}) — 전 지점 결측 처리: "
               f"{type(e).__name__}: {redact_secrets(str(e), key)[:150]}")
+        # 연결 계열 실패는 서킷브레이커에 알려 쿨다운을 건다 — 다음 호출이
+        # 같은 타임아웃을 반복하지 않도록. (_note_conn_failure 가 저장 시점에
+        # redact 하므로 여기서 또 가리지 않아도 안전하다.)
+        if isinstance(e, (requests.ConnectionError, requests.Timeout)):
+            _note_conn_failure(e, key)
     return snapshot
 
 

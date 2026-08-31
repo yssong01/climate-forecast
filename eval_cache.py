@@ -34,7 +34,7 @@ from train import (WeatherDataset, collect_historical, make_split, WET_THRESH,
                    DATA_CACHE)
 from weather_collector import STATION_COORDS
 from interp_field_collector import InterpolatedFieldCollector
-from island_collector import IslandPrecipCollector
+from island_collector import IslandPrecipCollector, ISLAND_PARQUET
 from tendency_collector import TendencyCollector
 from text_collector import SimulatedTextCollector
 
@@ -68,9 +68,6 @@ def cache_signature(ckpt_path: str, ckpt: dict) -> dict:
     # 불변이다. 그래도 이 서명 항목은 유지한다: 데이터가 바뀌면 표본 구성
     # (유효 (t, t+L) 쌍)이 달라져 캐시 내용이 어긋나는 것은 그대로이기 때문이다.
     #
-    # `use_island` 체크포인트는 cache/island_aws_raw.parquet 도 읽지만(build
-    # 아래), 그 파일은 서명에 없다 — 현재 그런 체크포인트가 없어 잠복 상태다.
-    # 도서 특징을 다시 채택하면 이 서명에 parquet mtime/size 도 넣어야 한다.
     try:
         dst = os.stat(DATA_CACHE)
         sig["data_mtime"] = float(dst.st_mtime)
@@ -78,6 +75,21 @@ def cache_signature(ckpt_path: str, ckpt: dict) -> dict:
     except OSError:
         sig["data_mtime"] = 0.0
         sig["data_size"] = 0
+
+    # `use_island` 체크포인트는 build() 가 island parquet 도 읽으므로 같은
+    # 이유로 서명에 넣는다(2026-08-31 추가). collect_island_backfill.py 가
+    # 이 파일을 정기 갱신하는데, 서명에 없으면 parquet 만 바뀐 경우 낡은
+    # 캐시가 그대로 재사용된다. `use_island` 가 아닌 체크포인트에서는
+    # build() 가 이 파일을 읽지 않으므로 서명에도 넣지 않는다 — 넣으면
+    # 무관한 파일 변경으로 캐시가 불필요하게 무효화된다.
+    if ckpt.get("use_island", False):
+        try:
+            ist = os.stat(ISLAND_PARQUET)
+            sig["island_mtime"] = float(ist.st_mtime)
+            sig["island_size"] = int(ist.st_size)
+        except OSError:
+            sig["island_mtime"] = 0.0
+            sig["island_size"] = 0
     return sig
 
 

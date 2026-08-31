@@ -371,7 +371,11 @@ def record_to_vec(r: dict) -> list[float]:
     ]
 
 
-NUM_FEATURES = 14   # record_to_vec 출력 차원
+# record_to_vec() 출력 차원을 문서화하는 상수. **모델 입력 폭으로 쓰지 말 것** —
+# 그건 `len(full_ds.mean)` 에서 결정된다(train() 참고). USE_ISLAND=1 이면 도서
+# 특징 26차원이 뒤에 붙어 실제 입력이 40차원이 되므로, 이 상수를 모델 생성에
+# 쓰면 입력층과 X_num 폭이 어긋나 첫 forward 에서 shape mismatch 가 난다.
+NUM_FEATURES = 14
 
 
 # ── 2. 과거 데이터 수집 ───────────────────────────────────────────
@@ -465,9 +469,12 @@ def _prf_metrics(probs: torch.Tensor, labels: torch.Tensor,
 
 class WeatherDataset(Dataset):
     """
-    입력 X_num: 시각 t 의 12차원 수치 벡터 (표준화)
-    입력 X_img: 시각 t 의 합성 위성 이미지 (4, 32, 32)
-    입력 X_txt: 시각 t 의 MiniLM 텍스트 임베딩 (384)
+    입력 X_num: 시각 t 의 수치 벡터 (표준화). record_to_vec() 14차원이
+               기본이고, island_collector 를 넘기면 도서 강수 26차원이
+               뒤에 붙어 40차원이 된다.
+    입력 X_img: 시각 t 의 Re축 공간보간장 (n_bands, 32, 32) — 기본 4채널
+    입력 X_txt: 시각 t 의 Im축 시간 경향 벡터 (12). 구버전 체크포인트는
+               MiniLM 텍스트 임베딩(384)이며 im_dim 으로 분기한다.
     타깃 y    : [기온_{t+L}, 강수량_{t+L}]      L = lead_hours
 
     수집 실패로 시각이 건너뛴 구간이 있으면 (t, t+L) 쌍이 아예 존재하지
@@ -980,16 +987,17 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         print(f"  강수 상시 0 예측            : {precip_naive:.4f} mm   "
               f"[전체 {full_ds.precip_mean:.4f}]\n")
 
-    # ── 알려진 한계: 정규화·타깃 통계는 아직 전체 표본에서 계산된다 ──
-    # 아래 사전확률·가중치들은 규약대로 train_ds 에서만 산출하지만,
-    # WeatherDataset.__init__ 이 만드는 self.mean/std(입력 표준화)와
-    # temp_mean/temp_std/precip_mean(헤드 편향 초기화·손실 스케일)은
-    # make_split 이전에 **전체 표본**으로 계산된다 — 검증셋이 섞인 통계다.
-    # 표본이 138만 개라 수치 영향은 미미할 것으로 보이나 측정한 적은 없고,
-    # 원칙적으로는 누설이다(2026-08-29 총점검에서 확인).
-    # 지금 고치지 않는 이유: 정규화 통계를 바꾸면 현행 배포 체크포인트와
-    # 입력 스케일이 달라져 재학습이 강제되고, README 의 모든 수치가 무효가
-    # 된다. **다음 재학습 때 함께 고칠 항목**으로 남긴다.
+    # ── [해결됨, 2026-08-31] 정규화·타깃 통계의 검증셋 누설 ──
+    # 종전에는 `WeatherDataset.__init__` 이 만드는 self.mean/std(입력 표준화)와
+    # temp_mean/temp_std/precip_mean(헤드 편향 초기화·손실 스케일)이 분할
+    # 이전에 **전체 표본**으로 계산돼, 아래 사전확률·가중치가 지키는 원칙
+    # (train_ds 에서만 산출)과 어긋났다(2026-08-29 총점검에서 확인).
+    # 이제 셋 다 `_compute_split_indices()` 로 얻은 학습 인덱스에서만
+    # 계산한다 — make_split() 과 같은 함수를 쓰므로 여기 쓰는 학습 인덱스가
+    # 실제 학습 루프의 것과 일치함이 보장된다(WeatherDataset.__init__ 참고).
+    # 이 수정이 배포 체크포인트의 입력 스케일을 바꾸므로 재학습이 강제된다 —
+    # 그래서 현행 배포본은 아직 구 통계로 학습된 상태이며, 다음 유효 개선과
+    # 함께 승격할 때 이 수정이 반영된다(README '분할 알고리즘 교체' 절).
     #
     # hurdle 헤드 사전확률·클래스 불균형 가중치 — 학습 표본에서 직접 계산
     # (고정 상수 아님). 검증셋을 보면 데이터 누설이라 반드시 train_ds 에서만.

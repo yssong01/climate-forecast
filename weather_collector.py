@@ -12,7 +12,6 @@ import functools
 import tempfile
 import threading
 import requests
-import numpy as np
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv

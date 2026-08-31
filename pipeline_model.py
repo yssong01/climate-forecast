@@ -143,8 +143,11 @@ def _binary_head(embed_dim: int, prior: float, dropout: float = 0.0) -> nn.Seque
 
 class NumericalEncoder(nn.Module):
     """
-    Z축 (C): ASOS 지상관측 수치 8차원 → embed_dim.
-    기온·강수·습도·풍속·풍향sin/cos·기압·강수형태를 단일 표현 공간으로 압축.
+    Z축 (C): ASOS 지상관측 수치 벡터 → embed_dim.
+    기온·강수·습도·풍속·풍향sin/cos·기압·강수형태·시각sin/cos·위경도·
+    연중시각sin/cos(14차원)을 단일 표현 공간으로 압축한다. in_dim 은
+    호출부가 실제 입력 폭을 넘겨 결정하므로 아래 기본값 8은 초기 Phase
+    잔재이며, train()/load_model() 은 항상 명시적으로 넘긴다.
     """
     def __init__(self, in_dim: int = 8, embed_dim: int = 64):
         super().__init__()
@@ -630,9 +633,9 @@ class TriCHEFPipeline(nn.Module):
                 txt_x: torch.Tensor = None,
                 collect_diagnostics: bool = False) -> torch.Tensor:
         """
-        num_x : (B, 8)        수치 센서 (필수)
-        img_x : (B, 4, H, W)  위성 이미지
-        txt_x : (B, 384)      MiniLM 텍스트 임베딩
+        num_x : (B, num_features)  수치 센서 (필수). 기본 14, USE_ISLAND 면 40
+        img_x : (B, re_channels, H, W)  Re축 공간보간장. 기본 4채널
+        txt_x : (B, im_dim)        Im축 경향 벡터(12) 또는 MiniLM 임베딩(384)
 
         반환  : (B, 2) — [기온 °C, 강수량 mm]  (물리 단위)
         """
