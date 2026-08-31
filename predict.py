@@ -227,6 +227,7 @@ def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
         precip_gamma_nll=ckpt.get("precip_gamma_nll", False),
         precip_gamma_alpha_init=ckpt.get("precip_gamma_alpha_init", 1.0),
         precip_gamma_mu_init=ckpt.get("precip_gamma_mu_init"),
+        precip_quantile=ckpt.get("precip_quantile", False),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

@@ -305,6 +305,15 @@ COLDWAVE_DROPOUT = float(os.getenv("COLDWAVE_DROPOUT", "0"))
 # (head_dropout/signed_precip_input 과 같은 패턴).
 PRECIP_GAMMA_NLL = os.getenv("PRECIP_GAMMA_NLL", "0") != "0"
 
+# precip_quantile (2026-08-31) — amount 헤드를 습윤 표본 전용 τ=0.5
+# pinball(=L1) 손실로 학습하는 ablation 스위치(pipeline_model.py
+# TriCHEFPipeline.__init__ 의 precip_quantile 주석 참고). Gamma NLL 과
+# 같은 근본 문제(전 표본 MSE 로 학습해 MAE 최적해인 조건부 중앙값과
+# 어긋남, precip-mae-is-metric-artifact 메모리)를 겨냥하되 출력 차원도
+# 손실 결합 구조(곱셈)도 바꾸지 않는 최소 변경이다. 기본값 0(끔) —
+# 검증 전까지 배포 동작을 바꾸지 않는다.
+PRECIP_QUANTILE = os.getenv("PRECIP_QUANTILE", "0") != "0"
+
 # 저장 경로도 환경변수로 뺀다(2026-08-16) — 기본값은 배포가 읽는 경로다.
 # seed를 바꿔가며 재현성을 확인하는 대조 실행은 서로 다른 경로에 저장해야
 # 한다. 안 그러면 ① 동시에 돌린 두 실행이 같은 파일을 덮어쓰고 ② 검증도
@@ -1106,6 +1115,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         precip_gamma_nll=PRECIP_GAMMA_NLL,
         precip_gamma_alpha_init=precip_gamma_alpha_init,
         precip_gamma_mu_init=_wet_mean,   # μ 의 학습 목표는 E[y | 강수] 다
+        precip_quantile=PRECIP_QUANTILE,
         im_dim=TENDENCY_DIM,   # Phase 3-11 — 384(MiniLM) 대신 12(경향벡터)
     ).to(DEVICE)
 
@@ -1209,6 +1219,20 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 nll_raw = -gamma_dist.log_prob(y_wet_clamped)
                 loss = loss + PRECIP_WEIGHT * (
                     (nll_raw * is_wet_f).sum() / is_wet_f.sum().clamp(min=1)
+                )
+            elif PRECIP_QUANTILE:
+                # amount 를 습윤 표본에서만 τ=0.5 pinball(=0.5·L1)로 학습한다
+                # (위 PRECIP_QUANTILE 정의부 주석 참고). 최적해는 조건부
+                # 중앙값 — MAE 로 채점하는 지표와 정확히 같은 목적함수다.
+                # "오는가"는 head_rain 이 이미 담당하므로 amount 항은 습윤
+                # 표본에서만 계산한다(Gamma NLL 과 같은 이유, 이중 벌점 방지).
+                # forward() 의 곱셈 결합(precip_pred=rain_prob*amount)은
+                # 그대로 두므로 손실만 amount 자체를 직접 겨냥한다.
+                is_wet_f = (y_b[:, 1:2] >= WET_THRESH).float()
+                e = y_b[:, 1:2] - model._last_precip_amount
+                pinball = torch.maximum(0.5 * e, -0.5 * e)   # τ=0.5
+                loss = loss + PRECIP_WEIGHT * (
+                    (pinball * is_wet_f).sum() / is_wet_f.sum().clamp(min=1)
                 )
             else:
                 loss = loss + PRECIP_WEIGHT * mse(pred[:, 1:2], y_b[:, 1:2])
@@ -1385,6 +1409,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "precip_gamma_nll": PRECIP_GAMMA_NLL,
                 "precip_gamma_alpha_init": precip_gamma_alpha_init,
                 "precip_gamma_mu_init": _wet_mean,
+                "precip_quantile": PRECIP_QUANTILE,
                 "lead_hours":   lead_hours,
                 "num_features": num_features,
                 "use_island":   USE_ISLAND,

@@ -347,7 +347,8 @@ class TriCHEFPipeline(nn.Module):
                  coldwave_dropout: float = 0.0,
                  precip_gamma_nll: bool = False,
                  precip_gamma_alpha_init: float = 1.0,
-                 precip_gamma_mu_init: float = None):
+                 precip_gamma_mu_init: float = None,
+                 precip_quantile: bool = False):
         """
         orthogonalize        : Gram-Schmidt 직교화 on/off (ablation 스위치)
         gs_eps               : 소프트 정규화 ε — gradient 상한 1/ε
@@ -431,6 +432,26 @@ class TriCHEFPipeline(nn.Module):
         # 큰 값을 과소평가하지 않는다. 기본값 False — 검증 전까지 배포 동작을
         # 바꾸지 않는다(head_dropout/signed_precip_input 과 같은 패턴).
         self.precip_gamma_nll = precip_gamma_nll
+        # precip_quantile (2026-08-31) — amount 헤드의 학습 목표를 "곱셈
+        # 결과(rain_prob×amount)의 전체 표본 MSE"에서 "습윤 표본에서만의
+        # amount 자체의 τ=0.5 pinball(=L1) 손실"로 바꾸는 ablation 스위치.
+        # precip_gamma_nll 과 같은 근본 문제(precip-mae-is-metric-artifact
+        # 메모리 ③)를 겨냥하지만 더 보수적이다 — 새 출력 차원을 늘리지
+        # 않고(헤드 구조 불변), forward() 의 곱셈 결합(precip_pred =
+        # rain_prob*amount)도 그대로 둔다. 오직 손실 함수만 바뀐다.
+        #
+        # 왜 이렇게 좁혔는가. 실측(README 개선 레버 측정)으로 amount 헤드가
+        # 젖은 구간에서 상수(중앙값)보다 나쁘다는 것과(2.2115 vs 2.0746),
+        # 그 원인이 "전 표본(93.8% 무강수 포함) MSE 로 학습해 MAE 최적해인
+        # 조건부 중앙값과 어긋난다"는 것이 확인됐다. 이걸 직접 겨냥하는
+        # 최소 변경이 습윤-전용 pinball(0.5) 다. Gamma NLL 재도전(F1 0.51
+        # 까지 확인했으나 다른 헤드 퇴보로 미승격, precip-gamma-median-
+        # tradeoff-paused 메모리)은 출력을 2차원(μ,α)으로 늘리고 분포
+        # 가정을 추가했다 — 변경 표면이 넓어 다른 헤드로 새는 경사의 원인을
+        # 좁히기 어려웠다. 이 스위치는 출력 차원도 손실 결합 구조도 바꾸지
+        # 않아 대조가 더 깨끗하다. 기본값 False — 검증 전까지 배포 동작을
+        # 바꾸지 않는다.
+        self.precip_quantile = precip_quantile
         _precip_out = 2 if precip_gamma_nll else 1
         self.head_precip = nn.Sequential(
             *_head_layers(_reg_dim, head_dropout, out_dim=_precip_out))
@@ -524,6 +545,7 @@ class TriCHEFPipeline(nn.Module):
         self._last_rain_logit = None      # hurdle BCE 손실 계산용 (train.py 가 읽음)
         self._last_precip_mu = None       # Gamma NLL μ (precip_gamma_nll=True 일 때만)
         self._last_precip_alpha = None    # Gamma NLL α (precip_gamma_nll=True 일 때만)
+        self._last_precip_amount = None   # 원본 amount(곱셈 전) — precip_quantile 손실용
         self._last_heatwave_logit = None  # 폭염 BCE 손실 계산용
         self._last_coldwave_logit = None  # 한파 BCE 손실 계산용
         self._last_dust_logit = None      # 황사 BCE 손실 계산용
@@ -736,6 +758,7 @@ class TriCHEFPipeline(nn.Module):
                                                    rate.squeeze(-1)).unsqueeze(-1)
         else:
             amount = F.softplus(self.head_precip(_reg_in))
+            self._last_precip_amount = amount   # train.py 가 precip_quantile 손실에 사용
             precip_pred = rain_prob * amount
 
         # 극한기상 경보 확률 — 회귀 출력(temp_pred/precip_pred)과 별개로
