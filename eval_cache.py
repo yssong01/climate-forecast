@@ -58,12 +58,19 @@ def cache_signature(ckpt_path: str, ckpt: dict) -> dict:
     }
     # 학습 데이터 파일도 서명에 넣는다(2026-08-29 추가). 종전에는 체크포인트
     # 속성만 봤는데, build() 는 매번 collect_historical() 로 이 파일을 다시
-    # 읽으므로 파일이 바뀌면 캐시 내용이 실제와 어긋난다 — 특히 make_split
-    # 의 그룹 분할이 **고유 날짜 수**에 의존해(torch.randperm(len(uniq)))
-    # 데이터가 늘면 같은 SEED 로도 검증셋 구성이 통째로 달라진다(실측:
-    # 날짜가 1개만 늘어도 검증셋 겹침이 20%). 파일이 바뀌면 최소한 캐시를
-    # 다시 만들게 해서, 아래 _assert_split_matches_checkpoint() 의 대조가
-    # 반드시 한 번은 실행되도록 한다.
+    # 읽으므로 파일이 바뀌면 캐시 내용이 실제와 어긋난다. 파일이 바뀌면
+    # 최소한 캐시를 다시 만들게 해서, 아래 _assert_split_matches_checkpoint()
+    # 의 대조가 반드시 한 번은 실행되도록 한다.
+    #
+    # (2026-08-31 갱신) 종전 주석은 "그룹 분할이 고유 날짜 수에 의존한다
+    # (torch.randperm(len(uniq)))"를 근거로 들었는데, 그 의존성 자체는 날짜
+    # 문자열 해시 배정으로 교체돼 사라졌다 — 이제 날짜가 늘어도 기존 배정은
+    # 불변이다. 그래도 이 서명 항목은 유지한다: 데이터가 바뀌면 표본 구성
+    # (유효 (t, t+L) 쌍)이 달라져 캐시 내용이 어긋나는 것은 그대로이기 때문이다.
+    #
+    # `use_island` 체크포인트는 cache/island_aws_raw.parquet 도 읽지만(build
+    # 아래), 그 파일은 서명에 없다 — 현재 그런 체크포인트가 없어 잠복 상태다.
+    # 도서 특징을 다시 채택하면 이 서명에 parquet mtime/size 도 넣어야 한다.
     try:
         dst = os.stat(DATA_CACHE)
         sig["data_mtime"] = float(dst.st_mtime)
@@ -77,10 +84,18 @@ def cache_signature(ckpt_path: str, ckpt: dict) -> dict:
 def _assert_split_matches_checkpoint(ds, val_idx, ckpt) -> None:
     """재구성한 검증셋이 학습 당시의 그것과 같은지 기준선으로 대조한다.
 
-    make_split 의 그룹 분할은 고유 날짜 수에 의존하므로, 학습 이후 데이터가
-    누적되면 같은 SEED·같은 split_mode 여도 다른 검증셋이 나온다. 그러면
-    "학습 때 본 적 없는 표본"이라는 전제가 깨진 채 지표가 산출되는데,
-    지표 자체는 멀쩡해 보여서 눈치채기 어렵다.
+    재구성한 검증셋이 학습 당시와 달라지는 경로는 두 가지다. ① 분할
+    알고리즘이 바뀐 경우 — group 분할은 2026-08-31 에
+    `torch.randperm(고유 날짜 수)`에서 날짜 문자열 해시 배정으로 교체됐고,
+    그 이전에 학습된 체크포인트(현행 배포본 포함)는 현재 코드로 재현되지
+    않는다. ② 학습 이후 데이터가 누적된 경우 — 유효 (t, t+L) 쌍 구성이
+    달라진다(해시 배정으로 바뀐 뒤로는 날짜별 배정 자체는 불변이다).
+    어느 쪽이든 "학습 때 본 적 없는 표본"이라는 전제가 깨진 채 지표가
+    산출되는데, 지표 자체는 멀쩡해 보여서 눈치채기 어렵다.
+
+    같은 대조를 `train.assert_split_matches()` 가 `make_split(..., ckpt=ckpt)`
+    경로에서도 수행한다 — eval_cache 를 거치지 않는 진단 스크립트 15개를
+    덮기 위해서다(2026-08-31 추가).
 
     체크포인트에 저장된 val_temp_naive_mae / val_precip_naive_mae 는 학습
     당시 검증셋에서 계산한 값이다 — 지금 재구성한 검증셋에서 같은 값이
@@ -99,12 +114,15 @@ def _assert_split_matches_checkpoint(ds, val_idx, ckpt) -> None:
             raise RuntimeError(
                 f"검증셋이 학습 당시와 다르다 — {ko} 기준선 저장값 {float(want):.6f} "
                 f"vs 재구성값 {got:.6f}.\n"
-                f"  원인: make_split 의 그룹 분할이 고유 날짜 수에 의존하는데 "
-                f"{DATA_CACHE} 가 학습 이후 변경됐을 가능성이 높다.\n"
+                f"  원인 후보 ① 분할 알고리즘이 바뀌었다 — group 분할은 2026-08-31 에\n"
+                f"     torch.randperm(고유 날짜 수)에서 날짜 문자열 해시로 교체됐다.\n"
+                f"     그 이전에 학습된 체크포인트(현행 배포본 포함)는 현재 코드로\n"
+                f"     재현되지 않는다. 이 경우 데이터를 되돌려도 해결되지 않는다.\n"
+                f"  원인 후보 ② {DATA_CACHE} 가 학습 이후 변경됐다.\n"
                 f"  이 상태의 지표는 '학습에 쓰인 표본'을 검증셋에 섞어 산출한 "
                 f"값일 수 있으므로 신뢰할 수 없다.\n"
-                f"  조치: 이 체크포인트를 학습할 때 쓴 데이터 파일로 되돌리거나, "
-                f"현재 데이터로 재학습할 것.")
+                f"  조치: ①이면 현재 코드로 재학습한 체크포인트를 쓸 것. "
+                f"②면 학습 당시 데이터 파일로 되돌릴 것.")
 
 
 def is_fresh(path: str, sig: dict) -> bool:

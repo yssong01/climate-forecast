@@ -102,7 +102,7 @@ def main():
     )
     # 학습 때와 동일한 시드로 분할해 검증셋만 뽑는다 — 학습에 쓰인 표본을
     # 분포 진단에 섞으면 과적합된 부분까지 "정상"으로 보게 된다.
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False)
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False, ckpt=ckpt)
     val_idx = val_ds.indices
     print(f"검증 표본: {len(val_idx)}개")
 

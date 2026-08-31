@@ -45,7 +45,7 @@ def main():
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True)
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True, ckpt=ckpt)
     val_idx = list(val_ds.indices)
 
     temp_mae, precip_mae, metrics = evaluate(model, ds, val_idx, DEVICE)

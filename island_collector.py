@@ -33,8 +33,14 @@ parquet 갱신은 `collect_island_backfill.py`. 실시간 서빙용 조회는 �
 `fetch_live_snapshot()`.
 """
 import numpy as np
-import pandas as pd
 import requests
+
+# pandas·pyarrow 는 **학습·평가 경로에서만** 필요하다(parquet 조회). 서빙
+# 경로(`fetch_live_snapshot`/`encode_live`)는 requests 만 쓴다. 모듈 최상단에서
+# import 하면 배포 이미지가 선언하지 않은 pyarrow 에 묶이므로(requirements.txt
+# ·requirements-app.txt 에 없다), IslandPrecipCollector 안에서 지연 import 한다
+# — 2026-08-31 점검에서 "use_island 승격 시 서빙 컨테이너가 죽는다"는 잠복
+# 위험으로 지적된 항목을 구조적으로 끊은 것이다.
 
 ISLAND_PARQUET = "./cache/island_aws_raw.parquet"
 
@@ -69,13 +75,22 @@ class IslandPrecipCollector:
     """(시각) → 26차원 벡터. TendencyCollector와 같은 get_batch/encode_single 인터페이스."""
 
     def __init__(self, parquet_path: str = ISLAND_PARQUET):
+        import pandas as pd   # 지연 import — 모듈 상단 주석 참고
+
         df = pd.read_parquet(parquet_path, columns=["tm", "stn", "rn_hr1", "rn_hr1_missing"])
         df = df[df["stn"].isin(ISLAND_STNS)]
         # (tm, stn) -> rn_hr1 (결측이면 None). 중복 시각·지점 조합은 마지막이 이긴다
         # (이 저장소의 다른 dedup 병합과 동일 규칙).
-        self.by_key: dict[tuple[str, str], float] = {}
+        #
+        # 결측 판정에 `pd.isna(missing)` 를 함께 본다 — 플래그 컬럼에 NaN 이
+        # 섞이면 `bool(NaN)` 이 True 가 되어 "결측 아님"을 결측으로 뒤집는다
+        # (2026-08-31 실측: 백필이 만든 `wd_missing` 이 정확히 이 상태였다).
+        self.by_key: dict[tuple[str, str], float | None] = {}
         for tm, stn, rn, missing in zip(df["tm"], df["stn"], df["rn_hr1"], df["rn_hr1_missing"]):
-            self.by_key[(str(tm), stn)] = None if bool(missing) else float(rn)
+            if pd.isna(missing) or pd.isna(rn):
+                self.by_key[(str(tm), stn)] = None
+            else:
+                self.by_key[(str(tm), stn)] = None if bool(missing) else float(rn)
 
     def _vector(self, timestamp) -> np.ndarray:
         tm = str(timestamp)[:12]
@@ -98,12 +113,18 @@ def fetch_live_snapshot(tm=None, timeout: int = 15) -> dict:
     않는다(CLAUDE.md 1절 5항).
     """
     import os
-    from datetime import datetime, timedelta
+    from datetime import datetime
+
+    from weather_collector import KST, redact_secrets
 
     key = os.getenv("KMA_API_KEY", "")
     if tm is None:
-        tm = (datetime.utcnow() + timedelta(hours=9)).replace(
-            minute=0, second=0, microsecond=0)
+        # 인자가 없으면 현재 정시를 쓰지만, **서빙 경로는 반드시 대상 레코드의
+        # 시각을 넘겨야 한다**(아래 encode_live docstring 참고).
+        tm = datetime.now(KST).replace(minute=0, second=0, microsecond=0,
+                                       tzinfo=None)
+    elif isinstance(tm, str):
+        tm = datetime.strptime(str(tm)[:12], "%Y%m%d%H%M")
     snapshot = {stn: None for stn in ISLAND_STNS}
     if not key:
         return snapshot
@@ -126,10 +147,25 @@ def fetch_live_snapshot(tm=None, timeout: int = 15) -> dict:
             except ValueError:
                 continue
             snapshot[stn] = None if rn < 0.0 else rn
-    except Exception:
-        pass   # 실패해도 전부 결측(None)으로 반환 — 화면에는 정보없음으로 표시
+    except Exception as e:
+        # 전부 결측(None)으로 반환한다 — 날조하지 않는다(CLAUDE.md 1절 5항).
+        # 다만 조용히 삼키지는 않는다: 인증키 오류·IP 차단이 아무 흔적 없이
+        # "결측"으로 둔갑하면 진단이 불가능하다(2026-08-19 사고의 교훈).
+        # 예외 문자열에는 authKey 가 섞이므로 반드시 redact 후 출력한다.
+        print(f"[WARN] 도서 AWS 조회 실패({tm:%Y%m%d%H%M}) — 전 지점 결측 처리: "
+              f"{type(e).__name__}: {redact_secrets(str(e), key)[:150]}")
     return snapshot
 
 
-def encode_live() -> np.ndarray:
-    return _vector_from_map(fetch_live_snapshot())
+def encode_live(tm=None) -> np.ndarray:
+    """서빙용 26차원 벡터. **대상 레코드의 관측 시각을 반드시 넘길 것.**
+
+    학습은 `IslandPrecipCollector._vector(record["timestamp"])` 로 소스 레코드
+    시각의 도서 관측을 붙인다. 서빙이 벽시계 현재 시각을 쓰면 두 경로가 다른
+    시각을 보게 되어, 학습 때 성립하던 `island(t) ↔ record(t)` 짝이 깨진다
+    (2026-08-31 수정). 특히 `_obs_time()` 이 정시 10분 이전에 한 시간 뒤로
+    물리거나 레코드가 저장소 창 폴백일 때 몇 시간까지 벌어진다 —
+    `predict.py` 가 이웃 관측소에 대해 `timestamp == snapshot_ts` 를 엄격히
+    강제하는 것과 같은 이유다.
+    """
+    return _vector_from_map(fetch_live_snapshot(tm))

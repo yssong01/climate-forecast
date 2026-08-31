@@ -61,7 +61,7 @@ def main():
     # 으로도 적중률을 계산하게 된다 — 오늘 확인한 검증 누수와 같은 종류의
     # 문제다(2026-08-16 배포 전 점검에서 발견). 체크포인트가 실제로 학습된
     # 분할(split_mode)을 그대로 재현해 그 검증 인덱스만 쓴다.
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False)
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False, ckpt=ckpt)
     val_idx = list(val_ds.indices)
     n = len(val_idx)
     print(f"백테스트 대상: {n}개 (t, t+{ckpt['lead_hours']}h) 쌍 "

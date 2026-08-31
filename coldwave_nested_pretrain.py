@@ -156,7 +156,7 @@ def main():
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )
-    train_ds, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True)
+    train_ds, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True, ckpt=ckpt)
     train_idx = list(train_ds.indices)
     val_idx = list(val_ds.indices)
 

@@ -42,6 +42,12 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+# KST 는 저장소 표준(weather_collector.KST)을 그대로 쓴다 — `datetime.utcnow()
+# + 9시간` 은 Python 3.12 에서 deprecated 이고, 컨테이너가 UTC 라 시각이 밀렸던
+# 사고(weather_collector.py 상단 주석) 이후 이 저장소는 ZoneInfo 로 통일했다.
+# redact_secrets 도 같은 이유로 자체 구현 대신 정식 함수를 쓴다(CLAUDE.md 4절).
+from weather_collector import KST, redact_secrets
+
 load_dotenv()
 
 BASE = "https://apihub.kma.go.kr/api"
@@ -51,6 +57,13 @@ OUT_FILE = "./cache/island_aws_raw.parquet"
 AWSH_COLUMNS = ["tm", "stn", "ta", "wd", "ws", "rn_day", "rn_hr1", "hm", "pa", "ps"]
 # 기존 parquet 스키마와 맞춘다 — rn_day/ps는 애초에 저장하지 않았다.
 KEEP_FIELDS = ["ta", "wd", "ws", "rn_hr1", "hm", "pa"]
+# 결측 플래그를 만드는 필드는 **기존 parquet에 이미 그 컬럼이 있는 것만**으로
+# 제한한다(2026-08-31 수정). 종전엔 KEEP_FIELDS 전체에 플래그를 만들어
+# `wd_missing` 이라는 없던 컬럼이 새로 생겼고, 기존 497,107행에는 그 값이
+# 없어 NaN(dtype=object)으로 채워졌다 — 이 상태에서 `.astype(bool)` 을 하면
+# **NaN 이 True(결측)로 뒤집힌다**(IslandPrecipCollector 가 rn_hr1_missing 에
+# 쓰는 것과 같은 패턴이라 실제로 걸릴 수 있는 함정이었다).
+FLAG_FIELDS = ["ta", "ws", "rn_hr1", "hm", "pa"]
 RAIN_FIELDS = {"rn_hr1", "rn_day"}
 
 # island-aws-ablation-gate-passed 메모의 14개 코드(가대암 956 포함 —
@@ -92,7 +105,14 @@ def _tag_missing(value, *, is_rain: bool, sentinel: float = -50.0):
 
 
 def redact(text: str, key: str) -> str:
-    return text.replace(key, "***") if key else text
+    """정식 `weather_collector.redact_secrets()` 로 위임한다(2026-08-31 수정).
+
+    종전엔 리터럴 치환만 했다 — 그러면 `authKey=` 패턴 방어선(`_AUTHKEY_RE`)이
+    빠져, 환경변수가 비었거나 키 포맷이 다른 경우를 놓친다. CLAUDE.md 4절이
+    "redact_secrets() 를 거치지 않고 예외를 문자열화해 표시·출력하지 않는다"고
+    명시한 규약의 대상이다.
+    """
+    return redact_secrets(text, key)
 
 
 def fetch_awsh(tm: datetime, key: str, timeout: int = 20) -> list[dict]:
@@ -116,7 +136,8 @@ def fetch_awsh(tm: datetime, key: str, timeout: int = 20) -> list[dict]:
                 continue
             val, missing = _tag_missing(_f(raw), is_rain=name in RAIN_FIELDS)
             row[name] = val
-            row[f"{name}_missing"] = missing
+            if name in FLAG_FIELDS:
+                row[f"{name}_missing"] = missing
         rows.append(row)
     return rows
 
@@ -125,8 +146,15 @@ def atomic_save(df: pd.DataFrame, path: str) -> None:
     d = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(dir=d, suffix=".parquet")
     os.close(fd)
-    df.to_parquet(tmp, index=False)
-    os.replace(tmp, path)
+    try:
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
+    except Exception:
+        # 실패 시 tmp 를 남기지 않는다 — collect_year.atomic_save·
+        # weather_collector._atomic_write_json 과 같은 처리.
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 def main():
@@ -141,17 +169,26 @@ def main():
 
     existing = pd.read_parquet(OUT_FILE)
     existing["tm"] = existing["tm"].astype(str)
-    last_tm = datetime.strptime(existing["tm"].max(), "%Y%m%d%H%M")
-    now_kst = datetime.utcnow() + timedelta(hours=9)
-    now_kst = now_kst.replace(minute=0, second=0, microsecond=0)
+    have = set(existing["tm"].tolist())
+    first_tm = datetime.strptime(min(have), "%Y%m%d%H%M")
+    now_kst = datetime.now(KST).replace(minute=0, second=0, microsecond=0, tzinfo=None)
 
-    cursor = last_tm + timedelta(hours=1)
-    total_hours = int((now_kst - cursor).total_seconds() // 3600) + 1
-    print(f"기존 데이터 최대 시각: {last_tm} · 목표: {now_kst} · "
-          f"필요 호출 {max(total_hours, 0):,}회 · 이번 실행 예산 {args.budget:,}회")
+    # **집합 차집합으로 결손을 센다**(2026-08-31 수정). 종전엔 커서를
+    # `max(tm)+1h` 에서 시작해 앞으로만 전진했는데, 그러면 실패한 시각이
+    # 영구 구멍으로 남는다 — 다음 실행이 그 시각을 절대 되돌아보지 않기
+    # 때문이다. 실제로 첫 3회 실행에서 503·타임아웃·401 로 5개 구간
+    # 57시간이 유실됐는데도 종료 메시지는 "남은 결손 약 0시간"이었다.
+    # 이제 기대 시각 전체에서 이미 가진 시각을 빼 **중간 구멍부터** 채운다.
+    expected, cur = [], first_tm
+    while cur <= now_kst:
+        expected.append(cur.strftime("%Y%m%d%H%M"))
+        cur += timedelta(hours=1)
+    todo = [t for t in expected if t not in have]
+    print(f"보유 구간: {min(have)} ~ {max(have)} · 목표: {now_kst:%Y%m%d%H%M}")
+    print(f"결손 {len(todo):,}시간(중간 구멍 포함) · 이번 실행 예산 {args.budget:,}회")
 
-    if cursor > now_kst:
-        print("결손 구간 없음 — 이미 최신입니다.")
+    if not todo:
+        print("결손 구간 없음 — 이미 완전합니다.")
         return 0
 
     new_rows = []
@@ -161,7 +198,10 @@ def main():
     t_last_save = time.time()
     recent = []   # 최근 시도 성공/실패 슬라이딩 윈도우 — collect_year.py와 동일 안전장치
 
-    while cursor <= now_kst and requested < args.budget and not _stop:
+    for tm_str in todo:
+        if requested >= args.budget or _stop:
+            break
+        cursor = datetime.strptime(tm_str, "%Y%m%d%H%M")
         try:
             rows = fetch_awsh(cursor, key)
             new_rows.extend(rows)
@@ -173,7 +213,6 @@ def main():
             print(f"  [{cursor:%Y-%m-%d %H:%M}] 실패: {type(e).__name__}: "
                   f"{redact(str(e), key)[:150]}")
         requested += 1
-        cursor += timedelta(hours=1)
         recent = recent[-50:]
 
         # 최근 50건 성공률이 70% 미만이면 서버 쪽 일시 장애로 보고 60초 쉰다 —
@@ -203,9 +242,16 @@ def main():
         atomic_save(merged, OUT_FILE)
         existing = merged
 
-    remaining = max(0, int((now_kst - cursor).total_seconds() // 3600) + 1) if cursor <= now_kst else 0
-    print(f"\n종료 — 요청 {requested}회(성공 {ok}, 실패 {fail}), 저장 {len(existing):,}행, "
-          f"남은 결손 약 {remaining:,}시간(다음 실행에서 자동 재개)")
+    # 남은 결손은 저장된 실제 내용에서 다시 센다 — 커서 위치가 아니라
+    # 데이터가 진실이다(종전엔 커서로 계산해 실패분을 0으로 보고했다).
+    have_after = set(existing["tm"].astype(str).tolist())
+    remaining = [t for t in expected if t not in have_after]
+    print(f"\n종료 — 요청 {requested}회(성공 {ok}, 실패 {fail}), 저장 {len(existing):,}행")
+    if remaining:
+        print(f"  남은 결손 {len(remaining):,}시간 — 다시 실행하면 이 구멍부터 채운다.")
+        print(f"  (가장 이른 결손 {remaining[0]}, 가장 늦은 결손 {remaining[-1]})")
+    else:
+        print("  결손 없음 — 구간이 완전히 채워졌다.")
     return 0
 
 

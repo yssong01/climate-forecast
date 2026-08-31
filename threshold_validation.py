@@ -80,7 +80,7 @@ def main():
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False)
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False, ckpt=ckpt)
     val_idx = np.array(val_ds.indices)
 
     rain_p, heat_p, cold_p, dust_p = [], [], [], []

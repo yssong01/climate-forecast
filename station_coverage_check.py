@@ -56,7 +56,7 @@ def main():
         txt_collector=TendencyCollector(records), lead_hours=ckpt["lead_hours"],
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32))
-    _, val = make_split(ds, ckpt.get("split_mode", "group"), verbose=False)
+    _, val = make_split(ds, ckpt.get("split_mode", "group"), verbose=False, ckpt=ckpt)
     vi = np.array(val.indices)
     stns = np.array(ds.stns)[vi]
     code2name = {v: k for k, v in STATIONS.items()}

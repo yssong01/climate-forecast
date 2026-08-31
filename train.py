@@ -729,9 +729,50 @@ def _compute_split_indices(dates: np.ndarray, n: int, mode: str) -> tuple[list[i
     return train_idx, val_idx
 
 
-def make_split(full_ds, mode: str, verbose: bool = True):
+def assert_split_matches(full_ds, val_idx, ckpt, where: str = "") -> None:
+    """재구성한 검증셋이 체크포인트 학습 당시의 것과 같은지 기준선으로 대조한다.
+
+    **왜 이 함수가 `eval_cache` 밖에도 필요한가(2026-08-31 추가).**
+    종전에는 `eval_cache._assert_split_matches_checkpoint()` 하나만 이 대조를
+    했다. 그런데 2026-08-31 에 group 분할을 날짜 해시 기반으로 바꾸면서,
+    **그 이전에 학습된 체크포인트(현행 배포본 포함)는 현재 코드로 재구성한
+    검증셋과 다른 표본을 보게 됐다** — 실측: 저장된 기온 기준선 3.3452 vs
+    재구성값 3.3057. `eval_cache` 를 쓰는 경로는 여기서 멈추지만,
+    `make_split()` 을 직접 부르는 진단 스크립트 16개는 아무 경고 없이
+    **학습에 쓴 표본이 섞인 검증셋**에서 지표를 계산한다. 지표는 멀쩡해
+    보여서 눈치챌 수 없다(CLAUDE.md 1절 15항이 경고한 바로 그 상황).
+
+    체크포인트에 기준선이 없으면(구버전) 조용히 통과한다.
+    """
+    checks = (
+        ("val_temp_naive_mae", float(full_ds.temp_persist_abs[val_idx].mean()), "기온 퍼시스턴스"),
+        ("val_precip_naive_mae", float(full_ds.y[val_idx, 1].abs().mean()), "강수 상시 0"),
+    )
+    for key, got, ko in checks:
+        want = (ckpt or {}).get(key)
+        if want is None:
+            continue
+        if abs(float(want) - got) > 1e-4:
+            raise RuntimeError(
+                f"검증셋이 학습 당시와 다르다{(' — ' + where) if where else ''}: "
+                f"{ko} 기준선 저장값 {float(want):.6f} vs 재구성값 {got:.6f}.\n"
+                f"  원인 후보 ① 분할 알고리즘이 바뀌었다 — group 분할은 2026-08-31 에\n"
+                f"     torch.randperm(고유 날짜 수)에서 날짜 문자열 해시로 교체됐다.\n"
+                f"     그 이전에 학습된 체크포인트는 현재 코드로 재현되지 않는다.\n"
+                f"  원인 후보 ② {DATA_CACHE} 가 학습 이후 변경됐다.\n"
+                f"  이 상태의 지표는 '학습에 쓰인 표본'을 검증셋에 섞어 산출한\n"
+                f"  값일 수 있으므로 신뢰할 수 없다.")
+
+
+def make_split(full_ds, mode: str, verbose: bool = True, ckpt: dict = None):
     """
     학습/검증 분할. mode 는 SPLIT_MODE 참고.
+
+    `ckpt` 를 넘기면 재구성한 검증셋이 그 체크포인트 학습 당시와 같은지
+    `assert_split_matches()` 로 대조하고, 다르면 예외를 던진다 — 기존
+    체크포인트를 진단하는 스크립트는 **반드시 넘길 것**(2026-08-31 추가,
+    그 함수 docstring 의 경위 참고). 새로 학습하는 경로(train())는 대조할
+    기준선이 아직 없으므로 넘기지 않는다.
 
     왜 무작위 말고 다른 모드가 필요한가(2026-08-15 split_leakage_check.py 실측)
     ─ 폭염·한파·황사 라벨은 (관측소, 날짜) 단위다. 특보가 발효된 날은 그날
@@ -755,6 +796,9 @@ def make_split(full_ds, mode: str, verbose: bool = True):
     # 라벨 기준 날짜 = 타깃 시각의 날짜 (라벨이 붙는 단위와 일치시킨다)
     dates = np.array([str(ts)[:8] for ts in full_ds.tgt_timestamps])
     train_idx, val_idx = _compute_split_indices(dates, n, mode)
+
+    if ckpt is not None:
+        assert_split_matches(full_ds, np.asarray(val_idx), ckpt, where="make_split()")
 
     if verbose:
         # numpy 문자열 배열은 min/max 유니버설 함수가 없다 — 파이썬 set 으로 센다

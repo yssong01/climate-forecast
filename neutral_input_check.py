@@ -104,7 +104,7 @@ def main():
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False)
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False, ckpt=ckpt)
     val_idx = np.array(val_ds.indices)
     rng = np.random.RandomState(1234)
     idx = np.sort(rng.choice(val_idx, size=min(args.n, len(val_idx)), replace=False))

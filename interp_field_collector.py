@@ -1,6 +1,6 @@
 """
 interp_field_collector.py — Re축을 "가짜 위성"에서 "12개 관측소 실측
-공간보간장(場)"으로 교체.
+공간보간장(field)"으로 교체.
 
 왜: SimulatedSatelliteCollector 는 대상 관측소 자신의 스칼라(기온·습도·
 기압·풍속)를 랜덤 노이즈로 흩뿌린 것뿐이라 원리적으로 새 정보가 없다

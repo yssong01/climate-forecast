@@ -50,7 +50,7 @@ def main():
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False)
+    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False, ckpt=ckpt)
     idx = np.array(val_ds.indices)
     stns = np.array([ds.stns[i] for i in idx])
     tgt_ts = np.array([ds.tgt_timestamps[i] for i in idx])
