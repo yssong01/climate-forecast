@@ -20,6 +20,7 @@ Phase 3-4에서 확정된 사항
 import os
 import json
 import time
+import hashlib
 import torch
 import torch.nn as nn
 from torch.utils.data import (Dataset, DataLoader, Subset, WeightedRandomSampler,
@@ -32,6 +33,7 @@ from weather_collector import RobustWeatherCollector, STATIONS, STATION_COORDS, 
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector, TENDENCY_DIM
 from text_collector import SimulatedTextCollector
+from island_collector import IslandPrecipCollector, ISLAND_DIM
 from pipeline_model import TriCHEFPipeline
 
 load_dotenv()
@@ -158,6 +160,11 @@ COMPACT_SATELLITE = True
 # 손해 4개"라는 원래 사유는 과장이었다. 상세는 CLAUDE.md 5절 참고. 기본값은
 # 4(구버전, 강수 채널 없음)로 되돌리고, 코드는 재현 가능하도록 남겨둔다.
 RE_CHANNELS = int(os.getenv("RE_CHANNELS", "4"))
+# 서해 도서 AWS 13개 지점 강수를 Z축 부가 특징(26차원, island_collector.py)
+# 으로 추가할지. island-aws-ablation-gate-passed 절제 실험(ΔAUC +0.0143)의
+# 검증을 실제 파이프라인 재학습으로 재확인하는 대조 실험용 플래그다
+# (2026-08-31). 기본값 0(끔) — CHECKPOINT_PATH 분리한 대조 실험으로만 켠다.
+USE_ISLAND = os.getenv("USE_ISLAND", "0") == "1"
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
 SEED          = 42     # 학습/검증 분할 고정 → ablation 비교 가능
 # 모델 초기화·학습 stochasticity(가중치 초기값, DataLoader 셔플 순서)만
@@ -481,6 +488,7 @@ class WeatherDataset(Dataset):
     def __init__(self, records: list[dict],
                  sat_collector=None,   # InterpolatedFieldCollector — Re축, 실측 공간보간장
                  txt_collector: SimulatedTextCollector = None,
+                 island_collector=None,   # IslandPrecipCollector — Z축 부가 특징(도서 강수)
                  lead_hours: int = 1,
                  mean: np.ndarray = None, std: np.ndarray = None):
         L = lead_hours
@@ -520,9 +528,27 @@ class WeatherDataset(Dataset):
 
         # ── Z축: 수치 특성 ───────────────────────────────────────
         vecs = np.array([record_to_vec(r) for r in src_records], dtype=np.float32)
+        if island_collector is not None:
+            # 새 축은 벡터 끝에 붙인다(CLAUDE.md 1절 7항) — 구버전 체크포인트는
+            # mean 길이만큼만 앞에서 자르므로 이 블록이 통째로 빠진 채 복원된다.
+            # 다른 Z축 특성과 함께 평균/표준편차로 표준화된다(아래) — island_
+            # collector.py 는 이미 [0,1] 범위로 압축돼 있지만, 별도 파이프라인을
+            # 두지 않고 기존 Z축과 동일하게 다룬다.
+            vecs = np.concatenate(
+                [vecs, island_collector.get_batch(src_records)], axis=1)
         if mean is None:
-            self.mean = vecs.mean(axis=0)
-            self.std  = np.where(vecs.std(axis=0) > 1e-6, vecs.std(axis=0), 1.0)
+            # 정규화 통계는 학습 인덱스에서만 계산한다(2026-08-31,
+            # deferred-to-next-retrain 정정) — 종전엔 전체 표본(검증셋 포함)
+            # 에서 계산해, wet_prior·pos_weight·Gamma α 초기값이 이미 지키는
+            # "train_ds.indices에서만 산출" 원칙과 어긋났다. make_split()과
+            # 같은 _compute_split_indices()를 써서 여기서 쓰는 학습 인덱스가
+            # 실제 학습 루프의 학습 인덱스와 정확히 일치하도록 보장한다.
+            _dates_for_stats = np.array([str(ts)[:8] for ts in self.tgt_timestamps])
+            _train_idx_for_stats, _ = _compute_split_indices(
+                _dates_for_stats, len(vecs), SPLIT_MODE)
+            self.mean = vecs[_train_idx_for_stats].mean(axis=0)
+            self.std  = np.where(vecs[_train_idx_for_stats].std(axis=0) > 1e-6,
+                                  vecs[_train_idx_for_stats].std(axis=0), 1.0)
         else:
             # record_to_vec()이 나중에 차원을 늘려도(2026-08-16: 12→14, 연중
             # 시각 sin/cos 추가) 구버전 체크포인트의 mean/std(짧은 차원)를 그대로
@@ -558,10 +584,16 @@ class WeatherDataset(Dataset):
                                              dtype=torch.float32)
         self.temp_persistence_mae = float(self.temp_persist_abs.mean())
 
-        # 타깃 통계 — 헤드 편향 초기화 및 손실 스케일 정규화에 사용
-        self.temp_mean   = float(temp_tgt.mean())
-        self.temp_std    = float(max(temp_tgt.std(), 1e-3))
-        self.precip_mean = float(precip_tgt.mean())
+        # 타깃 통계 — 헤드 편향 초기화 및 손실 스케일 정규화에 사용. mean이
+        # None(신규 학습)이면 위와 같은 이유로 학습 인덱스에서만 산출한다.
+        if mean is None:
+            self.temp_mean   = float(temp_tgt[_train_idx_for_stats].mean())
+            self.temp_std    = float(max(temp_tgt[_train_idx_for_stats].std(), 1e-3))
+            self.precip_mean = float(precip_tgt[_train_idx_for_stats].mean())
+        else:
+            self.temp_mean   = float(temp_tgt.mean())
+            self.temp_std    = float(max(temp_tgt.std(), 1e-3))
+            self.precip_mean = float(precip_tgt.mean())
 
         # 관측소 구성 진단 — 다중 관측소 확장 검증용
         self.n_stations = len({r.get("stn") for r in src_records})
@@ -653,6 +685,50 @@ class WeatherDataset(Dataset):
 
 # ── 3-b. 학습/검증 분할 ───────────────────────────────────────────
 
+def _compute_split_indices(dates: np.ndarray, n: int, mode: str) -> tuple[list[int], list[int]]:
+    """분할 인덱스 계산의 단일 진실 공급원(single source of truth).
+
+    make_split() 과 WeatherDataset.__init__() (정규화 통계를 학습 인덱스만
+    으로 계산하기 위해) 양쪽에서 이 함수를 호출한다 — 로직을 두 곳에
+    복제하면 조용히 어긋날 수 있다.
+
+    group 모드는 날짜 문자열 해시로 배정한다(2026-08-31, deferred-to-
+    next-retrain 정정). 종전엔 `torch.randperm(len(uniq))` 을 썼는데,
+    이 방식은 SEED 를 고정해도 **고유 날짜 수가 바뀌면 순열 자체가
+    통째로 달라진다**(2026-08-29 실측: 날짜 1개 추가에 검증셋 겹침
+    20.2%). 날짜 문자열 자체를 해시해 [0,1) 구간에 매핑하면 각 날짜의
+    배정이 다른 날짜의 존재 여부와 무관해진다 — collect_incremental.py
+    로 데이터가 계속 늘어도 기존 배정은 그대로 유지된다.
+    """
+    if mode == "random":
+        n_val = max(2, int(n * VAL_RATIO))
+        g = torch.Generator().manual_seed(SEED)
+        perm = torch.randperm(n, generator=g).tolist()
+        train_idx, val_idx = perm[:n - n_val], perm[n - n_val:]
+
+    elif mode == "group":
+        def _date_frac(date_str: str) -> float:
+            h = hashlib.sha256(f"{SEED}:{date_str}".encode()).hexdigest()
+            return int(h[:8], 16) / 0xFFFFFFFF
+
+        uniq = np.unique(dates)
+        val_days = {d for d in uniq if _date_frac(d) < VAL_RATIO}
+        is_val = np.array([d in val_days for d in dates])
+        train_idx = np.flatnonzero(~is_val).tolist()
+        val_idx = np.flatnonzero(is_val).tolist()
+
+    elif mode == "temporal":
+        is_train = dates <= TEMPORAL_TRAIN_END
+        is_val = dates >= TEMPORAL_VAL_START
+        train_idx = np.flatnonzero(is_train).tolist()
+        val_idx = np.flatnonzero(is_val).tolist()
+
+    else:
+        raise ValueError(f"알 수 없는 SPLIT_MODE: {mode}")
+
+    return train_idx, val_idx
+
+
 def make_split(full_ds, mode: str, verbose: bool = True):
     """
     학습/검증 분할. mode 는 SPLIT_MODE 참고.
@@ -678,46 +754,7 @@ def make_split(full_ds, mode: str, verbose: bool = True):
     n = len(full_ds)
     # 라벨 기준 날짜 = 타깃 시각의 날짜 (라벨이 붙는 단위와 일치시킨다)
     dates = np.array([str(ts)[:8] for ts in full_ds.tgt_timestamps])
-
-    if mode == "random":
-        n_val = max(2, int(n * VAL_RATIO))
-        g = torch.Generator().manual_seed(SEED)
-        perm = torch.randperm(n, generator=g).tolist()
-        # random_split 과 같은 순서 — 앞에서부터 학습, 뒤가 검증.
-        # 종전 체크포인트와 분할이 일치해야 비교가 성립한다.
-        train_idx, val_idx = perm[:n - n_val], perm[n - n_val:]
-
-    elif mode == "group":
-        # ⚠ 이 분할은 SEED 를 고정해도 **고유 날짜 수가 바뀌면 재현되지 않는다**.
-        # torch.randperm(N) 은 N 이 1만 달라져도 완전히 다른 순열을 낸다
-        # (2026-08-29 실측: 날짜 4000→4001 일 때 검증셋 겹침 20.2%).
-        # 따라서 collect_incremental.py 로 데이터를 더 채운 뒤 옛 체크포인트를
-        # 진단하면, 학습 당시와 다른 검증셋에서 지표가 계산된다 — 학습에 쓴
-        # 표본이 검증셋에 섞여도 지표는 멀쩡해 보여 눈치채기 어렵다.
-        # eval_cache._assert_split_matches_checkpoint() 가 체크포인트에 저장된
-        # 기준선과 대조해 이 상황을 자동으로 잡는다(그 함수 docstring 참고).
-        # 근본 해결(날짜 문자열 해시 기반 배정)은 현행 체크포인트의 분할을
-        # 바꿔버리므로 다음 재학습 때 함께 처리한다.
-        uniq = np.unique(dates)
-        g = torch.Generator().manual_seed(SEED)
-        order = torch.randperm(len(uniq), generator=g).tolist()
-        n_val_days = max(1, int(len(uniq) * VAL_RATIO))
-        val_days = {uniq[k] for k in order[:n_val_days]}
-        is_val = np.array([d in val_days for d in dates])
-        train_idx = np.flatnonzero(~is_val).tolist()
-        val_idx = np.flatnonzero(is_val).tolist()
-
-    elif mode == "temporal":
-        # 과거로 배워 미래를 예측하는 실제 운영 구조. 경계에 완충 하루를
-        # 비운다 — Im축이 6시간 전을 보고 타깃이 +6시간이라 경계 표본은
-        # 양쪽 구간에 걸친다.
-        is_train = dates <= TEMPORAL_TRAIN_END
-        is_val = dates >= TEMPORAL_VAL_START
-        train_idx = np.flatnonzero(is_train).tolist()
-        val_idx = np.flatnonzero(is_val).tolist()
-
-    else:
-        raise ValueError(f"알 수 없는 SPLIT_MODE: {mode}")
+    train_idx, val_idx = _compute_split_indices(dates, n, mode)
 
     if verbose:
         # numpy 문자열 배열은 min/max 유니버설 함수가 없다 — 파이썬 set 으로 센다
@@ -820,9 +857,16 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
     # 대신 단일 스냅샷에서 유도 불가능한 시간 미분(∂s/∂t)을 Im축에 넣는다.
     txt_collector = TendencyCollector(records)
 
+    island_collector = None
+    if USE_ISLAND:
+        if verbose:
+            print(f"도서 AWS 부가 특징 생성 중 (13개 지점 강수, {ISLAND_DIM}차원)...")
+        island_collector = IslandPrecipCollector()
+
     full_ds = WeatherDataset(records,
                              sat_collector=sat_collector,
                              txt_collector=txt_collector,
+                             island_collector=island_collector,
                              lead_hours=lead_hours)
     train_ds, val_ds = make_split(full_ds, SPLIT_MODE, verbose=verbose)
     n_train, n_val = len(train_ds), len(val_ds)
@@ -955,8 +999,13 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
               f"({n_dust}/{n_dust_total}), pos_weight={dust_pos_weight.item():.2f}")
 
     # 모델 — 타깃 평균을 헤드 편향에 주입해 편향 학습 낭비 제거
+    # num_features 는 full_ds.mean 의 실제 길이에서 뽑는다(NUM_FEATURES 상수가
+    # 아니다) — island_collector 를 켜면 벡터가 14→40차원으로 늘어나는데,
+    # 상수를 그대로 쓰면 모델 입력층과 실제 X_num 폭이 어긋나 첫 forward에서
+    # 바로 shape mismatch 가 난다.
+    num_features = len(full_ds.mean)
     model = TriCHEFPipeline(
-        embed_dim=EMBED_DIM, num_features=NUM_FEATURES,
+        embed_dim=EMBED_DIM, num_features=num_features,
         alpha_init=ALPHA_INIT, phi_init=PHI_INIT,
         orthogonalize=orthogonalize,
         temp_mean=full_ds.temp_mean, precip_mean=full_ds.precip_mean,
@@ -1254,7 +1303,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "precip_gamma_alpha_init": precip_gamma_alpha_init,
                 "precip_gamma_mu_init": _wet_mean,
                 "lead_hours":   lead_hours,
-                "num_features": NUM_FEATURES,
+                "num_features": num_features,
+                "use_island":   USE_ISLAND,
                 "alpha_init":   ALPHA_INIT,
                 "phi_init":     PHI_INIT,
                 "mean":         full_ds.mean.tolist(),

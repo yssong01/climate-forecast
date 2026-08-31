@@ -34,6 +34,7 @@ from train import (WeatherDataset, collect_historical, make_split, WET_THRESH,
                    DATA_CACHE)
 from weather_collector import STATION_COORDS
 from interp_field_collector import InterpolatedFieldCollector
+from island_collector import IslandPrecipCollector
 from tendency_collector import TendencyCollector
 from text_collector import SimulatedTextCollector
 
@@ -135,10 +136,12 @@ def build(ckpt_path: str, batch: int):
     records = collect_historical()
     txt_collector = (TendencyCollector(records) if ckpt.get("im_dim", 384) < 128
                      else SimulatedTextCollector())
+    island_collector = IslandPrecipCollector() if ckpt.get("use_island", False) else None
     ds = WeatherDataset(
         records, sat_collector=InterpolatedFieldCollector(
             records, STATION_COORDS, n_bands=ckpt.get("re_channels", 4)),
-        txt_collector=txt_collector, lead_hours=ckpt["lead_hours"],
+        txt_collector=txt_collector, island_collector=island_collector,
+        lead_hours=ckpt["lead_hours"],
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )

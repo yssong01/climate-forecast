@@ -26,6 +26,7 @@ from weather_collector import (
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector, LAGS_HOURS
 from text_collector import SimulatedTextCollector
+from island_collector import encode_live as island_encode_live
 from pipeline_model import TriCHEFPipeline
 from train import record_to_vec, STATION_NAMES
 
@@ -329,7 +330,13 @@ def predict(stn: str = "108",
     # 체크포인트는 12차원으로 학습됐다. 새 축은 끝에 덧붙었으므로 그 체크포인트의
     # 차원만큼만 앞에서 잘라 쓰면 구버전 입력을 그대로 복원한다.
     nf = ckpt.get("num_features", len(mean))
-    num_vec  = np.array(record_to_vec(record), dtype=np.float32)[:nf]
+    num_vec = np.array(record_to_vec(record), dtype=np.float32)
+    if ckpt.get("use_island", False):
+        # 도서 AWS 13개 지점 강수(26차원, island_collector.py) — 학습 때와
+        # 같은 순서(record_to_vec 뒤에 이어붙임)로 실시간 조회한다. 실패해도
+        # 전부 결측(중립값 0.5+플래그 1)으로 채워 정상 응답한다(날조 금지).
+        num_vec = np.concatenate([num_vec, island_encode_live()])
+    num_vec  = num_vec[:nf]
     num_norm = (num_vec - mean) / std
 
     x_num = torch.tensor(num_norm, dtype=torch.float32).unsqueeze(0).to(device)
