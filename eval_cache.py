@@ -170,10 +170,16 @@ def build(ckpt_path: str, batch: int):
     txt_collector = (TendencyCollector(records) if ckpt.get("im_dim", 384) < 128
                      else SimulatedTextCollector())
     island_collector = IslandPrecipCollector() if ckpt.get("use_island", False) else None
+    # 평년값 테이블은 체크포인트에 이미 저장돼 있다(학습 날짜에서만 산출됐으므로
+    # 여기서 다시 계산하지 않는다 — 재계산하면 이 시점의 records 구성에 따라
+    # 학습 당시와 다른 테이블이 나올 위험이 있다).
+    climatology_table = (ckpt.get("climatology_table")
+                         if ckpt.get("use_climatology_anomaly", False) else None)
     ds = WeatherDataset(
         records, sat_collector=InterpolatedFieldCollector(
             records, STATION_COORDS, n_bands=ckpt.get("re_channels", 4)),
         txt_collector=txt_collector, island_collector=island_collector,
+        climatology_table=climatology_table,
         lead_hours=ckpt["lead_hours"],
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),

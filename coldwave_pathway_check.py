@@ -49,7 +49,14 @@ def head_prob(model, ckpt, record, img, txt, head="coldwave"):
     mean = np.array(ckpt["mean"], dtype=np.float32)
     std = np.array(ckpt["std"], dtype=np.float32)
     nf = ckpt.get("num_features", len(mean))
-    vec = np.array(record_to_vec(record), dtype=np.float32)[:nf]
+    vec = np.array(record_to_vec(record), dtype=np.float32)
+    if ckpt.get("use_climatology_anomaly", False):
+        # predict.py 서빙 경로와 같은 순서(record_to_vec 뒤에 이어붙임)로
+        # 맞춘다 — 안 그러면 mean/std 와 차원이 안 맞아 셰이프 에러가 난다.
+        from train import climatology_anomaly
+        table = ckpt.get("climatology_table") or {}
+        vec = np.concatenate([vec, [climatology_anomaly(record, table)]]).astype(np.float32)
+    vec = vec[:nf]
     x = torch.tensor((vec - mean) / std, dtype=torch.float32).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         model(num_x=x,

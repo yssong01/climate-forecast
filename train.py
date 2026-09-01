@@ -386,6 +386,99 @@ def record_to_vec(r: dict) -> list[float]:
 # 쓰면 입력층과 X_num 폭이 어긋나 첫 forward 에서 shape mismatch 가 난다.
 NUM_FEATURES = 14
 
+# use_climatology_anomaly (2026-09-01) — 폭염·한파 헤드가 집계 지표(AUC
+# 0.96/0.88) 뒤에서 하위그룹 붕괴를 겪는다는 실측(heatwave-coldwave-
+# subgroup-gap 메모리)에 대한 대응: 계절 전환기(봄철 폭염 F1 0.83→0.40,
+# 한파 AUC 0.87→0.66)와 한파 남북 지역 격차(부트스트랩으로 유의함 확인,
+# Δ=+0.0916 95%CI [0.024,0.164]). 절대기온만으로는 "봄철의 이른 한파"와
+# "평범한 쌀쌀한 봄날"을 구분할 근거가 약하고, 남부 관측소는 겨울 평년
+# 자체가 높아 "−12℃ 이하"라는 절대 기준에 도달하는 사건이 구조적으로
+# 드물다 — 이 두 문제를 관측소×연중일자 평년값 대비 이상편차(anomaly)로
+# 함께 겨냥한다. 기온 헤드가 이미 쓰는 "퍼시스턴스 잔차"(현재값 대비
+# 변화량 예측) 원리의 연장이다.
+CLIMATOLOGY_WINDOW_DAYS = 10   # 연중일자 평활 창(±일수) — 표본 부족한 날의 잡음 완화
+USE_CLIMATOLOGY_ANOMALY = os.getenv("USE_CLIMATOLOGY_ANOMALY", "0") != "0"
+
+
+def build_climatology_table(records: list[dict],
+                            window_days: int = CLIMATOLOGY_WINDOW_DAYS) -> dict:
+    """관측소별 연중일자(day-of-year) 평년 기온 테이블 — 학습 날짜에서만 산출한다.
+
+    **왜 학습 날짜에서만 계산하는가.** 정규화 평균/표준편차를 검증셋 포함
+    전체 표본에서 계산했다가 검증셋 누설로 드러나 고친 전례
+    (deferred-to-next-retrain 메모리, 2026-08-31)와 같은 문제가 평년값에도
+    적용된다 — 검증 날짜의 실측이 그 날짜 자체의 평년값 계산에 섞이면
+    안 된다. `make_split()`의 group 모드와 **같은 날짜 해시 함수**로 날짜를
+    학습/검증에 배정해, 실제 학습 때 쓰이는 분할과 반드시 일치시킨다
+    (분할 알고리즘이 바뀌면 이 함수도 같이 바뀌어야 한다는 뜻).
+
+    반환값: {관측소: np.ndarray(길이 367, 인덱스 1~366)} — 원형(circular)
+    ±window_days 이동평균으로 평활한 평년 기온. 표본이 없는 (관측소, 일자)는
+    NaN — 호출부가 폴백(이상편차 0)을 처리한다.
+    """
+    from collections import defaultdict
+
+    dates_seen = {str(r.get("timestamp", ""))[:8] for r in records
+                 if len(str(r.get("timestamp", ""))) >= 8}
+    uniq_dates = sorted(dates_seen)
+
+    def _date_frac(date_str: str) -> float:
+        h = hashlib.sha256(f"{SEED}:{date_str}".encode()).hexdigest()
+        return int(h[:8], 16) / 0xFFFFFFFF
+
+    # make_split() group 모드와 동일한 배정 규칙(_compute_split_indices 참고) —
+    # frac < VAL_RATIO 면 검증, 아니면 학습.
+    train_dates = {d for d in uniq_dates if _date_frac(d) >= VAL_RATIO}
+
+    daily = defaultdict(list)
+    for r in records:
+        ts = str(r.get("timestamp", ""))
+        if len(ts) < 8 or ts[:8] not in train_dates:
+            continue
+        temp = r.get("temperature")
+        if temp is None:
+            continue
+        doy = datetime(int(ts[:4]), int(ts[4:6]), int(ts[6:8])).timetuple().tm_yday
+        daily[(str(r.get("stn", "108")), doy)].append(float(temp))
+
+    stations = sorted({k[0] for k in daily})
+    table = {}
+    for stn in stations:
+        raw = np.full(367, np.nan)
+        for doy in range(1, 367):
+            vals = daily.get((stn, doy))
+            if vals:
+                raw[doy] = float(np.mean(vals))
+        smoothed = np.full(367, np.nan)
+        for doy in range(1, 367):
+            window_vals = [raw[((doy - 1 + off) % 366) + 1]
+                           for off in range(-window_days, window_days + 1)]
+            window_vals = [v for v in window_vals if not np.isnan(v)]
+            if window_vals:
+                smoothed[doy] = float(np.mean(window_vals))
+        table[stn] = smoothed
+    return table
+
+
+def climatology_anomaly(record: dict, table: dict) -> float:
+    """기록 하나의 기온이 그 관측소·그 날짜 평년 대비 얼마나 벗어났는가.
+
+    평년값이 없으면(신생 관측소·표본 부족) 0.0(평년과 같음) 폴백한다 —
+    날조 대신 중립값을 쓰는 이 저장소의 관행(CLAUDE.md 1절 5항)과 같다.
+    """
+    ts = str(record.get("timestamp", ""))
+    if len(ts) < 8:
+        return 0.0
+    stn = str(record.get("stn", "108"))
+    temp = record.get("temperature")
+    if temp is None or stn not in table:
+        return 0.0
+    doy = datetime(int(ts[:4]), int(ts[4:6]), int(ts[6:8])).timetuple().tm_yday
+    normal = table[stn][doy]
+    if np.isnan(normal):
+        return 0.0
+    return float(temp) - normal
+
 
 # ── 2. 과거 데이터 수집 ───────────────────────────────────────────
 
@@ -505,6 +598,7 @@ class WeatherDataset(Dataset):
                  sat_collector=None,   # InterpolatedFieldCollector — Re축, 실측 공간보간장
                  txt_collector: SimulatedTextCollector = None,
                  island_collector=None,   # IslandPrecipCollector — Z축 부가 특징(도서 강수)
+                 climatology_table: dict = None,  # build_climatology_table() 반환값 — Z축 부가 특징(평년 대비 이상편차)
                  lead_hours: int = 1,
                  mean: np.ndarray = None, std: np.ndarray = None):
         L = lead_hours
@@ -552,6 +646,13 @@ class WeatherDataset(Dataset):
             # 두지 않고 기존 Z축과 동일하게 다룬다.
             vecs = np.concatenate(
                 [vecs, island_collector.get_batch(src_records)], axis=1)
+        if climatology_table is not None:
+            # 도서 특징과 같은 이유로 벡터 끝에 붙인다 — 구버전 체크포인트는
+            # 짧은 mean 길이만큼만 앞에서 잘라 이 열이 빠진 채 복원된다.
+            anomaly = np.array(
+                [[climatology_anomaly(r, climatology_table)] for r in src_records],
+                dtype=np.float32)
+            vecs = np.concatenate([vecs, anomaly], axis=1)
         if mean is None:
             # 정규화 통계는 학습 인덱스에서만 계산한다(2026-08-31,
             # deferred-to-next-retrain 정정) — 종전엔 전체 표본(검증셋 포함)
@@ -954,10 +1055,17 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             print(f"도서 AWS 부가 특징 생성 중 (13개 지점 강수, {ISLAND_DIM}차원)...")
         island_collector = IslandPrecipCollector()
 
+    climatology_table = None
+    if USE_CLIMATOLOGY_ANOMALY:
+        if verbose:
+            print("계절 평년값 대비 이상편차 특징 생성 중 (관측소×연중일자, 학습 날짜만)...")
+        climatology_table = build_climatology_table(records)
+
     full_ds = WeatherDataset(records,
                              sat_collector=sat_collector,
                              txt_collector=txt_collector,
                              island_collector=island_collector,
+                             climatology_table=climatology_table,
                              lead_hours=lead_hours)
     train_ds, val_ds = make_split(full_ds, SPLIT_MODE, verbose=verbose)
     n_train, n_val = len(train_ds), len(val_ds)
@@ -1413,6 +1521,17 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "lead_hours":   lead_hours,
                 "num_features": num_features,
                 "use_island":   USE_ISLAND,
+                # 평년값 테이블을 체크포인트에 통째로 저장한다 — 서빙 시점에
+                # 1,382,583개 학습 캐시를 다시 로드해 재계산하면 RAM·지연이
+                # 크다(island_collector 는 실시간 API 조회라 이 문제가 없지만,
+                # 평년값은 다년간 히스토리가 필요해 같은 방식을 못 쓴다).
+                "use_climatology_anomaly": USE_CLIMATOLOGY_ANOMALY,
+                # numpy 배열이 아니라 리스트로 저장한다(mean/std 와 같은 이유) —
+                # torch.load(weights_only=True)(2026-08 PyTorch 기본값, 서빙·
+                # 모든 진단 스크립트가 이걸 쓴다)는 numpy 객체를 안전 목록에
+                # 두지 않아 그대로 저장하면 로드 시점에 깨진다(실측 확인).
+                "climatology_table": ({k: v.tolist() for k, v in climatology_table.items()}
+                                      if climatology_table else None),
                 "alpha_init":   ALPHA_INIT,
                 "phi_init":     PHI_INIT,
                 "mean":         full_ds.mean.tolist(),

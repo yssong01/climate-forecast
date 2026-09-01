@@ -363,6 +363,14 @@ def predict(stn: str = "108",
         # 같은 이유다(2026-08-31 수정).
         num_vec = np.concatenate(
             [num_vec, island_encode_live(record.get("timestamp"))])
+    if ckpt.get("use_climatology_anomaly", False):
+        # 학습 때와 같은 순서(record_to_vec → 도서 특징 → 이상편차)로 붙인다.
+        # 평년값 테이블은 체크포인트에 저장돼 있어 서빙 시점에 히스토리를
+        # 다시 로드하지 않는다(train.py 저장부 주석 참고).
+        from train import climatology_anomaly
+        table = ckpt.get("climatology_table") or {}
+        num_vec = np.concatenate(
+            [num_vec, [climatology_anomaly(record, table)]]).astype(np.float32)
     num_vec  = num_vec[:nf]
     num_norm = (num_vec - mean) / std
 
