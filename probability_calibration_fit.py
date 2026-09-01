@@ -109,6 +109,41 @@ def apply_calibration(probs, xs, ys):
     return np.interp(probs, xs, ys)
 
 
+def fit_beta(probs, labels, eps=1e-6, max_iter=100):
+    """
+    베타 보정(Kull, Filho & Flach 2017 — arXiv:1704.08065). 등온 회귀와 달리
+    매끄러운 순증가 함수라 평탄 구간이 없다 — CLAUDE.md 12절의 "등온 회귀
+    평탄 구간에서 임계값이 접히는 문제"가 구조적으로 발생하지 않는다.
+
+    m(p) = sigmoid(a·ln(p) − b·ln(1−p) + c) — [ln(p), −ln(1−p)] 를 특징으로
+    한 3모수 로지스틱 회귀. sklearn 없이 뉴턴-랩슨(IRLS)으로 직접 적합한다
+    (배포는 requirements.txt 하나로 빌드, 서빙 의존성 최소화 — 위 isotonic과
+    같은 이유). a,b ≥ 0 이면 dm/dp = a/p + b/(1−p) ≥ 0 로 전 구간 순증가가
+    보장된다 — 음수로 나오면(과신 방향이 뒤섞인 드문 경우) 호출부가 판단한다.
+    """
+    p = np.clip(probs, eps, 1 - eps)
+    X = np.column_stack([np.log(p), -np.log(1 - p), np.ones_like(p)])
+    y = labels.astype(np.float64)
+    beta = np.zeros(3)
+    for _ in range(max_iter):
+        z = X @ beta
+        pred = 1.0 / (1.0 + np.exp(-z))
+        grad = X.T @ (pred - y) / len(y)
+        w = pred * (1 - pred) + 1e-9
+        hess = (X * w[:, None]).T @ X / len(y) + 1e-6 * np.eye(3)
+        step = np.linalg.solve(hess, grad)
+        beta -= step
+        if np.abs(step).max() < 1e-10:
+            break
+    return float(beta[0]), float(beta[1]), float(beta[2])
+
+
+def apply_beta(probs, a, b, c, eps=1e-6):
+    p = np.clip(probs, eps, 1 - eps)
+    z = a * np.log(p) - b * np.log(1 - p) + c
+    return 1.0 / (1.0 + np.exp(-z))
+
+
 def ece(probs, labels, n_bins=10):
     edges = np.linspace(0.0, 1.0, n_bins + 1)
     tot, acc = len(probs), 0.0
@@ -118,6 +153,11 @@ def ece(probs, labels, n_bins=10):
             continue
         acc += abs(probs[m].mean() - labels[m].mean()) * m.sum()
     return acc / tot
+
+
+def log_loss(probs, labels, eps=1e-7):
+    p = np.clip(probs, eps, 1 - eps)
+    return float(-(labels * np.log(p) + (1 - labels) * np.log(1 - p)).mean())
 
 
 def mce(probs, labels, n_bins=10):
@@ -218,62 +258,92 @@ def main():
         pc, lc = probs[m], labels[m]       # calibration
         pe, le = probs[~m], labels[~m]     # evaluation
 
-        xs, ys = fit_isotonic(pc, lc)
-        pe_cal = apply_calibration(pe, xs, ys)
-        pc_cal = apply_calibration(pc, xs, ys)   # 임계값 재선정용(보정용 절반)
-
-        e0, e1 = ece(pe, le), ece(pe_cal, le)
-        m0, m1 = mce(pe, le), mce(pe_cal, le)
-        b0 = float(((pe - le) ** 2).mean())
-        b1 = float(((pe_cal - le) ** 2).mean())
-
-        # 순위 보존 확인 — 임계값을 같은 함수로 옮기면 판정이 동일해야 한다.
         t_raw = EXTREME_EVENT_THRESH.get(key, 0.5)
-        t_cal = float(apply_calibration(np.array([t_raw]), xs, ys)[0])
+        e0, m0 = ece(pe, le), mce(pe, le)
+        b0, l0 = float(((pe - le) ** 2).mean()), log_loss(pe, le)
         f_raw = prf(pe, le, t_raw)[2]
-        f_cal = prf(pe_cal, le, t_cal)[2]
 
-        # 옮긴 임계값이 판정을 보존하지 못할 때의 대비책(2026-08-17 추가).
-        # 등온 회귀 곡선은 평탄 구간을 가지므로 순증가가 아니다 — 임계값이 그
-        # 구간 안에 떨어지면 구간 전체가 한쪽으로 몰려 실효 임계값이 어긋난다.
-        # 실제로 한파 헤드 디커플링 직후 F1 이 0.4566→0.4484 로 떨어졌다
-        # (calibrated_threshold_check.py 로 확인). 판정이 실제로 이뤄지는
-        # 공간(보정 후)에서 임계값을 직접 고르되, 고르는 표본과 채점하는
-        # 표본을 분리하고 순이득이 기준에 미달하면 채택하지 않는다.
-        t_pick = _best_threshold(pc_cal, lc)
-        f_pick = prf(pe_cal, le, t_pick)[2]
-        repick = (f_pick - f_cal) >= MIN_THRESH_GAIN
-        t_decision = t_pick if repick else t_cal
+        # 등온 회귀(기존).
+        xs, ys = fit_isotonic(pc, lc)
+        pe_iso = apply_calibration(pe, xs, ys)
+        pc_iso = apply_calibration(pc, xs, ys)
+        t_cal_iso = float(apply_calibration(np.array([t_raw]), xs, ys)[0])
 
-        gain = e0 - e1
-        adopt = gain >= MIN_ECE_GAIN
-        summary.append((key, e0, e1, m0, m1, b0, b1, t_raw, t_cal, f_raw, f_cal, gain, adopt))
+        # 베타 보정(신규, 2026-09-01) — Kull et al. 2017. 평탄 구간이 없어
+        # 임계값 이동이 항상 판정을 보존할 것으로 기대되나, 실측으로 확인한다
+        # (측정하지 않은 것을 주장하지 않는다 — CLAUDE.md 1절).
+        a, b_, c = fit_beta(pc, lc)
+        pe_beta = apply_beta(pe, a, b_, c)
+        pc_beta = apply_beta(pc, a, b_, c)
+        t_cal_beta = float(apply_beta(np.array([t_raw]), a, b_, c)[0])
+
+        candidates = {}
+        for method, pe_cal, pc_cal, t_cal in (
+            ("isotonic", pe_iso, pc_iso, t_cal_iso),
+            ("beta", pe_beta, pc_beta, t_cal_beta),
+        ):
+            e1, m1 = ece(pe_cal, le), mce(pe_cal, le)
+            b1, l1 = float(((pe_cal - le) ** 2).mean()), log_loss(pe_cal, le)
+            f_cal = prf(pe_cal, le, t_cal)[2]
+            # 판정 보존 확인 + 필요시 보정 공간 재선정(등온 회귀의 평탄 구간
+            # 문제 대비책, 2026-08-17). 베타는 a,b>=0 이면 순증가라 이 경로가
+            # 발동하지 않을 것으로 기대되나 실측으로 확인한다.
+            t_pick = _best_threshold(pc_cal, lc)
+            f_pick = prf(pe_cal, le, t_pick)[2]
+            repick = (f_pick - f_cal) >= MIN_THRESH_GAIN
+            t_decision = t_pick if repick else t_cal
+            gain = e0 - e1
+            candidates[method] = dict(e1=e1, m1=m1, b1=b1, l1=l1, f_cal=f_cal,
+                                       t_cal=t_cal, t_pick=t_pick, f_pick=f_pick,
+                                       repick=repick, t_decision=t_decision, gain=gain)
+            print(f"\n{'='*74}\n[{ko[key]}/{method}]  평가용 {len(pe):,}개 (보정용 {len(pc):,}개로 적합)")
+            print(f"  ECE {e0:.4f}→{e1:.4f}(개선{gain:+.4f}) MCE {m0:.4f}→{m1:.4f} "
+                  f"Brier {b0:.4f}→{b1:.4f} LogLoss {l0:.4f}→{l1:.4f}")
+            print(f"  임계값 {t_raw:.3f}→{t_cal:.3f} 이동 시 F1 {f_raw:.4f}→{f_cal:.4f}"
+                  f"  ({'보존됨' if abs(f_raw - f_cal) < 1e-6 else '차이 발생'})")
+            print(f"  보정공간 재선정 t={t_pick:.3f} F1={f_pick:.4f}(순이득{f_pick-f_cal:+.4f}) "
+                  f"— {'채택' if repick else '기각'}, 서빙판정선={t_decision:.3f}")
+
+        # 두 후보 중 평가용 ECE 가 더 좋은(낮은) 쪽을 고른다 — 둘 다 원본 대비
+        # MIN_ECE_GAIN 을 못 넘으면 이 헤드는 보정 자체를 기각한다.
+        #
+        # ECE(평균 보정오차) 하나만으로 고르면 위험하다 — 실측(2026-09-01,
+        # 황사)에서 두 후보 ECE 가 0.0006 으로 사실상 동률인데 MCE(최악
+        # 구간 보정오차)는 등온 0.0042 대 베타 0.3094 로 73배 차이가 났다.
+        # 평균이 같아 보여도 한 구간에서 크게 어긋나는 후보를 고르면 그
+        # 구간의 사용자에게 실제 피해가 간다. ECE 차이가 TIE_ECE_EPS 안이면
+        # MCE 로 재판정한다.
+        TIE_ECE_EPS = 0.001
+        e_iso, e_beta = candidates["isotonic"]["e1"], candidates["beta"]["e1"]
+        if abs(e_iso - e_beta) < TIE_ECE_EPS:
+            winner = min(candidates, key=lambda k: candidates[k]["m1"])
+        else:
+            winner = "isotonic" if e_iso < e_beta else "beta"
+        w = candidates[winner]
+        adopt = w["gain"] >= MIN_ECE_GAIN
+        summary.append((key, winner, e0, w["e1"], f_raw, w["f_cal"], w["gain"], adopt))
         if adopt:
-            calib_maps[key] = {"x": [float(v) for v in xs],
-                               "y": [float(v) for v in ys],
-                               "threshold_raw": t_raw,
-                               "threshold_calibrated": t_cal,
-                               # 서빙이 실제로 쓰는 판정선. 재선정을 채택하지
-                               # 않으면 옮긴 값과 같다.
-                               "threshold_decision": t_decision,
-                               "threshold_repicked": bool(repick)}
-
-        print(f"\n{'='*74}\n[{ko[key]}]  평가용 {len(pe):,}개 (보정용 {len(pc):,}개로 적합)")
-        print(f"  ECE   {e0:.4f} → {e1:.4f}   (개선 {gain:+.4f})")
-        print(f"  MCE   {m0:.4f} → {m1:.4f}")
-        print(f"  Brier {b0:.4f} → {b1:.4f}")
-        print(f"  임계값 {t_raw:.3f} → {t_cal:.3f} 로 이동 시 F1 {f_raw:.4f} → {f_cal:.4f}"
-              f"  ({'보존됨' if abs(f_raw - f_cal) < 1e-6 else '차이 발생 — 재선정 검토'})")
-        print(f"  보정 공간 재선정 t = {t_pick:.3f} → 평가용 F1 {f_pick:.4f} "
-              f"(순이득 {f_pick - f_cal:+.4f}) — "
-              f"{'채택' if repick else f'기각(기준 {MIN_THRESH_GAIN})'}")
-        print(f"  서빙 판정선 = {t_decision:.3f}")
-        print(f"  판정: {'채택' if adopt else f'기각(개선 {gain:+.4f} < 기준 {MIN_ECE_GAIN})'}")
+            entry = {"method": winner,
+                      "threshold_raw": t_raw,
+                      "threshold_calibrated": w["t_cal"],
+                      "threshold_decision": w["t_decision"],
+                      "threshold_repicked": bool(w["repick"])}
+            if winner == "isotonic":
+                entry["x"] = [float(v) for v in xs]
+                entry["y"] = [float(v) for v in ys]
+            else:
+                entry["a"], entry["b"], entry["c"] = a, b_, c
+            calib_maps[key] = entry
+        verdict = (f"채택" if adopt
+                   else f"기각(개선 {w['gain']:+.4f} < 기준 {MIN_ECE_GAIN})")
+        print(f"\n[{ko[key]}] 승자: {winner} "
+              f"(ECE 등온={candidates['isotonic']['e1']:.4f} "
+              f"베타={candidates['beta']['e1']:.4f}) — {verdict}")
 
     print(f"\n{'='*74}\n요약")
-    print(f"  {'헤드':<8}{'ECE 전':>10}{'ECE 후':>10}{'F1 전':>10}{'F1 후':>10}  판정")
-    for (key, e0, e1, _, _, _, _, _, _, f0, f1, _, adopt) in summary:
-        print(f"  {ko[key]:<8}{e0:>10.4f}{e1:>10.4f}{f0:>10.4f}{f1:>10.4f}  "
+    print(f"  {'헤드':<8}{'방법':<10}{'ECE 전':>10}{'ECE 후':>10}{'F1 전':>10}{'F1 후':>10}  판정")
+    for (key, method, e0, e1, f0, f1, _, adopt) in summary:
+        print(f"  {ko[key]:<8}{method:<10}{e0:>10.4f}{e1:>10.4f}{f0:>10.4f}{f1:>10.4f}  "
               f"{'채택' if adopt else '기각'}")
 
     if not do_apply:
@@ -290,7 +360,9 @@ def main():
         print(f"\n백업: {backup}")
 
     ckpt["prob_calibration"] = {
-        "method": "isotonic(PAVA) on quantile bins",
+        # 헤드별로 등온/베타 중 평가용 ECE 가 더 좋은 쪽을 고른다(2026-09-01) —
+        # 실제 채택 방법은 calib_maps[head]["method"] 를 봐야 한다. 전역
+        # "method" 필드는 남기지 않는다 — 헤드마다 다를 수 있어 오해를 부른다.
         "calib_seed": CALIB_SEED,
         "min_ece_gain": MIN_ECE_GAIN,
         "heads": calib_maps,

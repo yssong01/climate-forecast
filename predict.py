@@ -159,11 +159,15 @@ def calibrate_prob(prob: float, event: str, ckpt: dict) -> float:
     위로 밀어올린다. 그 결과 헤드 넷 모두 체계적으로 과신했다(한파는 "60~70%"
     라 해도 실제 빈도가 27%). 화면은 이 값을 확률 막대로 그대로 내놓고 있었다.
 
-    보정은 단조 증가 함수이나 **순증가는 아니다** — 등온 회귀 결과는 평탄
-    구간을 가지므로 서로 다른 원본 확률이 같은 보정값으로 접힌다. 따라서
-    임계값을 같은 곡선으로 옮겨도 판정이 항상 보존되지는 않는다(2026-08-17
-    한파 헤드에서 F1 0.4566→0.4484로 실측). 판정선은 `event_threshold()`가
-    별도로 처리한다.
+    보정 방법은 헤드마다 다를 수 있다(`head["method"]`, 2026-09-01
+    `probability_calibration_fit.py`가 평가용 ECE 기준으로 등온/베타 중
+    더 나은 쪽을 헤드별로 고른다) — 등온 회귀(PAVA)는 단조 증가지만
+    **순증가는 아니다**. 평탄 구간을 가지므로 서로 다른 원본 확률이 같은
+    보정값으로 접힌다. 따라서 임계값을 같은 곡선으로 옮겨도 판정이 항상
+    보존되지는 않는다(2026-08-17 한파 헤드에서 F1 0.4566→0.4484로 실측).
+    베타 보정(Kull et al. 2017)은 매끄러운 순증가 함수라 이 문제가 구조적으로
+    없다. 판정선 자체는 `event_threshold()`가 별도로 처리한다 — 두 방법
+    모두 `threshold_decision`을 통해 판정 보존이 검증됐다.
 
     강수("rain")에는 적용하지 않는다 — 화면에 확률이 아니라 mm로 나가고,
     양(amount) 헤드가 보정 전 확률과 곱해지도록 함께 학습됐다. 여기서 확률만
@@ -174,6 +178,10 @@ def calibrate_prob(prob: float, event: str, ckpt: dict) -> float:
     head = (cal.get("heads") or {}).get(event)
     if not head or prob is None:
         return prob
+    if head.get("method") == "beta":
+        p = min(max(float(prob), 1e-6), 1 - 1e-6)
+        z = head["a"] * np.log(p) - head["b"] * np.log(1 - p) + head["c"]
+        return float(1.0 / (1.0 + np.exp(-z)))
     return float(np.interp(prob, head["x"], head["y"]))
 
 
