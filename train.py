@@ -167,6 +167,17 @@ RE_CHANNELS = int(os.getenv("RE_CHANNELS", "4"))
 # (2026-08-31). 기본값 0(끔) — CHECKPOINT_PATH 분리한 대조 실험으로만 켠다.
 USE_ISLAND = os.getenv("USE_ISLAND", "0") == "1"
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
+# 그래디언트 누적(2026-09-01) — amount 헤드 pinball 재도전용. PRECIP_QUANTILE
+# 실험([[precip-quantile-experiment-result]] 메모리, 커밋 17a3c9b)이 젖은구간
+# MAE 는 유의 개선했지만 폭염 F1 을 유의 악화시켰다 — 가설은 pinball 이 습윤
+# 표본(~6%)에서만 계산돼 배치마다 그 항의 그래디언트 신호가 성기고(고분산),
+# 이게 공유 트렁크로 전파돼 다른 헤드를 흔든다는 것(미검증). 그래디언트
+# 누적은 K 배치를 모아 한 번에 step 해 유효 배치 크기를 키운다 — 이미
+# 매 배치 전부를 보는 기온 MSE·극한기상 BCE 항보다 습윤 표본만 보는 pinball
+# 항의 분산을 상대적으로 더 줄인다. PCGrad·CAGrad 류 그래디언트 수술과
+# 달리 재현성 논란이 없는 표준 기법이다([[cross-project-technique-survey]]
+# 문헌조사). 기본값 1(끔) — 배포 동작 불변.
+GRAD_ACCUM_STEPS = int(os.getenv("GRAD_ACCUM_STEPS", "1"))
 SEED          = 42     # 학습/검증 분할 고정 → ablation 비교 가능
 # 모델 초기화·학습 stochasticity(가중치 초기값, DataLoader 셔플 순서)만
 # 따로 흔들고 싶을 때 쓴다 — SEED(분할)는 그대로 두고 이것만 바꾸면 같은
@@ -1386,8 +1397,10 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
 
         model.train()
         train_loss = 0.0
-        for (x_num, x_img, x_txt, y_b, heat_b, cold_b, dust_b,
-             hmask_b, cmask_b, dmask_b) in train_loader:
+        optimizer.zero_grad()
+        n_batches = len(train_loader)
+        for step, (x_num, x_img, x_txt, y_b, heat_b, cold_b, dust_b,
+                   hmask_b, cmask_b, dmask_b) in enumerate(train_loader):
             # non_blocking — pin_memory 로 고정한 페이지에서만 실제로 비동기
             # 전송이 일어난다. 둘은 짝으로 써야 의미가 있다.
             _nb = dict(non_blocking=True)
@@ -1401,7 +1414,6 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             x_img = x_img.to(DEVICE, **_nb).float() if use_re else None
             x_txt = x_txt.to(DEVICE, **_nb) if use_im else None
 
-            optimizer.zero_grad()
             pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt)
             loss = mse(pred[:, 0:1], y_b[:, 0:1]) / temp_var
             if PRECIP_GAMMA_NLL:
@@ -1492,11 +1504,19 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             # 가중치를 키우는 방향으로 학습된다(Phase 3-4 실측).
             if dynamic_gate and lam_now > 0:
                 loss = loss + lam_now * model.gate_entropy()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
             train_loss += loss.item()
-        train_loss /= len(train_loader)
+            # GRAD_ACCUM_STEPS 배치를 모아 한 번에 step 한다(기본 1이면 매
+            # 배치 step — 기존과 동일). 나눠서 backward 하므로 손실도 나눠야
+            # 평균 그래디언트 크기가 K=1 일 때와 같다(안 나누면 사실상 학습률을
+            # K 배 올린 것과 같아진다).
+            (loss / GRAD_ACCUM_STEPS).backward()
+            is_accum_boundary = ((step + 1) % GRAD_ACCUM_STEPS == 0
+                                  or step + 1 == n_batches)
+            if is_accum_boundary:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+        train_loss /= n_batches
 
         # ── 검증 ──────────────────────────────────────────────────
         model.eval()
@@ -1629,6 +1649,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "precip_gamma_alpha_init": precip_gamma_alpha_init,
                 "precip_gamma_mu_init": _wet_mean,
                 "precip_quantile": PRECIP_QUANTILE,
+                "grad_accum_steps": GRAD_ACCUM_STEPS,
                 "lead_hours":   lead_hours,
                 "num_features": num_features,
                 "use_island":   USE_ISLAND,
