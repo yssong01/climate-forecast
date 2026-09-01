@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import (Dataset, DataLoader, Subset, WeightedRandomSampler,
                               BatchSampler, RandomSampler, SequentialSampler)
+import math
 import numpy as np
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -1189,6 +1190,104 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
     dust_prior, dust_pos_weight, n_dust, n_dust_total = _masked_prior(
         full_ds.y_dust, full_ds.dust_mask)
 
+    # GroupDRO(2026-09-01) — 계절 그룹별 최악 손실을 최소화한다. 폭염·한파
+    # 헤드가 집계 지표(AUC 0.96/0.88) 뒤에서 계절 전환기 하위그룹 붕괴를
+    # 겪는다는 실측 대응(heatwave-coldwave-subgroup-gap 메모리 — 봄철 폭염
+    # F1 0.83→0.40, 한파 AUC 겨울 0.87→봄 0.66). Sagawa et al. ICLR 2020
+    # (arXiv:1911.08731). 1순위였던 입력 특징 추가(계절 평년값 이상편차)는
+    # 실패했다(climatology-anomaly-rejected 메모리, 목표 미달성+집단피해) —
+    # 이건 손실 함수만 바꾸는 더 국소적인 시도다.
+    #
+    # 원 논문이 명시적으로 경고한 실패 모드: 과매개변수화 모델에 정규화 없이
+    # 적용하면 그룹별 최악 손실이 0에 수렴하며 작은 그룹(부산 한파 검증셋
+    # 48건 등)에 과적합한다. 그룹 가중치 상한(GROUPDRO_WEIGHT_CAP_MULTIPLE)으로
+    # 완화한다 — 어떤 그룹도 균등 가중치의 이 배수를 넘지 못하게 제한한다.
+    # 기본값 0(끔) — 검증 전까지 배포 동작을 바꾸지 않는다.
+    #
+    # 2026-09-01 최초 실행(GROUPDRO_WEIGHT_CAP=4.0, N=4)은 상한이 무효였다 —
+    # q 는 4개 그룹의 심플렉스(합=1)라 개별 성분은 애초에 1.0을 못 넘는데,
+    # clamp 기준값이 4.0/4=1.0 이라 아무것도 자르지 못하는 no-op이었다.
+    # 그 결과 한파 비수기 그룹(표본이 적어 손실이 불안정)에 가중치가 사실상
+    # 무제한으로 쏠려, 대조군 대비 coldwave_offseason AUC 0.8712→0.7601,
+    # coldwave_south 0.8680→0.8083 로 유의하게 악화됐다(subgroup_ci2_tmp.py
+    # 부트스트랩, 원 논문이 경고한 실패 모드 그대로 재현). 또한 단순
+    # clamp 후 sum 으로 재정규화하면 클립된 성분이 재정규화 과정에서 다시
+    # 상한을 넘을 수 있다(다른 성분이 작을 때 나눗셈이 그 값을 도로 밀어올림)
+    # — 아래 `_project_capped_simplex` 는 초과분을 상한 아래 성분들에만
+    # 반복 재분배해 상한을 실제로 지킨다(capped simplex projection).
+    #
+    # 2026-09-01 상한을 고쳐(2배, 위 `_GROUPDRO_CAP`) 재실행한 결과도
+    # **기각**. 앞선 붕괴(coldwave_offseason/south 유의 악화)는 사라졌지만
+    # 목표했던 4개 하위그룹(coldwave_offseason/inseason/south/north) 어디도
+    # 유의한 개선이 없었고, 오히려 heatwave_inseason(여름 — 실제 운영에서
+    # 가장 중요한 구간) AUC 가 0.9311→0.9224 로 새로 유의하게 악화됐다
+    # (subgroup_ci2_capfix_tmp.py 부트스트랩, B=2000). 트렁크·게이트를
+    # 공유하는 한 계절 그룹 재가중이 목표 헤드가 아닌 다른 헤드로 경사를
+    # 새게 한다는 점에서 `한파 헤드 전용 드롭아웃 기각` 사례와 같은
+    # 기전으로 추정한다. 두 차례 독립 시행(상한버그 有/無) 모두 목표
+    # 미달성이라 재시도하지 않는다. 기본값 0(끔) 유지.
+    GROUPDRO_ETA = float(os.getenv("GROUPDRO_ETA", "0.0"))
+    GROUPDRO_WEIGHT_CAP_MULTIPLE = 2.0   # 균등 가중치의 이 배수까지만 허용
+    N_SEASON_GROUPS = 4   # 0=겨울 1=봄 2=여름 3=가을
+    _GROUPDRO_CAP = GROUPDRO_WEIGHT_CAP_MULTIPLE / N_SEASON_GROUPS
+    _SEASON_BOUNDS_RAD = [2 * math.pi * d / 365.25 for d in (60, 152, 244, 335)]
+
+    def _project_capped_simplex(q, cap, iters=10):
+        """q(합=1, 성분수 N)를 '모든 성분 <= cap'인 심플렉스로 사영한다.
+        cap*N >= 1 이어야 실행 가능(feasible)하다. 상한을 넘는 성분을 cap
+        으로 자르고 초과분을 상한 아래 성분에 비례 배분 — 재배분된 성분이
+        다시 상한을 넘을 수 있어 수렴할 때까지 반복한다(N<=4라 수 회면 충분)."""
+        q = q.clamp(min=0)
+        q = q / q.sum()
+        for _ in range(iters):
+            over = q > cap
+            if not over.any():
+                break
+            excess = (q[over] - cap).sum()
+            q = torch.where(over, torch.full_like(q, cap), q)
+            under = ~over
+            under_sum = q[under].sum()
+            if under_sum > 0:
+                q = torch.where(under, q + excess * (q / under_sum), q)
+            else:
+                break
+        return q / q.sum()
+
+    def _season_group_from_xnum(x_num):
+        """정규화된 x_num 의 12·13열(연중시각 sin/cos)에서 계절 그룹(0~3)을
+        복원한다. WeatherDataset.__getitem__ 인터페이스는 건드리지 않는다 —
+        바꾸면 이걸 쓰는 다른 스크립트 전부를 함께 고쳐야 한다."""
+        sin_doy = x_num[:, 12] * model.feat_std[12] + model.feat_mean[12]
+        cos_doy = x_num[:, 13] * model.feat_std[13] + model.feat_mean[13]
+        angle = torch.atan2(sin_doy, cos_doy)
+        angle = torch.where(angle < 0, angle + 2 * math.pi, angle)
+        b0, b1, b2, b3 = _SEASON_BOUNDS_RAD
+        group = torch.zeros_like(angle, dtype=torch.long)          # 겨울(기본)
+        group = torch.where((angle >= b0) & (angle < b1), torch.ones_like(group), group)
+        group = torch.where((angle >= b1) & (angle < b2), torch.full_like(group, 2), group)
+        group = torch.where((angle >= b2) & (angle < b3), torch.full_like(group, 3), group)
+        return group
+
+    def _groupdro_bce(logit, target, mask, pos_weight, group, q):
+        """그룹별 평균 손실의 q-가중합. q 는 GroupDRO 규칙으로 그 자리에서
+        갱신한다(지수 상승 후 정규화, 상한 클립)."""
+        raw = nn.functional.binary_cross_entropy_with_logits(
+            logit, target, pos_weight=pos_weight, reduction="none")
+        group_losses = torch.zeros(N_SEASON_GROUPS, device=logit.device)
+        for g in range(N_SEASON_GROUPS):
+            gm = mask * (group == g).float().unsqueeze(-1)
+            n = gm.sum()
+            if n > 0:
+                group_losses[g] = (raw * gm).sum() / n
+        with torch.no_grad():
+            q.mul_(torch.exp(GROUPDRO_ETA * group_losses.detach()))
+            q.div_(q.sum())
+            q.copy_(_project_capped_simplex(q, _GROUPDRO_CAP))
+        return (q * group_losses).sum()
+
+    _dro_q_heat = torch.ones(N_SEASON_GROUPS, device=DEVICE) / N_SEASON_GROUPS
+    _dro_q_cold = torch.ones(N_SEASON_GROUPS, device=DEVICE) / N_SEASON_GROUPS
+
     if verbose:
         print(f"극한기상 헤드 — 전부 공식 라벨 표본만 사용(판정 불가 표본은 손실에서 제외)")
         print(f"              학습셋 폭염 비율 {heatwave_prior:.4f} "
@@ -1366,12 +1465,24 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                     logit, target, pos_weight=pos_weight, reduction="none")
                 return (raw * mask).sum() / mask.sum()
 
+            _season_grp = (_season_group_from_xnum(x_num)
+                          if GROUPDRO_ETA > 0 else None)
             if hasattr(model, "head_heatwave") and hmask_b.sum() > 0:
-                loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
-                    model._last_heatwave_logit, heat_b, hmask_b, heatwave_pos_weight)
+                if GROUPDRO_ETA > 0:
+                    loss = loss + EXTREME_BCE_WEIGHT * _groupdro_bce(
+                        model._last_heatwave_logit, heat_b, hmask_b,
+                        heatwave_pos_weight, _season_grp, _dro_q_heat)
+                else:
+                    loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
+                        model._last_heatwave_logit, heat_b, hmask_b, heatwave_pos_weight)
             if hasattr(model, "head_coldwave") and cmask_b.sum() > 0:
-                loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
-                    model._last_coldwave_logit, cold_b, cmask_b, coldwave_pos_weight)
+                if GROUPDRO_ETA > 0:
+                    loss = loss + EXTREME_BCE_WEIGHT * _groupdro_bce(
+                        model._last_coldwave_logit, cold_b, cmask_b,
+                        coldwave_pos_weight, _season_grp, _dro_q_cold)
+                else:
+                    loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
+                        model._last_coldwave_logit, cold_b, cmask_b, coldwave_pos_weight)
             if (DUST_LOSS_WEIGHT > 0 and hasattr(model, "head_dust")
                     and dmask_b.sum() > 0):
                 loss = loss + EXTREME_BCE_WEIGHT * DUST_LOSS_WEIGHT * _masked_bce(
@@ -1526,6 +1637,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # 크다(island_collector 는 실시간 API 조회라 이 문제가 없지만,
                 # 평년값은 다년간 히스토리가 필요해 같은 방식을 못 쓴다).
                 "use_climatology_anomaly": USE_CLIMATOLOGY_ANOMALY,
+                "groupdro_eta": GROUPDRO_ETA,
                 # numpy 배열이 아니라 리스트로 저장한다(mean/std 와 같은 이유) —
                 # torch.load(weights_only=True)(2026-08 PyTorch 기본값, 서빙·
                 # 모든 진단 스크립트가 이걸 쓴다)는 numpy 객체를 안전 목록에
