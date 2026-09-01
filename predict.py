@@ -443,6 +443,14 @@ def predict(stn: str = "108",
         "forecast": {
             "temperature":   round(temp_pred, 2),
             "precipitation": round(precip_pred, 2),
+            # 강수 확률(게이팅 전 원본, 미보정) — 2026-09-01 추가. 게이팅으로
+            # 0.0mm 가 된 경우와 "비가 안 온다"고 확신한 경우가 화면에서
+            # 구분되지 않는 문제(예: rain_prob=0.84 인데 τ=0.85 라 0mm 로
+            # 표시)를 app.py 가 드러낼 수 있게 노출한다. 임계값 자체를
+            # 옮기는 건 아니다 — 그 여지는 이미 소진됐다(improvement-levers
+            # -measured 메모리, 임계값 재선정 여유 실측 +0.0015). 여기서는
+            # 이미 계산돼 있던 값을 반환값에서 빠뜨리지 않는 것뿐이다.
+            "rain_prob": round(rain_prob, 4) if rain_prob is not None else None,
         },
         "extreme_event_probs": {
             "heatwave": round(heatwave_prob, 4) if heatwave_prob is not None else None,

@@ -1318,6 +1318,29 @@ with tab_trend:
         "탭의 강수 MAE 설명을 함께 참조한다."
     )
 
+    # 강수확률 근접 판정 안내(2026-09-01 추가). "0.0mm"는 두 가지 서로 다른
+    # 상황을 구분 없이 보여준다 — ① 모델이 확신에 차서 무강수로 본 경우,
+    # ② 강수확률이 임계값에 근접했으나 살짝 못 미친 경우. 검증셋 실측:
+    # 게이트로 놓친 실제 강수 사건의 14.6%가 확률 0.80 이상이었다(대부분은
+    # 확률 자체가 낮아 게이트가 정당했다). 임계값을 옮기는 건 대안이
+    # 아니다 — 그 여지는 이미 소진됐다(재선정 여유 실측 +0.0015,
+    # improvement-levers-measured). 그래서 임계값은 그대로 두고, 근접
+    # 판정일 때만 이미 계산돼 있던 확률을 드러낸다.
+    for _lbl, _res, _f, _gate in (
+        ("+6시간", result, f6, PRECIP_PROB_GATE_BY_LEAD[6]),
+        ("+12시간", result_12h, f12 if result_12h is not None else None,
+         PRECIP_PROB_GATE_BY_LEAD.get(12)),
+    ):
+        if _res is None or _f is None:
+            continue
+        _rp = _f.get("rain_prob")
+        if _rp is not None and _f["precipitation"] == 0.0 and _rp >= _gate - 0.10:
+            st.caption(
+                f"ℹ️ {_lbl} 강수확률은 {_rp:.0%}로 판정 임계값({_gate:.0%})에 "
+                f"근접했으나 못 미쳐 0.0mm로 표시됐다 — 확신에 찬 무강수 판정이 "
+                "아니라 근접 판정이다."
+            )
+
 # ── 탭 2: 극한기상 ───────────────────────────────────────────────
 
 with tab_extreme:
