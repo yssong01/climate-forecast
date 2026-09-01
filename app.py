@@ -1240,16 +1240,24 @@ with tab_trend:
     _val_precip_mae6 = ckpt.get("val_precip_mae")
     _d_temp6 = f6["temperature"] - c6["temperature"]
     _d_precip6 = f6["precipitation"] - c6["precipitation"]
+    # 90% 예측구간(분포무관, split conformal) — 2026-09-01 연결. "±MAE"는
+    # 검증셋 평균오차일 뿐 이 예측 1건의 신뢰구간이 아니다(README '정직한
+    # 한계'). conformal_interval_fit.py 가 이미 적합·검증해 체크포인트에
+    # 저장해둔 값을 조회만 한다 — 없으면(구버전 체크포인트 등) 조용히 생략.
+    _ti6 = f6.get("temp_interval_90")
+    _pi6 = f6.get("precip_interval_90")
     _rows = [
         {
             "항목": "기온 출력값",
             "+6시간(기본)": f"{f6['temperature']:.1f} °C ({_d_temp6:+.1f} 현재 대비)"
-                          + (f" ±{_val_temp_mae6:.2f}" if _val_temp_mae6 is not None else ""),
+                          + (f" ±{_val_temp_mae6:.2f}" if _val_temp_mae6 is not None else "")
+                          + (f" · 90% 구간 [{_ti6[0]:.1f}, {_ti6[1]:.1f}]" if _ti6 else ""),
         },
         {
             "항목": "강수 출력값",
             "+6시간(기본)": f"{f6['precipitation']:.1f} mm ({_d_precip6:+.1f} 현재 대비)"
-                          + (f" ±{_val_precip_mae6:.3f}" if _val_precip_mae6 is not None else ""),
+                          + (f" ±{_val_precip_mae6:.3f}" if _val_precip_mae6 is not None else "")
+                          + (f" · 90% 구간 [{_pi6[0]:.1f}, {_pi6[1]:.1f}]" if _pi6 else ""),
         },
     ]
     # 상승/하강 방향에 따른 글자색(2026-08-20) — 현재 대비 증가는 빨강,
@@ -1262,13 +1270,17 @@ with tab_trend:
         _val_precip_mae12 = ckpt_12h.get("val_precip_mae")
         _d_temp12 = f12["temperature"] - c12["temperature"]
         _d_precip12 = f12["precipitation"] - c12["precipitation"]
+        _ti12 = f12.get("temp_interval_90")
+        _pi12 = f12.get("precip_interval_90")
         _rows[0]["+12시간(2차 산출값)"] = (
             f"{f12['temperature']:.1f} °C ({_d_temp12:+.1f} 현재 대비)"
             + (f" ±{_val_temp_mae12:.2f}" if _val_temp_mae12 is not None else "")
+            + (f" · 90% 구간 [{_ti12[0]:.1f}, {_ti12[1]:.1f}]" if _ti12 else "")
         )
         _rows[1]["+12시간(2차 산출값)"] = (
             f"{f12['precipitation']:.1f} mm ({_d_precip12:+.1f} 현재 대비)"
             + (f" ±{_val_precip_mae12:.3f}" if _val_precip_mae12 is not None else "")
+            + (f" · 90% 구간 [{_pi12[0]:.1f}, {_pi12[1]:.1f}]" if _pi12 else "")
         )
         _deltas[0]["+12시간(2차 산출값)"] = _d_temp12
         _deltas[1]["+12시간(2차 산출값)"] = _d_precip12
@@ -1308,7 +1320,11 @@ with tab_trend:
         f"+12시간은 {PRECIP_PROB_GATE_BY_LEAD[12]:.0%} 미만이면 강수량을 0으로 "
         "반올림한다(리드타임마다 확률 분포가 달라 임계값을 따로 골랐다). "
         "'±' 뒤 숫자는 "
-        "검증셋 평균절대오차(MAE)이며 이 예측 1건의 신뢰구간이 아니다. 빨간 "
+        "검증셋 평균절대오차(MAE)이며 이 예측 1건의 신뢰구간이 아니다. "
+        "'90% 구간'이 그 신뢰구간이다 — 분포무관 예측구간(split conformal "
+        "prediction)으로, 검증셋에서 실제로 90%(기온) · 93%(강수)의 관측값이 "
+        "이 구간 안에 들었음을 확인한 뒤에만 채택했다(관측소·강수확률 구간별로 "
+        "따로 적합). 빨간 "
         "글자는 현재 대비 상승, 초록 글자는 하강 전망이다. 열 제목 색은 위 "
         "차트의 별 색과 같다 — 주황이 꽉 찬 별(+6시간), 보라가 속 빈 "
         "별(+12시간)이다."

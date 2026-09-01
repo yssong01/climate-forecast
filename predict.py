@@ -177,6 +177,36 @@ def calibrate_prob(prob: float, event: str, ckpt: dict) -> float:
     return float(np.interp(prob, head["x"], head["y"]))
 
 
+def conformal_bounds(ckpt: dict, kind: str, group_key, point_pred: float,
+                     clip_min: float = None):
+    """분포무관 예측구간(split conformal, conformal_interval_fit.py 참고).
+
+    체크포인트에 이미 적합·검증된 분위수를 조회만 한다 — 이 함수 자체는
+    아무것도 새로 추정하지 않는다. `kind`는 "temp"(관측소별 층화) 또는
+    "precip"(rain_prob 구간별 층화). 체크포인트에 conformal_interval 이
+    없거나 그 kind 가 채택되지 않았으면 (None, None) — 화면은 이를
+    "구간 미제공"으로 처리해야 한다(날조 금지).
+    """
+    ci = ckpt.get("conformal_interval")
+    if not ci or not ci.get(kind):
+        return None, None
+    info = ci[kind]
+    entry = info["per_group"].get(str(group_key))
+    q_lo, q_hi = ((entry["q_lo"], entry["q_hi"]) if entry is not None
+                  else (info["q_lo_global"], info["q_hi_global"]))
+    lo, hi = point_pred + q_lo, point_pred + q_hi
+    if clip_min is not None:
+        lo, hi = max(lo, clip_min), max(hi, clip_min)
+    return round(float(lo), 2), round(float(hi), 2)
+
+
+def _rain_prob_bucket(rain_prob: float, edges: list) -> str:
+    """conformal_interval_fit.py 의 버킷팅과 정확히 같은 규칙(np.digitize)."""
+    b = int(np.digitize([rain_prob], edges)[0]) - 1
+    b = max(0, min(b, len(edges) - 2))
+    return f"[{edges[b]:.1f},{edges[b+1]:.1f})"
+
+
 def event_threshold(event: str, stn: str, ckpt: dict = None) -> float:
     """
     판정 임계값. 확률을 보정했으면 판정선도 보정 공간의 값이어야 한다 — 확률만
@@ -415,6 +445,19 @@ def predict(stn: str = "108",
     dust_prob     = (calibrate_prob(extreme["dust"][0].item(), "dust", ckpt)
                      if extreme["dust"] is not None else None)
 
+    # 분포무관 예측구간(2026-09-01 연결) — conformal_interval_fit.py 가 이미
+    # 적합·검증(실측 커버리지 기온 0.899·강수 0.929)해 체크포인트에 저장해둔
+    # 분위수를 조회만 한다. 화면의 "±MAE"는 검증셋 평균오차일 뿐 이 예측
+    # 1건의 신뢰구간이 아니라는 한계(README '정직한 한계')를 이걸로 보완한다.
+    temp_ci = conformal_bounds(ckpt, "temp", stn, temp_pred)
+    precip_ci = (None, None)
+    if rain_prob is not None:
+        ci_precip = ckpt.get("conformal_interval", {}).get("precip")
+        if ci_precip:
+            bucket = _rain_prob_bucket(rain_prob, ci_precip["rain_prob_edges"])
+            precip_ci = conformal_bounds(ckpt, "precip", bucket, precip_pred,
+                                        clip_min=0.0)
+
     observed_at = record.get("timestamp")
     # accuracy.py 가 (관측소, 목표시각)으로 로그를 남기려면 이 시각이 필요하다
     # — 시간대는 관측시각 문자열이 이미 KST 벽시계 표기라 그대로 산술한다.
@@ -459,6 +502,10 @@ def predict(stn: str = "108",
             # -measured 메모리, 임계값 재선정 여유 실측 +0.0015). 여기서는
             # 이미 계산돼 있던 값을 반환값에서 빠뜨리지 않는 것뿐이다.
             "rain_prob": round(rain_prob, 4) if rain_prob is not None else None,
+            # 90% 예측구간(분포무관, split conformal) — 없으면 None(구버전
+            # 체크포인트이거나 채택 기준 미달, 날조 대신 미제공으로 표시).
+            "temp_interval_90": temp_ci if temp_ci != (None, None) else None,
+            "precip_interval_90": precip_ci if precip_ci != (None, None) else None,
         },
         "extreme_event_probs": {
             "heatwave": round(heatwave_prob, 4) if heatwave_prob is not None else None,
