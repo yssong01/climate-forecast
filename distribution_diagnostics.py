@@ -41,7 +41,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import stats
 
-from train import collect_historical, WeatherDataset, VAL_RATIO, SEED, make_split
+from train import collect_historical, WeatherDataset, VAL_RATIO, SEED, make_split, aux_dataset_kwargs
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
 from weather_collector import STATION_COORDS
@@ -97,6 +97,7 @@ def main():
     ds = WeatherDataset(
         records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
         txt_collector=txt_collector, lead_hours=ckpt["lead_hours"],
+        **aux_dataset_kwargs(ckpt),
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )

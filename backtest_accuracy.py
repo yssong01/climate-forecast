@@ -21,7 +21,7 @@ accuracy.py 의 live 경로는 예보를 만들고 +6시간을 기다려야 1건
 import numpy as np
 import torch
 
-from train import collect_historical, WeatherDataset, make_split
+from train import collect_historical, WeatherDataset, make_split, aux_dataset_kwargs
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
 from weather_collector import STATION_COORDS
@@ -51,6 +51,7 @@ def main():
         sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
         txt_collector=txt_collector,
         lead_hours=ckpt["lead_hours"],
+        **aux_dataset_kwargs(ckpt),
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )

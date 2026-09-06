@@ -32,7 +32,7 @@ import numpy as np
 import torch
 
 from predict import CHECKPOINT, load_model
-from train import WeatherDataset, collect_historical, make_split
+from train import WeatherDataset, collect_historical, make_split, aux_dataset_kwargs
 from weather_collector import STATION_COORDS
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
@@ -101,6 +101,7 @@ def main():
     ds = WeatherDataset(
         records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
         txt_collector=TendencyCollector(records), lead_hours=ckpt["lead_hours"],
+        **aux_dataset_kwargs(ckpt),
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )

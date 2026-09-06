@@ -35,7 +35,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from train import (
     collect_historical, WeatherDataset, make_split, _prf_metrics,
-    WET_THRESH, DEVICE,
+    WET_THRESH, DEVICE, aux_dataset_kwargs,
 )
 from weather_collector import STATION_COORDS
 from interp_field_collector import InterpolatedFieldCollector
@@ -195,6 +195,7 @@ def main():
     ds = WeatherDataset(
         records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
         txt_collector=txt_collector, lead_hours=ckpt["lead_hours"],
+        **aux_dataset_kwargs(ckpt),
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )

@@ -636,6 +636,8 @@ class WeatherDataset(Dataset):
                  climatology_table: dict = None,  # build_climatology_table() 반환값 — Z축 부가 특징(평년 대비 이상편차)
                  nwp_collector=None,      # NWPForecastCollector — Z축 부가 특징(수치예보)
                  nwp_features: bool = True,  # False 면 표본 선별만 하고 특징은 안 붙인다(대조군용)
+                 offseason_negative: bool = None,  # None 이면 환경변수 기본값
+
                  lead_hours: int = 1,
                  mean: np.ndarray = None, std: np.ndarray = None):
         L = lead_hours
@@ -820,8 +822,14 @@ class WeatherDataset(Dataset):
         # 구분되는 근거는, 여기서 채우는 것이 **결측**이 아니라 그 사건의
         # 라벨이 그 계절에 원리적으로 생산되지 않는 구간이라는 점이다.
         # 그래도 가정이므로 실험 스위치로 두고 실측으로 판단한다.
+        # 이 값은 **체크포인트에서 온다**(aux_dataset_kwargs). 환경변수에만
+        # 의존하면 미세조정·진단 스크립트가 기반 체크포인트와 다른 라벨
+        # 조건으로 데이터셋을 세우는데 아무도 눈치채지 못한다 — 실제로
+        # 한파 헤드 디커플링 첫 시도에서 그렇게 돌 뻔했다(2026-09-06).
+        offseason_neg = (EXTREME_OFFSEASON_NEGATIVE if offseason_negative is None
+                         else bool(offseason_negative))
         covered_months = {}
-        if EXTREME_OFFSEASON_NEGATIVE:
+        if offseason_neg:
             for _key in ("heatwave_advisory", "coldwave_advisory"):
                 _ms = {_d[5:7] for _days in issue_labels.values()
                        for _d, _v in _days.items() if _key in _v}
@@ -841,7 +849,7 @@ class WeatherDataset(Dataset):
 
             if "heatwave_advisory" in day:
                 heat_list.append(day["heatwave_advisory"]); heat_mask_list.append(1); n_heat_off += 1
-            elif (EXTREME_OFFSEASON_NEGATIVE
+            elif (offseason_neg
                   and ts[4:6] not in covered_months["heatwave_advisory"]):
                 heat_list.append(0); heat_mask_list.append(1); n_heat_offseason += 1
             elif EXTREME_LABEL_MASKING:
@@ -851,7 +859,7 @@ class WeatherDataset(Dataset):
 
             if "coldwave_advisory" in day:
                 cold_list.append(day["coldwave_advisory"]); cold_mask_list.append(1); n_cold_off += 1
-            elif (EXTREME_OFFSEASON_NEGATIVE
+            elif (offseason_neg
                   and ts[4:6] not in covered_months["coldwave_advisory"]):
                 cold_list.append(0); cold_mask_list.append(1); n_cold_offseason += 1
             elif EXTREME_LABEL_MASKING:
@@ -875,7 +883,7 @@ class WeatherDataset(Dataset):
         self.n_dust_official = n_dust_off
         self.n_heat_offseason = n_heat_offseason
         self.n_cold_offseason = n_cold_offseason
-        if EXTREME_OFFSEASON_NEGATIVE:
+        if offseason_neg:
             # 무엇이 얼마나 채워졌는지 반드시 눈에 보이게 남긴다 — 라벨 의미를
             # 바꾸는 스위치라 조용히 켜져 있으면 안 된다.
             print(f"  [정보] 특보 비운영기간을 확정 음성으로 채움 — "
@@ -1039,6 +1047,9 @@ def aux_dataset_kwargs(ckpt: dict) -> dict:
         # 평년값 테이블은 체크포인트에 저장돼 있다 — 여기서 다시 계산하면
         # 그 시점 records 구성에 따라 학습 당시와 다른 표가 나올 수 있다.
         kw["climatology_table"] = ckpt.get("climatology_table")
+    # 라벨 의미를 바꾸는 스위치라 반드시 체크포인트를 따라가야 한다 —
+    # 키가 없는(구버전) 체크포인트는 False 로 종전 동작 그대로다.
+    kw["offseason_negative"] = bool(ckpt.get("extreme_offseason_negative", False))
     if ckpt.get("use_nwp", False) or ckpt.get("use_nwp_subset", False):
         from nwp_collector import shared as _nwp_shared
         # `use_nwp_subset`(대조군)은 특징을 붙이지 않지만 **표본 선별은
