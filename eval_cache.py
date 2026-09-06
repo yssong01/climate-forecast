@@ -241,6 +241,10 @@ def build(ckpt_path: str, batch: int):
         y_coldwave=ds.y_coldwave[val_idx].numpy(),
         y_dust=ds.y_dust[val_idx].numpy(),
         heat_mask=ds.heat_mask[val_idx].numpy(),
+        # 공식 라벨 전용 마스크(2026-09-07) — offseason 채움을 켠 체크포인트를
+        # 배포본과 공정하게 비교하려면 이 표본으로 한정해 채점해야 한다.
+        heat_mask_official=ds.heat_mask_official[val_idx].numpy(),
+        cold_mask_official=ds.cold_mask_official[val_idx].numpy(),
         cold_mask=ds.cold_mask[val_idx].numpy(),
         dust_mask=ds.dust_mask[val_idx].numpy(),
         stn=np.array([str(ds.stns[i]) for i in val_idx]),

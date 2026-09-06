@@ -342,6 +342,7 @@ class TriCHEFPipeline(nn.Module):
                  coldwave_prior: float = 0.003,
                  dust_prior: float = 0.05,
                  signed_head_input: bool = False,
+                 extreme_nwp_neutral_dims: int = 0,
                  signed_precip_input: bool = False,
                  head_dropout: float = 0.0,
                  coldwave_dropout: float = 0.0,
@@ -502,6 +503,24 @@ class TriCHEFPipeline(nn.Module):
         # 원인 분리가 불가능해진다.
         _ext_dim = embed_dim * 2 if signed_head_input else embed_dim
         self.signed_head_input = signed_head_input
+        # extreme_nwp_neutral_dims (2026-09-07) — 극한기상 헤드가 받는 부호
+        # 표현(v_Z)만 **수치예보 없이** 계산한다. 0 이면 종전 동작 그대로다.
+        #
+        # 왜(실측 근거): 수치예보 14차원을 Z축에 붙이자 한파 헤드가 겨울에
+        # 크게 역전했다(1월 −15°C 0.06% vs +20°C 60.9%, 단조성 게이트 FAIL).
+        # 원인을 대조군으로 갈랐다 — 같은 재학습 계열이라도 수치예보가 없는
+        # 대조군은 WARN 으로 통과하고(최악 상관 −0.30), 수치예보 변형 둘은
+        # 각각 +0.82·+0.70 으로 역전했다. 즉 재학습 불안정이 아니라 이 축이
+        # 원인이다. 헤드 디커플링으로는 못 고쳤다(심각도만 0.710→0.448) —
+        # 원인이 헤드가 아니라 그 앞의 표현에 있기 때문이다.
+        #
+        # 처방: 같은 인코더에 수치예보 차원만 중립값(정규화 후 0 = 학습
+        # 평균)으로 채워 한 번 더 통과시키고, 그 출력을 극한기상 헤드에만
+        # 준다. 새 파라미터가 없고 융합식·회귀·강수 경로는 건드리지 않아
+        # 기온·강수 이득이 보존된다. 극한기상 헤드는 수치예보를 잃지만,
+        # 부트스트랩에서 그 이득은 폭염 +0.0144(CI 0 포함)·한파 +0.0278
+        # (CI 0 포함)로 **둘 다 유의하지 않았다.**
+        self.extreme_nwp_neutral_dims = int(extreme_nwp_neutral_dims)
         self.head_heatwave = _binary_head(_ext_dim, heatwave_prior, head_dropout)
         # coldwave_dropout (2026-08-17) — head_dropout과 별도로 한파 헤드에만
         # 거는 드롭아웃. head_dropout을 전체 헤드에 걸었더니(2026-08-17 기각)
@@ -768,7 +787,15 @@ class TriCHEFPipeline(nn.Module):
         # 극한기상 헤드에는 부호가 살아 있는 v_z 를 함께 넣는다(위 __init__
         # signed_head_input 주석 참고). magnitude 는 제곱을 거쳐 |편차| 만
         # 남으므로, 이것만으로는 한겨울과 한여름이 구분되지 않는다.
-        _ext_in = (torch.cat([magnitude, v_z], dim=-1)
+        v_z_ext = v_z
+        if self.extreme_nwp_neutral_dims > 0:
+            # 뒤쪽 n 차원(수치예보)만 0 으로 — 입력은 표준화돼 있으므로 0 이
+            # 곧 학습 평균이다. 앞쪽 지상 관측 특징은 그대로 둔다.
+            n = self.extreme_nwp_neutral_dims
+            num_neutral = num_x.clone()
+            num_neutral[:, -n:] = 0.0
+            v_z_ext = self.enc_z(num_neutral)
+        _ext_in = (torch.cat([magnitude, v_z_ext], dim=-1)
                    if self.signed_head_input else magnitude)
         self._last_heatwave_logit = self.head_heatwave(_ext_in)
         self._last_coldwave_logit = self.head_coldwave(_ext_in)

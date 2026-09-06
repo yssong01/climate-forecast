@@ -151,6 +151,17 @@ def precision_block(d, ckpt):
     for key, ko in EVENTS:
         short = key.replace('heatwave', 'heat').replace('coldwave', 'cold')
         mask = d[f"{short}_mask"].astype(bool)
+        # 공식 라벨 전용 채점(2026-09-07) — EXTREME_OFFSEASON_NEGATIVE 를 켠
+        # 체크포인트는 특보 비운영기간이 '확정 음성'으로 채워져 채점 표본이
+        # 크게 늘어난다(한파 53,111 → 139,893). 쉬운 음성이 대량으로 섞이면
+        # 정밀도가 올라 F1 이 부풀고, 그 값을 배포본과 나란히 놓으면 비교가
+        # 성립하지 않는다. 공식 라벨이 실제로 존재하는 표본으로 한정한다 —
+        # 그래야 배포본과 **같은 질문**에 답한 값이 된다.
+        _off_key = f"{short}_mask_official"
+        if _off_key in d:
+            _official = d[_off_key].astype(bool)
+            if int(_official.sum()) and int(_official.sum()) != int(mask.sum()):
+                mask = mask & _official
         prob = d[f"{short}_prob"][mask]
         label = d[f"y_{key}"][mask].astype(int)
         if len(prob) == 0:

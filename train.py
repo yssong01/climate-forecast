@@ -188,6 +188,11 @@ USE_ISLAND = os.getenv("USE_ISLAND", "0") == "1"
 # 위험은 WeatherDataset 안의 covered_months 주석 참고. 기본값 0(끔).
 EXTREME_OFFSEASON_NEGATIVE = os.getenv("EXTREME_OFFSEASON_NEGATIVE", "0") == "1"
 USE_NWP = os.getenv("USE_NWP", "0") == "1"
+# 극한기상 헤드의 부호 표현에서만 수치예보를 중립화할지(2026-09-07).
+# 근거는 pipeline_model.TriCHEFPipeline.__init__ 의 extreme_nwp_neutral_dims
+# 주석 참고 — 한파 단조성 FAIL 의 원인이 이 축임을 대조군으로 확인했다.
+# USE_NWP=1 일 때만 의미가 있다. 기본값 0(끔).
+EXTREME_NWP_NEUTRAL = os.getenv("EXTREME_NWP_NEUTRAL", "0") == "1"
 USE_NWP_SUBSET = os.getenv("USE_NWP_SUBSET", "0") == "1"
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
 # 그래디언트 누적(2026-09-01) — amount 헤드 pinball 재도전용. PRECIP_QUANTILE
@@ -840,6 +845,11 @@ class WeatherDataset(Dataset):
 
         heat_list, cold_list, dust_list = [], [], []
         heat_mask_list, cold_mask_list, dust_mask_list = [], [], []
+        # 공식 라벨이 실제로 존재하는 표본만 1 인 마스크. offseason 채움과
+        # 무관하게 유지한다 — 채움을 켜면 극한기상 채점 표본이 크게 늘어
+        # (한파 53,111 → 139,893) 쉬운 음성이 섞이므로, 배포본과 공정하게
+        # 비교하려면 **공식 라벨 표본으로 한정해 다시 채점**해야 한다.
+        heat_off_mask, cold_off_mask = [], []
         n_heat_off = n_cold_off = n_dust_off = 0
         n_heat_offseason = n_cold_offseason = 0
         for i, r in enumerate(tgt_records):
@@ -847,6 +857,8 @@ class WeatherDataset(Dataset):
             date_str = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
             day = issue_labels.get(str(r.get("stn")), {}).get(date_str, {})
 
+            heat_off_mask.append(1 if "heatwave_advisory" in day else 0)
+            cold_off_mask.append(1 if "coldwave_advisory" in day else 0)
             if "heatwave_advisory" in day:
                 heat_list.append(day["heatwave_advisory"]); heat_mask_list.append(1); n_heat_off += 1
             elif (offseason_neg
@@ -876,6 +888,8 @@ class WeatherDataset(Dataset):
         self.y_coldwave = torch.tensor(cold_list, dtype=torch.float32)
         self.y_dust     = torch.tensor(dust_list, dtype=torch.float32)
         self.heat_mask  = torch.tensor(heat_mask_list, dtype=torch.float32)
+        self.heat_mask_official = torch.tensor(heat_off_mask, dtype=torch.float32)
+        self.cold_mask_official = torch.tensor(cold_off_mask, dtype=torch.float32)
         self.cold_mask  = torch.tensor(cold_mask_list, dtype=torch.float32)
         self.dust_mask  = torch.tensor(dust_mask_list, dtype=torch.float32)
         self.n_heat_official = n_heat_off
@@ -1475,6 +1489,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         heatwave_prior=heatwave_prior, coldwave_prior=coldwave_prior,
         dust_prior=dust_prior,
         signed_head_input=SIGNED_HEAD_INPUT,
+        # 수치예보를 쓸 때만 그 차원 수를 넘긴다 — 0 이면 종전 동작.
+        extreme_nwp_neutral_dims=(NWP_DIM if (USE_NWP and EXTREME_NWP_NEUTRAL) else 0),
         signed_precip_input=SIGNED_PRECIP_INPUT,
         head_dropout=HEAD_DROPOUT,
         coldwave_dropout=COLDWAVE_DROPOUT,
@@ -1807,6 +1823,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # 필드가 없으면 나중에 어느 쪽 체크포인트인지 알 수 없다.
                 "extreme_offseason_negative": EXTREME_OFFSEASON_NEGATIVE,
                 "use_nwp":        USE_NWP,
+                "extreme_nwp_neutral_dims": (NWP_DIM if (USE_NWP and EXTREME_NWP_NEUTRAL)
+                                             else 0),
                 "use_nwp_subset": USE_NWP_SUBSET,
                 "nwp_model":      (NWP_ARCHIVE_MODEL if (USE_NWP or USE_NWP_SUBSET)
                                    else None),
