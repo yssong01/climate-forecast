@@ -45,7 +45,14 @@ TEMPS = list(range(-15, 36, 5))                      # −15 ~ 35 °C
 MONTHS = [(m, f"{m:02d}15") for m in range(1, 13)]   # 각 달 15일
 
 
-def head_prob(model, ckpt, record, img, txt, head="coldwave"):
+def head_prob(model, ckpt, record, img, txt, head="coldwave", nwp_fixed=None):
+    """`nwp_fixed` 는 기준 레코드에서 한 번 뽑은 예보값이다.
+
+    기온·계절을 흔드는 동안 예보를 다시 조회하지 않는 이유는 두 가지다.
+    ① 한 번에 하나만 바꾼다는 원칙 — 예보까지 함께 바뀌면 확률 변화가
+       기온 때문인지 예보 때문인지 가릴 수 없다. ② 흔드는 날짜에는 애초에
+       예보가 없다(미래 날짜를 포함한다).
+    """
     mean = np.array(ckpt["mean"], dtype=np.float32)
     std = np.array(ckpt["std"], dtype=np.float32)
     nf = ckpt.get("num_features", len(mean))
@@ -56,6 +63,13 @@ def head_prob(model, ckpt, record, img, txt, head="coldwave"):
         from train import climatology_anomaly
         table = ckpt.get("climatology_table") or {}
         vec = np.concatenate([vec, [climatology_anomaly(record, table)]]).astype(np.float32)
+    if ckpt.get("use_nwp", False):
+        from nwp_collector import NWPForecastCollector
+        nv = NWPForecastCollector.encode_from(nwp_fixed, record)
+        if nv is None:
+            raise RuntimeError("고정 예보값으로 NWP 특징을 만들 수 없다 — "
+                               "기준 레코드의 관측값이 결측이다.")
+        vec = np.concatenate([vec, nv]).astype(np.float32)
     vec = vec[:nf]
     x = torch.tensor((vec - mean) / std, dtype=torch.float32).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
@@ -68,13 +82,23 @@ def head_prob(model, ckpt, record, img, txt, head="coldwave"):
 def build_grid(model, ckpt, base, img, txt, head="coldwave"):
     """(달, 기온) → 한파확률 격자. 시각(시)은 고정한다."""
     hh = str(base.get("timestamp", "202601011200"))[8:12] or "1200"
+    # NWP 예보값은 기준 레코드에서 한 번만 뽑아 격자 전체에 고정한다
+    # (head_prob docstring 참고).
+    nwp_fixed = None
+    if ckpt.get("use_nwp", False):
+        from nwp_collector import shared as nwp_shared
+        nwp_fixed = nwp_shared().raw_forecast(base, ckpt["lead_hours"])
+        if nwp_fixed is None:
+            raise RuntimeError(
+                f"탐침 기준 레코드({base.get('stn')} {base.get('timestamp')})의 "
+                f"수치예보가 아카이브에 없다 — 단조성 시험을 수행할 수 없다.")
     grid = np.zeros((len(MONTHS), len(TEMPS)))
     for i, (_, mmdd) in enumerate(MONTHS):
         for j, t in enumerate(TEMPS):
             r = dict(base)
             r["temperature"] = t
             r["timestamp"] = f"2026{mmdd}{hh}"
-            grid[i, j] = head_prob(model, ckpt, r, img, txt, head)
+            grid[i, j] = head_prob(model, ckpt, r, img, txt, head, nwp_fixed)
     return grid
 
 

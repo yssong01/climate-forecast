@@ -35,6 +35,7 @@ import torch
 
 from predict import CHECKPOINT, load_model, raw_event_threshold
 from train import WeatherDataset, collect_historical, make_split
+from nwp_collector import shared as nwp_shared
 from weather_collector import STATION_COORDS, STATIONS
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
@@ -51,9 +52,15 @@ def main():
     model.eval()
 
     records = collect_historical()
+    # NWP 예보 특징 — 이 체크포인트가 쓰면 학습과 같은 방식으로 붙인다.
+    # 빠뜨리면 mean/std 와 차원이 안 맞아 즉시 죽는다(조용히 틀리지는
+    # 않지만, 게이트가 아예 못 돌면 승격 절차가 막힌다).
+    _nwp = (nwp_shared() if (ckpt.get("use_nwp") or ckpt.get("use_nwp_subset"))
+            else None)
     ds = WeatherDataset(
         records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
         txt_collector=TendencyCollector(records), lead_hours=ckpt["lead_hours"],
+        nwp_collector=_nwp, nwp_features=bool(ckpt.get("use_nwp")),
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32))
     _, val = make_split(ds, ckpt.get("split_mode", "group"), verbose=False, ckpt=ckpt)

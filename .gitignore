@@ -47,6 +47,9 @@ cache/*
 !cache/recent_window.json
 !cache/accuracy_log.json
 !cache/api_usage_daily.json
+# 수치예보 창 — refresh-data.yml 이 data 브랜치에 커밋하고 앱이 raw 로 읽는다.
+# 학습용 전체 아카이브(cache/nwp_archive.json, 52MB)는 여기 없으므로 계속 제외된다.
+!cache/nwp_recent.json
 *.json.bak
 *.log
 

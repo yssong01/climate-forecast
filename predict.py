@@ -27,6 +27,7 @@ from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector, LAGS_HOURS
 from text_collector import SimulatedTextCollector
 from island_collector import encode_live as island_encode_live
+from nwp_collector import load_for_serving as _load_nwp_for_serving
 from pipeline_model import TriCHEFPipeline
 from train import record_to_vec, STATION_NAMES
 
@@ -43,6 +44,30 @@ from train import record_to_vec, STATION_NAMES
 # 무효로 표시했다(재실행 필요).
 CHECKPOINT = os.getenv("CHECKPOINT_PATH", "./checkpoints/numerical_trichef.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class NWPUnavailable(RuntimeError):
+    """수치예보 부가 입력을 구성할 수 없을 때 — 화면이 사유를 드러내도록 별도 형으로 둔다."""
+
+
+_NWP_CACHE = None
+
+
+def _nwp_collector():
+    """서빙용 NWP 표를 읽어 재사용한다.
+
+    파일이 갱신됐는데 프로세스가 살아 있는 동안 옛 표를 계속 쓰면 안 되므로
+    파일 mtime 을 캐시 키에 넣는다 — "결과를 바꾸는 모든 것을 캐시 키에
+    넣는다"는 규약(CLAUDE.md 1절 14항)과 같은 취지다. CI 가 15분마다
+    nwp_recent.json 을 갱신하므로 이 경로는 실제로 자주 바뀐다.
+    """
+    from nwp_collector import ARCHIVE_PATH, RECENT_PATH
+    global _NWP_CACHE
+    sig = tuple(os.path.getmtime(p) if os.path.exists(p) else None
+                for p in (ARCHIVE_PATH, RECENT_PATH))
+    if _NWP_CACHE is None or _NWP_CACHE[0] != sig:
+        _NWP_CACHE = (sig, _load_nwp_for_serving())
+    return _NWP_CACHE[1]
 
 # 강수 후처리 게이팅 — precip_prob_gate_sweep.py 실측(2026-08-29, 검증셋
 # 평가용 절반·보정용 절반 분리): 매그니튜드(mm) 임계값은 강수 발생 판정
@@ -409,6 +434,20 @@ def predict(stn: str = "108",
         table = ckpt.get("climatology_table") or {}
         num_vec = np.concatenate(
             [num_vec, [climatology_anomaly(record, table)]]).astype(np.float32)
+    if ckpt.get("use_nwp", False):
+        # 수치예보 예보값 14차원 — 학습 때와 같은 순서로 맨 뒤에 붙인다.
+        # 학습과 **같은 함수**(nwp_collector.encode)를 쓰므로 특징 정의가
+        # 두 경로에서 어긋날 수 없다.
+        #
+        # 결측이면 예보를 낼 수 없다 — 중립값으로 메우면 "예보가 없다"가
+        # "강수 0mm 예보"로 둔갑한다(CLAUDE.md 1절 5항). 호출자가 이 사정을
+        # 화면에 드러낼 수 있도록 명시적 예외로 올린다.
+        nwp_vec = _nwp_collector().encode(record, lead_hours)
+        if nwp_vec is None:
+            raise NWPUnavailable(
+                f"{record.get('stn')} {record.get('timestamp')} 의 +{lead_hours}h "
+                f"수치예보가 없다 — cache/nwp_recent.json 갱신 상태를 확인할 것.")
+        num_vec = np.concatenate([num_vec, nwp_vec]).astype(np.float32)
     num_vec  = num_vec[:nf]
     num_norm = (num_vec - mean) / std
 

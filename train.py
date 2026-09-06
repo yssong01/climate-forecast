@@ -35,6 +35,8 @@ from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector, TENDENCY_DIM
 from text_collector import SimulatedTextCollector
 from island_collector import IslandPrecipCollector, ISLAND_DIM
+from nwp_collector import NWPForecastCollector, NWP_DIM
+from collect_nwp_archive import MODEL as NWP_ARCHIVE_MODEL
 from pipeline_model import TriCHEFPipeline
 
 load_dotenv()
@@ -71,9 +73,13 @@ _REFERENCE_BATCH = 32     # LR 스케일링 기준점 — 종전 배치 크기
 # 도커에서는 --shm-size 를 키워야 워커가 죽지 않는다(기본 64MB 로는 부족).
 NUM_WORKERS = 8
 
-EPOCHS     = 400    # 배치가 32배 커져 에폭당 스텝 수가 그만큼 줄었다.
-                    # 같은 학습량을 확보하려면 에폭 수를 늘려야 한다.
-                    # 에폭당 0.25분이라 400에폭도 100분이면 끝난다.
+# 배치가 32배 커져 에폭당 스텝 수가 그만큼 줄었다. 같은 학습량을 확보하려면
+# 에폭 수를 늘려야 한다. 에폭당 0.25분이라 400에폭도 100분이면 끝난다.
+# 환경변수로 뺀 것은 **연기 시험(smoke test)용**이다(2026-09-06) — 입력 차원을
+# 바꾸는 변경은 데이터셋 구성까지 다 끝난 뒤에야 shape 오류가 드러나는데,
+# 그때마다 전체 학습을 돌려 확인하면 한 번에 25분씩 버린다. EPOCHS=1 로
+# 경로 전체를 먼저 통과시킨 뒤 본 학습을 돌린다. 기본값은 바뀌지 않았다.
+EPOCHS     = int(os.getenv("EPOCHS", "400"))
 
 # AdamW 에서 배치를 k배 키울 때는 학습률을 √k 배 하는 것이 통용되는 규칙이다
 # (SGD 의 선형 스케일링과 달리 Adam 계열은 제곱근 쪽이 안정적이다).
@@ -166,6 +172,20 @@ RE_CHANNELS = int(os.getenv("RE_CHANNELS", "4"))
 # 검증을 실제 파이프라인 재학습으로 재확인하는 대조 실험용 플래그다
 # (2026-08-31). 기본값 0(끔) — CHECKPOINT_PATH 분리한 대조 실험으로만 켠다.
 USE_ISLAND = os.getenv("USE_ISLAND", "0") == "1"
+# 수치예보(NWP) 예보값을 Z축 부가 특징(14차원, nwp_collector.py)으로 추가할지.
+# `nwp_feature_probe.py` 절제 실험(2026-09-06)에서 강수 발생 판정 AUC 가
+# +6h +0.0285 · +12h +0.0795 올랐다 — 이 저장소가 측정한 어떤 특징군보다
+# 큰 증분이고, "기존 관측망의 정보는 소진됐다"는 기존 결론이 **지상 관측만
+# 쓸 때의 상한**이었음을 보인다. 프로브 결과가 전체 파이프라인에서 재현된다는
+# 보장은 없으므로(Re축 강수 채널 기각의 교훈 1) 기본값 0(끔)으로 두고
+# CHECKPOINT_PATH 를 분리한 대조 실험으로만 켠다.
+#
+# 주의: 이 축을 켜면 아카이브 소급 한계(2016-01-01) 때문에 표본이 줄어든다.
+# 대조군도 반드시 같은 표본에서 학습해야 한다 — USE_NWP_SUBSET=1 이 특징은
+# 붙이지 않고 표본만 같게 맞춘 대조군을 만든다(CLAUDE.md 2절 "baseline 은
+# 검증셋과 동일 표본에서 계산한다").
+USE_NWP = os.getenv("USE_NWP", "0") == "1"
+USE_NWP_SUBSET = os.getenv("USE_NWP_SUBSET", "0") == "1"
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
 # 그래디언트 누적(2026-09-01) — amount 헤드 pinball 재도전용. PRECIP_QUANTILE
 # 실험([[precip-quantile-experiment-result]] 메모리, 커밋 17a3c9b)이 젖은구간
@@ -611,6 +631,8 @@ class WeatherDataset(Dataset):
                  txt_collector: SimulatedTextCollector = None,
                  island_collector=None,   # IslandPrecipCollector — Z축 부가 특징(도서 강수)
                  climatology_table: dict = None,  # build_climatology_table() 반환값 — Z축 부가 특징(평년 대비 이상편차)
+                 nwp_collector=None,      # NWPForecastCollector — Z축 부가 특징(수치예보)
+                 nwp_features: bool = True,  # False 면 표본 선별만 하고 특징은 안 붙인다(대조군용)
                  lead_hours: int = 1,
                  mean: np.ndarray = None, std: np.ndarray = None):
         L = lead_hours
@@ -642,6 +664,28 @@ class WeatherDataset(Dataset):
         src_records = [records[i] for i in src_idx]
         tgt_records = [records[j] for j in tgt_idx]
 
+        # ── NWP 예보 특징 — 결측 표본을 여기서 뺀다 ──────────────
+        # 다른 부가 특징(도서·평년값)과 달리 이 축은 결측을 중립값으로
+        # 메울 수 없다. "예보가 없다"와 "예보가 0mm 다"가 같은 벡터가 되면
+        # 모델이 전자를 후자로 학습하기 때문이다(CLAUDE.md 1절 5항).
+        # 아카이브 소급 한계(2016-01-01)와 산발적 결측이 여기서 걸러진다.
+        nwp_vecs = None
+        if nwp_collector is not None:
+            nwp_vecs, nwp_mask = nwp_collector.get_batch(src_records, L)
+            kept = int(nwp_mask.sum())
+            if kept == 0:
+                raise ValueError(
+                    "NWP 예보가 있는 표본이 하나도 없다 — "
+                    "`python collect_nwp_archive.py --backfill` 을 먼저 실행할 것.")
+            if kept < len(src_records):
+                print(f"  [정보] NWP 예보 결측으로 {len(src_records) - kept:,}개 제외 "
+                      f"(사용 {kept:,}개 / {len(src_records):,}개, "
+                      f"{kept / len(src_records):.1%})")
+            keep = np.flatnonzero(nwp_mask)
+            src_records = [src_records[i] for i in keep]
+            tgt_records = [tgt_records[i] for i in keep]
+            nwp_vecs = nwp_vecs[keep] if nwp_features else None
+
         # 관측소·시각 메타데이터 — 학습에는 쓰이지 않지만 backtest_accuracy.py
         # 가 샘플별 예측을 (관측소, 목표시각)으로 정확도 로그에 남기는 데 필요.
         self.stns = [r.get("stn") for r in src_records]
@@ -665,6 +709,10 @@ class WeatherDataset(Dataset):
                 [[climatology_anomaly(r, climatology_table)] for r in src_records],
                 dtype=np.float32)
             vecs = np.concatenate([vecs, anomaly], axis=1)
+        if nwp_vecs is not None:
+            # 앞의 두 부가 특징과 같은 이유로 벡터 끝에 붙인다 — 순서를 바꾸면
+            # 구버전 체크포인트의 앞자름 복원이 깨진다(CLAUDE.md 1절 7항).
+            vecs = np.concatenate([vecs, nwp_vecs], axis=1)
         if mean is None:
             # 정규화 통계는 학습 인덱스에서만 계산한다(2026-08-31,
             # deferred-to-next-retrain 정정) — 종전엔 전체 표본(검증셋 포함)
@@ -1067,6 +1115,13 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             print(f"도서 AWS 부가 특징 생성 중 (13개 지점 강수, {ISLAND_DIM}차원)...")
         island_collector = IslandPrecipCollector()
 
+    nwp_collector = None
+    if USE_NWP or USE_NWP_SUBSET:
+        nwp_collector = NWPForecastCollector()
+        if verbose:
+            what = ("수치예보 특징 %d차원" % NWP_DIM) if USE_NWP else "표본 정렬만(대조군)"
+            print(f"NWP 예보 부가 특징 — {what} · 아카이브 {nwp_collector.coverage()}")
+
     climatology_table = None
     if USE_CLIMATOLOGY_ANOMALY:
         if verbose:
@@ -1078,6 +1133,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                              txt_collector=txt_collector,
                              island_collector=island_collector,
                              climatology_table=climatology_table,
+                             nwp_collector=nwp_collector,
+                             nwp_features=USE_NWP,
                              lead_hours=lead_hours)
     train_ds, val_ds = make_split(full_ds, SPLIT_MODE, verbose=verbose)
     n_train, n_val = len(train_ds), len(val_ds)
@@ -1653,6 +1710,14 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "lead_hours":   lead_hours,
                 "num_features": num_features,
                 "use_island":   USE_ISLAND,
+                # NWP 예보 부가 특징(2026-09-06). `use_nwp` 는 특징을 실제로
+                # 붙였는지, `use_nwp_subset` 은 특징 없이 표본만 맞춘 대조군인지를
+                # 구분한다 — 둘은 검증셋이 같고 입력 차원만 다르므로, 이 두
+                # 필드가 없으면 나중에 어느 쪽 체크포인트인지 알 수 없다.
+                "use_nwp":        USE_NWP,
+                "use_nwp_subset": USE_NWP_SUBSET,
+                "nwp_model":      (NWP_ARCHIVE_MODEL if (USE_NWP or USE_NWP_SUBSET)
+                                   else None),
                 # 평년값 테이블을 체크포인트에 통째로 저장한다 — 서빙 시점에
                 # 1,382,583개 학습 캐시를 다시 로드해 재계산하면 RAM·지연이
                 # 크다(island_collector 는 실시간 API 조회라 이 문제가 없지만,

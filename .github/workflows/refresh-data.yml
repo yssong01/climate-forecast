@@ -9,6 +9,7 @@ name: Refresh deploy data
 #   · cache/recent_window.json   — 최근 10일 관측 (스파크라인·추이 탭·API 장애 시 폴백 입력)
 #   · cache/accuracy_log.json    — 예보 적중률 로그의 대기 항목 해소
 #   · cache/api_usage_daily.json — 인증키 유출 대응용 사용량 감시(README '인증키 관리' 참고)
+#   · cache/nwp_recent.json      — 수치예보 창 (Open-Meteo, 강수 헤드의 보조 입력)
 #
 # API 호출량: 관측소 12곳 × 경과 시간. 이 값은 **주기와 무관하게 하루 288건**
 # 으로 고정된다 — 각 실행이 '마지막 관측 이후의 빈 시간'만 채우는 격차 보충
@@ -139,6 +140,25 @@ jobs:
           python ${{ github.workspace }}/code/refresh_deploy_data.py \
             ${{ inputs.dry_run && '--dry-run' || '' }}
 
+      # 수치예보(NWP) 창 갱신(2026-09-06). 관측 갱신과 **분리된 스텝**이고
+      # `!cancelled()` 를 붙인 이유는 아래 커밋 스텝과 같다 — 관측 쪽 최신성
+      # 게이트가 실패하면 상태 함수 없는 스텝은 암묵적 success() 로 skipped
+      # 되어, 아무 문제 없는 NWP 수집까지 함께 멈춘다(2026-08-18 사고와
+      # 같은 기전).
+      #
+      # 이 API 는 인증키를 쓰지 않는다(Open-Meteo, CC BY 4.0). 12개 관측소를
+      # 각각 1회씩 부르므로 15분 주기라도 하루 약 1,152회로 무료 한도
+      # (10,000회/일)의 12% 수준이다. 실패해도 잡을 죽이지 않는다 — 직전
+      # 창이 저장소에 남아 있고, 앱은 "지금 것이 아님"을 화면에 밝힌다.
+      - name: Refresh NWP forecast window
+        if: ${{ !cancelled() && !inputs.dry_run }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/code
+        working-directory: data
+        continue-on-error: true
+        run: |
+          python ${{ github.workspace }}/code/collect_nwp_archive.py --incremental
+
       # 최신성 게이트가 실패해도(= 위 스텝 exit 1) 이 스텝은 반드시 돈다.
       #
       # 왜 `!cancelled()` 인가(2026-08-18, 실측으로 원인 규명): 종전 조건은
@@ -163,6 +183,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add cache/recent_window.json cache/accuracy_log.json cache/api_usage_daily.json
+          git add cache/nwp_recent.json 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "변경 없음 — 커밋 생략 (이미 최신이거나 신규 관측 0건)"
             exit 0

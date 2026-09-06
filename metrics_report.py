@@ -351,6 +351,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt", nargs="?", default=CHECKPOINT)
     ap.add_argument("--batch", type=int, default=eval_cache.DEFAULT_BATCH)
+    ap.add_argument("--patch-checkpoint", action="store_true",
+                    help="서빙 기준 강수 오차를 체크포인트에 기록한다"
+                         "(화면의 ± 표기가 쓰는 값)")
     args = ap.parse_args()
 
     import torch
@@ -368,6 +371,38 @@ def main():
         json.dump({"accuracy": acc, "precision": pre, "calibration": cal},
                   f, ensure_ascii=False, indent=2)
     print(f"저장: {OUT_JSON}")
+
+    if args.patch_checkpoint:
+        _patch_checkpoint(args.ckpt, acc)
+
+
+def _patch_checkpoint(path: str, acc: dict) -> None:
+    """서빙 기준 강수 오차 두 개를 체크포인트에 적어 넣는다(2026-09-06).
+
+    왜 필요한가 — '출력값 추이' 탭이 강수 출력값 옆에 붙이던 `±` 는
+    체크포인트의 `val_precip_mae`(=0.1665mm)였는데, 이 값은 두 가지가
+    화면과 어긋난다.
+
+      ① **다른 파이프라인의 수치다.** 학습이 재는 것은 후처리 전 원본
+         출력이고, 화면에 나가는 값은 확률 게이팅 후다(0.1573mm).
+      ② **젖은 예보에서 한 자릿수 틀린다.** 검증셋의 94%가 무강수라
+         이 평균은 건조 표본이 지배한다. 모델이 "5.0mm"를 낼 때 관련
+         있는 오차는 강수 구간 조건부 MAE(2.2396mm)이지 0.1665mm 가
+         아니다 — 약 13배 과소 표기였다.
+
+    두 값을 체크포인트에 넣어 화면이 상황에 맞는 쪽을 고를 수 있게 한다.
+    `cache/metrics_report.json` 에 이미 있는 값이지만 그 파일은 배포에
+    실리지 않으므로(gitignore, 배포는 recent_window.json 만 읽는다)
+    체크포인트가 유일한 전달 경로다.
+    """
+    import torch
+    ck = torch.load(path, map_location="cpu", weights_only=True)
+    ck["val_precip_mae_served"] = acc["precip_mae_served"]
+    ck["val_precip_mae_wet"] = acc["precip_mae_wet"]
+    ck["val_precip_baseline_mae_wet"] = acc["precip_baseline_mae_wet"]
+    torch.save(ck, path)
+    print(f"체크포인트 갱신: {path} — 서빙 MAE {acc['precip_mae_served']:.4f} · "
+          f"강수구간 조건부 MAE {acc['precip_mae_wet']:.4f}")
 
 
 if __name__ == "__main__":

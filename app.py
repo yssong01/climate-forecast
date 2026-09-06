@@ -15,6 +15,7 @@ st.metric의 help 툴팁으로 함께 표시한다 — "이 값이 왜 이렇게
 import json
 import math
 import os
+import tempfile
 import time
 import pandas as pd
 import requests
@@ -43,7 +44,7 @@ from weather_collector import (
 from predict import (
     load_model, predict, CHECKPOINT, event_threshold,
     PRECIP_PROB_GATE, PRECIP_PROB_GATE_BY_LEAD,
-    STATION_EVENT_THRESH_OVERRIDES,
+    STATION_EVENT_THRESH_OVERRIDES, NWPUnavailable,
 )
 import accuracy
 
@@ -83,6 +84,16 @@ HIST_FILES = ["./cache/recent_window.json"]
 RAW_WINDOW_URL = (
     "https://raw.githubusercontent.com/yssong01/climate-forecast/data/"
     "cache/recent_window.json"
+)
+
+# 수치예보(NWP) 창도 같은 경로로 받는다(2026-09-06). 앱이 Open-Meteo 를
+# 직접 부르지 않는 이유는 관측 자료와 정확히 같다 — Streamlit Cloud 는
+# 발신 IP 를 다른 무료 앱들과 공유하고, Open-Meteo 는 그 공유 IP 에서
+# 429(일일 한도 초과)를 돌려준 사례가 보고돼 있다. CI 가 받아 저장소에
+# 적재하고 앱은 그 파일만 읽는다.
+RAW_NWP_URL = (
+    "https://raw.githubusercontent.com/yssong01/climate-forecast/data/"
+    "cache/nwp_recent.json"
 )
 
 st.set_page_config(
@@ -225,6 +236,51 @@ def _fetch_raw_window(retries: int = 1, backoff_sec: float = 1.0) -> dict | None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
+def sync_nwp_window() -> str:
+    """data 브랜치의 NWP 창을 로컬 `cache/nwp_recent.json` 으로 내려받는다.
+
+    왜 파일로 떨어뜨리는가 — 학습·서빙이 `nwp_collector` 라는 **같은 함수**
+    로 특징을 만들게 하려면 그 모듈이 읽는 경로에 자료가 있어야 한다.
+    `predict.py` 는 이 파일의 mtime 을 캐시 키로 써서 갱신을 자동으로
+    집어낸다(CLAUDE.md 1절 14항).
+
+    `predict.py` 의 함수 시그니처를 건드리지 않는 것도 의도적이다 —
+    Streamlit 은 import 된 모듈을 `sys.modules` 에 캐시하므로 시그니처를
+    바꿔 배포하면 새 app.py 와 옛 predict.py 가 한 프로세스에 공존해
+    TypeError 가 난다(CLAUDE.md 4절, 2026-08-17 실제 사고).
+
+    반환값은 상태 문자열이다("raw" / "kept" / "unavailable") — 화면이
+    "지금 것이 아닌 것"과 "아예 없는 것"을 구분해 말할 수 있어야 한다.
+    """
+    from nwp_collector import RECENT_PATH
+    try:
+        resp = requests.get(RAW_NWP_URL, timeout=8)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        payload = resp.content
+    except Exception as e:
+        print(f"[WARN] NWP 창 조회 실패({type(e).__name__})")
+        return "kept" if os.path.exists(RECENT_PATH) else "unavailable"
+
+    try:
+        os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
+        if os.path.exists(RECENT_PATH):
+            with open(RECENT_PATH, "rb") as f:
+                if f.read() == payload:
+                    return "raw"       # 내용 동일 — mtime 을 흔들지 않는다
+        # 고유 tmp + os.replace(CLAUDE.md 1절 6항) — 여러 세션이 같은
+        # 파일을 동시에 쓰면 잘린 JSON 이 남아 폴백 재료가 사라진다.
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(RECENT_PATH), suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        os.replace(tmp, RECENT_PATH)
+        return "raw"
+    except Exception as e:
+        print(f"[WARN] NWP 창 저장 실패({type(e).__name__})")
+        return "kept" if os.path.exists(RECENT_PATH) else "unavailable"
+
+
 def load_merged_history() -> tuple[dict, str]:
     """
     (관측소, 시각) → 레코드, 그리고 그 출처.
@@ -588,10 +644,26 @@ set_offline_fallback(list(load_merged_history()[0].values()))
 try:
     _fp6 = ckpt_fingerprint()
     model, ckpt = get_model(_fp6)
+    # 수치예보 입력을 쓰는 체크포인트라면 그 창을 먼저 내려받는다 — 없으면
+    # predict() 가 NWPUnavailable 을 올린다(중립값으로 메우지 않는다).
+    _nwp_status = sync_nwp_window() if ckpt.get("use_nwp", False) else None
     result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], _fp6, model, ckpt)
+except NWPUnavailable as e:
+    st.error(
+        "수치예보 보조 입력을 구성할 수 없어 출력값을 낼 수 없다. "
+        "이 모델은 수치예보를 입력으로 쓰며, 없는 값을 임의로 채우지 않는다."
+    )
+    st.caption(f"사유: {redact_secrets(str(e))}")
+    st.stop()
 except Exception as e:
     st.error(f"예측 실패: {redact_secrets(str(e))}")
     st.stop()
+
+if _nwp_status == "kept":
+    st.warning(
+        "수치예보 창을 새로 받지 못해 직전에 받아둔 값을 쓰고 있다 — "
+        "표시된 출력값이 최신 예보를 반영하지 않을 수 있다."
+    )
 
 # 이번 실행의 조회분까지 반영해 사이드바 사용량을 채운다(위 api_usage_slot 참고).
 _calls = api_call_stats()
@@ -1237,7 +1309,6 @@ with tab_trend:
 
     st.markdown("#### 모델 출력값")
     _val_temp_mae6 = ckpt.get("val_temp_mae")
-    _val_precip_mae6 = ckpt.get("val_precip_mae")
     _d_temp6 = f6["temperature"] - c6["temperature"]
     _d_precip6 = f6["precipitation"] - c6["precipitation"]
     # 90% 예측구간(분포무관, split conformal) — 2026-09-01 연결. "±MAE"는
@@ -1246,6 +1317,43 @@ with tab_trend:
     # 저장해둔 값을 조회만 한다 — 없으면(구버전 체크포인트 등) 조용히 생략.
     _ti6 = f6.get("temp_interval_90")
     _pi6 = f6.get("precip_interval_90")
+
+    def _precip_err(_ck, _val):
+        """강수 출력값에 붙일 오차 표기를 고른다(2026-09-06 수정).
+
+        종전에는 `val_precip_mae` 하나만 썼는데 두 가지가 화면과 어긋났다.
+        ① 그 값은 **후처리 전** 원본 출력의 오차인데 화면 값은 후처리 후다.
+        ② 검증셋의 94%가 무강수라 그 평균은 건조 표본이 지배한다 — 강수가
+           예보된 상황에서는 강수 구간 조건부 MAE(약 2.24mm)가 관련 있는
+           수치이고, 종전 표기는 약 13배 과소였다.
+
+        그래서 출력값이 0보다 크면 강수 구간 조건부 MAE 를, 0이면 서빙
+        기준 전체 MAE 를 쓰고 어느 쪽인지 라벨로 밝힌다. 두 값은
+        `metrics_report.py --patch-checkpoint` 가 체크포인트에 적어 넣는다 —
+        없는(구버전) 체크포인트에서는 오해를 부르는 값을 보여주느니
+        **표기를 생략한다.**
+        """
+        if _val > 0:
+            m = _ck.get("val_precip_mae_wet")
+            return f" ±{m:.2f}(강수 구간 평균오차)" if m is not None else ""
+        m = _ck.get("val_precip_mae_served")
+        return f" ±{m:.3f}(무강수 포함 평균오차)" if m is not None else ""
+
+    def _rain_prob_cell(_f, _gate):
+        """강수확률을 상시 표시한다(2026-09-06 추가).
+
+        종전에는 근접 판정(확률이 임계값 바로 아래)일 때만 안내 문구로
+        드러냈다. 그러나 +6·+12시간 리드에서 강수는 본래 확률로 말해야
+        하는 양이고(단일 mm 값은 '오는가'와 '얼마나'를 뭉뚱그린다),
+        확률은 mm 값이 0이든 아니든 판단에 필요하다. 이미 계산돼 있는
+        값이므로 추가 비용은 없다.
+        """
+        _rp = _f.get("rain_prob")
+        if _rp is None:
+            return "—"
+        _mark = "판정 임계값 초과" if _rp >= _gate else f"임계값({_gate:.0%}) 미만"
+        return f"{_rp:.0%} ({_mark})"
+
     _rows = [
         {
             "항목": "기온 출력값",
@@ -1256,18 +1364,24 @@ with tab_trend:
         {
             "항목": "강수 출력값",
             "+6시간(기본)": f"{f6['precipitation']:.1f} mm ({_d_precip6:+.1f} 현재 대비)"
-                          + (f" ±{_val_precip_mae6:.3f}" if _val_precip_mae6 is not None else "")
+                          + _precip_err(ckpt, f6["precipitation"])
                           + (f" · 90% 구간 [{_pi6[0]:.1f}, {_pi6[1]:.1f}]" if _pi6 else ""),
+        },
+        {
+            "항목": "강수 확률",
+            "+6시간(기본)": _rain_prob_cell(f6, PRECIP_PROB_GATE_BY_LEAD[6]),
         },
     ]
     # 상승/하강 방향에 따른 글자색(2026-08-20) — 현재 대비 증가는 빨강,
     # 감소는 초록. 표 셀 문자열에서 부호를 다시 파싱하지 않도록, 델타 부호를
     # 같은 모양의 별도 표에 담아 pandas Styler 로 입힌다.
     _deltas = [{"항목": "기온 출력값", "+6시간(기본)": _d_temp6},
-               {"항목": "강수 출력값", "+6시간(기본)": _d_precip6}]
+               {"항목": "강수 출력값", "+6시간(기본)": _d_precip6},
+               # 확률 행은 '현재 대비 증감'이라는 개념이 없어 색을 입히지
+               # 않는다 — 0 이면 _color_by_delta 가 빈 스타일을 돌려준다.
+               {"항목": "강수 확률", "+6시간(기본)": 0.0}]
     if result_12h is not None:
         _val_temp_mae12 = ckpt_12h.get("val_temp_mae")
-        _val_precip_mae12 = ckpt_12h.get("val_precip_mae")
         _d_temp12 = f12["temperature"] - c12["temperature"]
         _d_precip12 = f12["precipitation"] - c12["precipitation"]
         _ti12 = f12.get("temp_interval_90")
@@ -1279,16 +1393,21 @@ with tab_trend:
         )
         _rows[1]["+12시간(2차 산출값)"] = (
             f"{f12['precipitation']:.1f} mm ({_d_precip12:+.1f} 현재 대비)"
-            + (f" ±{_val_precip_mae12:.3f}" if _val_precip_mae12 is not None else "")
+            + _precip_err(ckpt_12h, f12["precipitation"])
             + (f" · 90% 구간 [{_pi12[0]:.1f}, {_pi12[1]:.1f}]" if _pi12 else "")
         )
+        _rows[2]["+12시간(2차 산출값)"] = _rain_prob_cell(
+            f12, PRECIP_PROB_GATE_BY_LEAD.get(12))
         _deltas[0]["+12시간(2차 산출값)"] = _d_temp12
         _deltas[1]["+12시간(2차 산출값)"] = _d_precip12
+        _deltas[2]["+12시간(2차 산출값)"] = 0.0
     else:
         _rows[0]["+12시간(2차 산출값)"] = "불러오기 실패"
         _rows[1]["+12시간(2차 산출값)"] = "불러오기 실패"
+        _rows[2]["+12시간(2차 산출값)"] = "불러오기 실패"
         _deltas[0]["+12시간(2차 산출값)"] = 0.0
         _deltas[1]["+12시간(2차 산출값)"] = 0.0
+        _deltas[2]["+12시간(2차 산출값)"] = 0.0
     _out_df = pd.DataFrame(_rows).set_index("항목")
     _delta_df = pd.DataFrame(_deltas).set_index("항목")
 
@@ -2091,6 +2210,20 @@ st.caption(
     "12개 관측소의 실측 공간보간장, Im축은 동일 관측소의 시간 변화율이며, 둘 "
     "다 실측에서 산출한 값이다 — 시뮬레이션이나 합성 데이터가 아니다."
 )
+# 출처 표기는 **실제로 쓰는 자료만** 밝힌다. 수치예보 보조 입력은 그 축을
+# 쓰는 체크포인트가 배포됐을 때만 표시한다 — 안 쓰는 자료를 출처로 적으면
+# 그 자체가 화면의 거짓 서술이 되고, 이 저장소가 반복해 겪은 "상수는 바뀌었는데
+# 서술문은 그대로"의 반대 방향 사례가 된다(2026-09-06 렌더링 점검에서 발견).
+_src = ("자료 출처 — 지상 관측은 기상청 종관기상관측(ASOS, apihub.kma.go.kr)이다.")
+if ckpt.get("use_nwp", False) or (ckpt_12h or {}).get("use_nwp", False):
+    _src += (
+        " 수치예보 보조 입력은 [Open-Meteo](https://open-meteo.com/)가 제공하는 "
+        "일본기상청 전지구모델(JMA GSM) 예보이며 "
+        "[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 하에 이용한다 — "
+        "본 모델은 이 예보값을 그대로 표시하지 않고 지상 실측과 함께 입력으로 "
+        "사용해 재산출한다."
+    )
+st.caption(_src)
 st.caption(
     "⚠️ 이 화면의 수치는 모델 출력값이며 기상청의 공식 예보·특보가 아니다. "
     "연구·포트폴리오 목적으로 제작했으며, 실제 방재 판단의 근거로 사용해서는 "
