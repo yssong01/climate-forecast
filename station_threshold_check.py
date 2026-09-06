@@ -18,7 +18,7 @@ import argparse
 import numpy as np
 import torch
 
-from train import collect_historical, WeatherDataset, make_split, STATION_NAMES
+from train import collect_historical, WeatherDataset, make_split, STATION_NAMES, aux_dataset_kwargs
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
 from weather_collector import STATION_COORDS
@@ -46,6 +46,7 @@ def main():
     ds = WeatherDataset(
         records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
         txt_collector=txt, lead_hours=ckpt["lead_hours"],
+        **aux_dataset_kwargs(ckpt),
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )

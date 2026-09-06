@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 from predict import CHECKPOINT, load_model
-from train import WeatherDataset, collect_historical, make_split, WET_THRESH
+from train import WeatherDataset, collect_historical, make_split, WET_THRESH, aux_dataset_kwargs
 from weather_collector import STATION_COORDS
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
@@ -204,6 +204,7 @@ def load_probs(ckpt_path):
     ds = WeatherDataset(
         records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
         txt_collector=txt_collector, lead_hours=ckpt["lead_hours"],
+        **aux_dataset_kwargs(ckpt),
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),
     )

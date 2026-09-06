@@ -110,7 +110,7 @@ N_PROBE_BASES = 12   # 계절이 고루 섞이도록 캐시 전 구간에서 균
 SEVERITY_REF = 0.30
 
 
-def pick_base_records(n: int = N_PROBE_BASES):
+def pick_base_records(n: int = N_PROBE_BASES, ckpt: dict = None):
     """단조성 탐침에 쓸 기준 레코드 n 개를 **결정적으로** 고른다.
 
     **왜 여러 개인가(2026-08-31 추가).** 이 격자는 14개 입력 중 기온과
@@ -131,6 +131,19 @@ def pick_base_records(n: int = N_PROBE_BASES):
     for r in recs:
         by_ts.setdefault(str(r["timestamp"])[:12], []).append(r)
     full = sorted(ts for ts, rs in by_ts.items() if len(rs) >= len(STATIONS))
+    if ckpt is not None and (ckpt.get("use_nwp") or ckpt.get("use_nwp_subset")):
+        # 수치예보를 쓰는 체크포인트는 **그 모델이 실제로 처리할 수 있는
+        # 시각**에서만 탐침해야 한다(2026-09-06). 캐시 전 구간에서 균등
+        # 표집하면 아카이브 소급 한계(2016-01-01) 이전 시각이 뽑혀 게이트가
+        # 실행조차 되지 않는다 — 그러면 단조성이 "통과"가 아니라 "미측정"인
+        # 채로 승격 절차가 진행될 위험이 있다.
+        from nwp_collector import shared as _nwp_shared
+        _tbl = _nwp_shared().table
+        _lead = ckpt.get("lead_hours", 6)
+        def _covered(ts):
+            b = next((r for r in by_ts[ts] if str(r.get("stn")) == "108"), None)
+            return b is not None and _nwp_shared().raw_forecast(b, _lead) is not None
+        full = [ts for ts in full if _covered(ts)]
     if not full:
         raise RuntimeError("12관측소가 모두 있는 시각이 캐시에 없다 — --live 로 실행할 것")
     idx = np.linspace(0, len(full) - 1, min(n, len(full))).astype(int)
@@ -219,7 +232,19 @@ def main():
         allr = [RobustWeatherCollector(stn=s).fetch() for s in STATIONS.values()]
         probes = [(str(base.get("timestamp"))[:12], base, allr)]
     else:
-        probes = pick_base_records()
+        # 비교 대상 중 하나라도 수치예보를 쓰면 **전부** 그 아카이브가 덮는
+        # 구간에서만 탐침한다 — 체크포인트마다 다른 탐침을 쓰면 비교가
+        # 성립하지 않고, 안 걸러내면 게이트가 실행조차 못 한다.
+        _meta = None
+        for _p in paths:
+            try:
+                _c = torch.load(_p, map_location="cpu", weights_only=True)
+            except Exception:
+                continue
+            if _c.get("use_nwp") or _c.get("use_nwp_subset"):
+                _meta = _c
+                break
+        probes = pick_base_records(ckpt=_meta)
     print(f"기준 레코드 {len(probes)}개로 탐침"
           + (" (--live: 실시간 관측 1개)" if use_live else " (학습 캐시 균등 표집, 재현 가능)"))
     print(f"  {probes[0][0]} ~ {probes[-1][0]}\n")

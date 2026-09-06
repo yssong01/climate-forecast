@@ -184,6 +184,9 @@ USE_ISLAND = os.getenv("USE_ISLAND", "0") == "1"
 # 대조군도 반드시 같은 표본에서 학습해야 한다 — USE_NWP_SUBSET=1 이 특징은
 # 붙이지 않고 표본만 같게 맞춘 대조군을 만든다(CLAUDE.md 2절 "baseline 은
 # 검증셋과 동일 표본에서 계산한다").
+# 폭염·한파 특보 비운영기간을 '확정 음성'으로 채울지(2026-09-06). 근거와
+# 위험은 WeatherDataset 안의 covered_months 주석 참고. 기본값 0(끔).
+EXTREME_OFFSEASON_NEGATIVE = os.getenv("EXTREME_OFFSEASON_NEGATIVE", "0") == "1"
 USE_NWP = os.getenv("USE_NWP", "0") == "1"
 USE_NWP_SUBSET = os.getenv("USE_NWP_SUBSET", "0") == "1"
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
@@ -798,9 +801,39 @@ class WeatherDataset(Dataset):
             with open(WEATHER_ISSUE_LABELS, "r", encoding="utf-8") as f:
                 issue_labels = json.load(f)
 
+        # 특보 라벨이 실제로 존재하는 '달'을 사건별로 구한다(2026-09-06).
+        #
+        # 왜 필요한가 — 폭염·한파는 **특보이지 관측이 아니다.** 라벨 파일
+        # (기상청 포털 XLS)에는 폭염이 4~9월, 한파가 10~4월 행만 있고 나머지
+        # 달은 행 자체가 없다. 그 구간이 마스킹되면 헤드는 **그 계절에 어떤
+        # 경사도 받지 않는다** — 겨울에 폭염 확률을 아무렇게나 내도 손실이
+        # 0이고 집계 지표도 그 표본을 채점에서 빼므로 영원히 드러나지 않는다.
+        # 2026-09-06 수치예보 실험에서 겨울철(−30~−15°C) 폭염 오탐이 27.2%로
+        # 승격 게이트에 걸렸을 때, 헤드 디커플링으로 고칠 수 없음이 이 구조
+        # 때문임을 확인했다(라벨이 없으니 미세조정이 그 구간에 닿지 않는다).
+        #
+        # 달 목록을 하드코딩하지 않고 **라벨 파일에서 유도**한다 — 특보
+        # 운영기간이 바뀌면 파일이 먼저 바뀌고 이 집합이 따라간다. 반대로
+        # 하드코딩하면 제도 변경 시 조용히 어긋난다.
+        #
+        # 기본값 0(끔). "판정 불가를 음성으로 둔갑시키지 않는다"는 규약과
+        # 구분되는 근거는, 여기서 채우는 것이 **결측**이 아니라 그 사건의
+        # 라벨이 그 계절에 원리적으로 생산되지 않는 구간이라는 점이다.
+        # 그래도 가정이므로 실험 스위치로 두고 실측으로 판단한다.
+        covered_months = {}
+        if EXTREME_OFFSEASON_NEGATIVE:
+            for _key in ("heatwave_advisory", "coldwave_advisory"):
+                _ms = {_d[5:7] for _days in issue_labels.values()
+                       for _d, _v in _days.items() if _key in _v}
+                covered_months[_key] = _ms
+                if not _ms:
+                    raise ValueError(
+                        f"{_key} 라벨이 하나도 없다 — 비운영기간을 유도할 수 없다.")
+
         heat_list, cold_list, dust_list = [], [], []
         heat_mask_list, cold_mask_list, dust_mask_list = [], [], []
         n_heat_off = n_cold_off = n_dust_off = 0
+        n_heat_offseason = n_cold_offseason = 0
         for i, r in enumerate(tgt_records):
             ts = str(r["timestamp"])
             date_str = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
@@ -808,6 +841,9 @@ class WeatherDataset(Dataset):
 
             if "heatwave_advisory" in day:
                 heat_list.append(day["heatwave_advisory"]); heat_mask_list.append(1); n_heat_off += 1
+            elif (EXTREME_OFFSEASON_NEGATIVE
+                  and ts[4:6] not in covered_months["heatwave_advisory"]):
+                heat_list.append(0); heat_mask_list.append(1); n_heat_offseason += 1
             elif EXTREME_LABEL_MASKING:
                 heat_list.append(0); heat_mask_list.append(0)
             else:   # 대조군 — 종전처럼 임계값 근사로 채우고 손실에도 넣는다
@@ -815,6 +851,9 @@ class WeatherDataset(Dataset):
 
             if "coldwave_advisory" in day:
                 cold_list.append(day["coldwave_advisory"]); cold_mask_list.append(1); n_cold_off += 1
+            elif (EXTREME_OFFSEASON_NEGATIVE
+                  and ts[4:6] not in covered_months["coldwave_advisory"]):
+                cold_list.append(0); cold_mask_list.append(1); n_cold_offseason += 1
             elif EXTREME_LABEL_MASKING:
                 cold_list.append(0); cold_mask_list.append(0)
             else:
@@ -834,6 +873,16 @@ class WeatherDataset(Dataset):
         self.n_heat_official = n_heat_off
         self.n_cold_official = n_cold_off
         self.n_dust_official = n_dust_off
+        self.n_heat_offseason = n_heat_offseason
+        self.n_cold_offseason = n_cold_offseason
+        if EXTREME_OFFSEASON_NEGATIVE:
+            # 무엇이 얼마나 채워졌는지 반드시 눈에 보이게 남긴다 — 라벨 의미를
+            # 바꾸는 스위치라 조용히 켜져 있으면 안 된다.
+            print(f"  [정보] 특보 비운영기간을 확정 음성으로 채움 — "
+                  f"폭염 {n_heat_offseason:,}개(운영월 "
+                  f"{sorted(covered_months['heatwave_advisory'])}), "
+                  f"한파 {n_cold_offseason:,}개(운영월 "
+                  f"{sorted(covered_months['coldwave_advisory'])})")
 
     def __len__(self):
         return len(self.X_num)
@@ -966,6 +1015,37 @@ def assert_split_matches(full_ds, val_idx, ckpt, where: str = "") -> None:
                 f"  원인 후보 ② {DATA_CACHE} 가 학습 이후 변경됐다.\n"
                 f"  이 상태의 지표는 '학습에 쓰인 표본'을 검증셋에 섞어 산출한\n"
                 f"  값일 수 있으므로 신뢰할 수 없다.")
+
+
+def aux_dataset_kwargs(ckpt: dict) -> dict:
+    """체크포인트가 쓰는 Z축 부가 특징 컬렉터를 한 곳에서 만든다.
+
+    왜 필요한가(2026-09-06) — 진단·게이트 스크립트 여덟 개가 각자
+    `WeatherDataset(...)` 를 세우면서 부가 특징을 **각자 기억해서** 붙이고
+    있었다. 하나라도 빠뜨리면 `mean/std` 와 차원이 어긋나 그 스크립트가
+    통째로 죽는다. 실제로 도서 AWS·계절 아노말리 실험은 전부 게이트에 닿기
+    전에 기각돼 드러날 기회가 없었을 뿐, **입력 차원을 늘리는 실험이
+    성공하는 순간 승격 절차가 막히는 구조**였다(수치예보 실험에서
+    `seasonal_falsealarm_check.py`·`station_coverage_check.py`·
+    `threshold_validation.py` 가 차례로 죽으며 드러났다).
+
+    새 부가 특징을 만들면 **이 함수 한 곳만** 고치면 되도록 모은다.
+    """
+    kw = {}
+    if ckpt.get("use_island", False):
+        from island_collector import IslandPrecipCollector
+        kw["island_collector"] = IslandPrecipCollector()
+    if ckpt.get("use_climatology_anomaly", False):
+        # 평년값 테이블은 체크포인트에 저장돼 있다 — 여기서 다시 계산하면
+        # 그 시점 records 구성에 따라 학습 당시와 다른 표가 나올 수 있다.
+        kw["climatology_table"] = ckpt.get("climatology_table")
+    if ckpt.get("use_nwp", False) or ckpt.get("use_nwp_subset", False):
+        from nwp_collector import shared as _nwp_shared
+        # `use_nwp_subset`(대조군)은 특징을 붙이지 않지만 **표본 선별은
+        # 똑같이 해야** 같은 검증셋이 재현된다.
+        kw["nwp_collector"] = _nwp_shared()
+        kw["nwp_features"] = bool(ckpt.get("use_nwp", False))
+    return kw
 
 
 def make_split(full_ds, mode: str, verbose: bool = True, ckpt: dict = None):
@@ -1714,6 +1794,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # 붙였는지, `use_nwp_subset` 은 특징 없이 표본만 맞춘 대조군인지를
                 # 구분한다 — 둘은 검증셋이 같고 입력 차원만 다르므로, 이 두
                 # 필드가 없으면 나중에 어느 쪽 체크포인트인지 알 수 없다.
+                "extreme_offseason_negative": EXTREME_OFFSEASON_NEGATIVE,
                 "use_nwp":        USE_NWP,
                 "use_nwp_subset": USE_NWP_SUBSET,
                 "nwp_model":      (NWP_ARCHIVE_MODEL if (USE_NWP or USE_NWP_SUBSET)

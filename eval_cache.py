@@ -31,11 +31,12 @@ import torch
 
 from predict import CHECKPOINT, load_model
 from train import (WeatherDataset, collect_historical, make_split, WET_THRESH,
+                   aux_dataset_kwargs,
                    DATA_CACHE)
 from weather_collector import STATION_COORDS
 from interp_field_collector import InterpolatedFieldCollector
-from island_collector import IslandPrecipCollector, ISLAND_PARQUET
-from nwp_collector import NWPForecastCollector, ARCHIVE_PATH as NWP_ARCHIVE
+from island_collector import ISLAND_PARQUET
+from nwp_collector import ARCHIVE_PATH as NWP_ARCHIVE
 from tendency_collector import TendencyCollector
 from text_collector import SimulatedTextCollector
 
@@ -181,26 +182,13 @@ def build(ckpt_path: str, batch: int):
     records = collect_historical()
     txt_collector = (TendencyCollector(records) if ckpt.get("im_dim", 384) < 128
                      else SimulatedTextCollector())
-    island_collector = IslandPrecipCollector() if ckpt.get("use_island", False) else None
-    # NWP 예보 특징(2026-09-06). `use_nwp_subset` 체크포인트는 특징을 붙이지
-    # 않지만 **표본 선별은 똑같이 해야** 검증셋이 재현된다 — 대조군을 만든
-    # 이유가 바로 같은 표본에서 비교하는 것이므로, 여기서 빠뜨리면
-    # _assert_split_matches_checkpoint() 가 즉시 잡아낸다.
-    _use_nwp = ckpt.get("use_nwp", False)
-    _use_nwp_subset = ckpt.get("use_nwp_subset", False)
-    nwp_collector = (NWPForecastCollector() if (_use_nwp or _use_nwp_subset)
-                     else None)
-    # 평년값 테이블은 체크포인트에 이미 저장돼 있다(학습 날짜에서만 산출됐으므로
-    # 여기서 다시 계산하지 않는다 — 재계산하면 이 시점의 records 구성에 따라
-    # 학습 당시와 다른 테이블이 나올 위험이 있다).
-    climatology_table = (ckpt.get("climatology_table")
-                         if ckpt.get("use_climatology_anomaly", False) else None)
     ds = WeatherDataset(
         records, sat_collector=InterpolatedFieldCollector(
             records, STATION_COORDS, n_bands=ckpt.get("re_channels", 4)),
-        txt_collector=txt_collector, island_collector=island_collector,
-        climatology_table=climatology_table,
-        nwp_collector=nwp_collector, nwp_features=_use_nwp,
+        txt_collector=txt_collector,
+        # 부가 특징(도서·평년값·수치예보)은 train.aux_dataset_kwargs 한 곳에서
+        # 만든다 — 스크립트마다 각자 기억해 붙이다 빠뜨리는 사고를 막는다.
+        **aux_dataset_kwargs(ckpt),
         lead_hours=ckpt["lead_hours"],
         mean=np.array(ckpt["mean"], dtype=np.float32),
         std=np.array(ckpt["std"], dtype=np.float32),

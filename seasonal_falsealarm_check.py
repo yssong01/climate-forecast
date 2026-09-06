@@ -28,8 +28,7 @@ import numpy as np
 import torch
 
 from predict import CHECKPOINT, load_model
-from train import WeatherDataset, collect_historical
-from nwp_collector import shared as nwp_shared
+from train import WeatherDataset, collect_historical, aux_dataset_kwargs
 from weather_collector import STATION_COORDS
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
@@ -60,15 +59,9 @@ def main():
     for path in paths:
         model, ckpt = load_model(path, DEVICE)
         model.eval()
-        # NWP 예보 특징 — 이 체크포인트가 쓰면 학습과 같은 방식으로 붙인다.
-        # `use_nwp_subset`(대조군)도 표본 선별은 똑같이 해야 같은 검증셋이
-        # 재현된다.
-        _nwp = (nwp_shared() if (ckpt.get("use_nwp") or ckpt.get("use_nwp_subset"))
-                else None)
         ds = WeatherDataset(records, sat_collector=sat, txt_collector=tnd,
                             lead_hours=ckpt["lead_hours"],
-                            nwp_collector=_nwp,
-                            nwp_features=bool(ckpt.get("use_nwp")),
+                            **aux_dataset_kwargs(ckpt),
                             mean=np.array(ckpt["mean"], dtype=np.float32),
                             std=np.array(ckpt["std"], dtype=np.float32))
         # 표준화된 값에서 실제 기온을 복원한다(인덱스 0 = 기온).
