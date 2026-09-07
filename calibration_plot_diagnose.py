@@ -206,8 +206,15 @@ def main():
         rows = results[name]
         for r in rows:
             x, y = r["recall"], r["precision"]
-            xerr = [[x - r["r_lo"]], [r["r_hi"] - x]]
-            yerr = [[y - r["p_lo"]], [r["p_hi"] - y]]
+            # 음수 방지(2026-09-07). 윌슨(Wilson) 구간은 중심이 0.5 쪽으로
+            # 밀리므로 점추정이 0 이나 1 에 붙으면 **구간이 점추정을 포함하지
+            # 않을 수 있다**(예: 표본 2개에서 정밀도 100%인데 상한 95.4%).
+            # 그러면 오차막대 길이가 음수가 되어 matplotlib 이 예외를 던지고
+            # 플롯 전체가 생성되지 않는다 — 실제로 수치예보 모델 승격에서
+            # 이것 때문에 관측소별 플롯이 이전 모델 시점 그대로 남을 뻔했다.
+            # 구간 자체는 그대로 두고 막대 길이만 0 으로 자른다.
+            xerr = [[max(0.0, x - r["r_lo"])], [max(0.0, r["r_hi"] - x)]]
+            yerr = [[max(0.0, y - r["p_lo"])], [max(0.0, r["p_hi"] - y)]]
             size = 20 + 4 * math.sqrt(r["n_events_pos"])
             ax.errorbar(x, y, xerr=xerr, yerr=yerr, fmt="+",
                         color=colors[name], markersize=size / 5,
