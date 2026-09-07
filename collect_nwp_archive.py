@@ -44,7 +44,7 @@ import os
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from weather_collector import STATION_COORDS
 
@@ -170,7 +170,6 @@ def _freshness_gate(recent: dict) -> None:
     창은 파일 크기가 정상이어도 예보를 만들지 못한다. 그래서 '얼마나 최신인가'
     가 아니라 '현재 이후 몇 시간이 채워져 있는가'로 잰다.
     """
-    from datetime import datetime
     now = datetime.now().strftime("%Y%m%d%H%M")
     worst_stn, worst_n = None, None
     for stn, rows in recent.items():

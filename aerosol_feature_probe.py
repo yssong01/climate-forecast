@@ -38,6 +38,10 @@ from sklearn.metrics import roc_auc_score, average_precision_score, precision_re
 from weather_collector import STATION_COORDS
 from collect_aerosol_archive import VARS as AERO_VARS, UPSTREAM
 
+# 아래 인덱스 상수는 AERO_VARS 순서에 묶여 있다 — 수집기에서 변수를
+# 추가·재배열하면 여기도 함께 고쳐야 하므로, 임포트한 목록으로 실제
+# 순서를 검증한다(조용히 어긋나면 특징이 뒤섞인 채 학습된다).
+
 DATA_PATH = "./cache/historical_data_1y.json"
 LABEL_PATH = "./cache/weather_issue_labels.json"
 AERO_PATH = "./cache/aerosol_archive.json"
@@ -46,6 +50,9 @@ LAGS = [3, 6, 12]        # 상류 경향은 강수보다 긴 시간 규모라 �
 SEED = 7
 
 I_DUST, I_PM10, I_PM25, I_AOD, I_CO = range(5)
+assert AERO_VARS == ["dust", "pm10", "pm2_5", "aerosol_optical_depth",
+                     "carbon_monoxide"], \
+    f"collect_aerosol_archive.VARS 순서가 바뀌었다 — 인덱스 상수를 맞출 것: {AERO_VARS}" 
 
 
 def haversine(a, b):
