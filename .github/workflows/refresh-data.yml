@@ -183,7 +183,18 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add cache/recent_window.json cache/accuracy_log.json cache/api_usage_daily.json
-          git add cache/nwp_recent.json 2>/dev/null || true
+          # data 브랜치는 **자체 .gitignore 스냅숏**을 갖고 있어 main 의 예외
+          # 규칙(`!cache/nwp_recent.json`)이 반영돼 있지 않다. 그래서 평범한
+          # `git add` 는 이 파일을 조용히 무시한다 — 2026-09-07 에 실제로
+          # 이것 때문에 워크플로가 계속 초록불인데 파일만 안 올라왔다.
+          # 이 브랜치는 캐시 파일 운반 전용이므로 -f 로 강제하는 것이 맞고,
+          # 실패를 `2>/dev/null` 로 삼키지 않는다(그 침묵이 원인 규명을
+          # 늦췄다). 파일이 없으면 경고로 드러낸다.
+          if [ -f cache/nwp_recent.json ]; then
+            git add -f cache/nwp_recent.json
+          else
+            echo "::warning::cache/nwp_recent.json 이 없다 — NWP 수집 스텝을 확인할 것"
+          fi
           if git diff --cached --quiet; then
             echo "변경 없음 — 커밋 생략 (이미 최신이거나 신규 관측 0건)"
             exit 0
