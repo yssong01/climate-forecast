@@ -485,7 +485,8 @@ def predict(stn: str = "108",
         # 결측이면 예보를 낼 수 없다 — 중립값으로 메우면 "예보가 없다"가
         # "강수 0mm 예보"로 둔갑한다(CLAUDE.md 1절 5항). 호출자가 이 사정을
         # 화면에 드러낼 수 있도록 명시적 예외로 올린다.
-        nwp_vec = _nwp_collector().encode(record, lead_hours)
+        nwp_vec = _nwp_collector().encode(
+            record, lead_hours, ckpt.get("nwp_feature_set", "full14"))
         if nwp_vec is None:
             raise NWPUnavailable(
                 f"{record.get('stn')} {record.get('timestamp')} 의 +{lead_hours}h "

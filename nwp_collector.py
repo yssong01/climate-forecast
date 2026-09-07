@@ -38,6 +38,34 @@ I_PR, I_TP, I_RH, I_CC, I_WS, I_WD, I_SP = range(7)
 
 NWP_DIM = 14
 
+# 특징 부분집합(2026-09-07). `nwp_feature_probe.py --NWP_ABLATE` 절제에서
+# 14차원의 기여가 극소수에 몰려 있음이 두 리드타임 모두에서 확인됐다 —
+# 기온 이득의 94~95%를 `예보기온` 하나가, 강수 이득의 89~93%를 `창합계`
+# 하나가 나른다. 아래 6개면 14차원 이득의 98.5~98.7%(강수)·98.6~99.2%
+# (기온)를 회수하고, 동시각 편향 3개(11~13)는 빼도 영향이 없다.
+#
+# 차원을 줄이는 이유는 성능이 아니라 **Z축 예산**이다. 수치예보 도입 후
+# Re축 게이트가 0.380→0.021 로 붕괴하고 황사가 유의 악화했는데, 신호 없는
+# 차원이 Z축을 부풀린 것이 원인인지 이 축소로 가릴 수 있다.
+#
+# 인코딩 자체는 늘 14차원을 만들고 **여기서 열을 고른다** — 그래야
+# 구버전 체크포인트(full14)와 새 체크포인트가 같은 코드 경로를 쓴다.
+FEATURE_SETS = {
+    "full14":  list(range(14)),
+    # 예보강수·예보기온·예보습도·예보운량·창합계·기압변화
+    "compact6": [0, 1, 2, 3, 7, 10],
+}
+
+
+def feature_dim(feature_set: str = "full14") -> int:
+    return len(FEATURE_SETS[feature_set])
+
+
+def select(vec, feature_set: str = "full14"):
+    """14차원 벡터에서 그 집합의 열만 고른다."""
+    cols = FEATURE_SETS[feature_set]
+    return vec if len(cols) == NWP_DIM else vec[..., cols]
+
 
 def _ts_add_hours(ts12: str, hours: int) -> str:
     from datetime import datetime, timedelta
@@ -119,7 +147,7 @@ class NWPForecastCollector:
         return f_now, got[1], [g[I_PR] for g in got]
 
     @staticmethod
-    def encode_from(forecast, record: dict):
+    def encode_from(forecast, record: dict, feature_set: str = "full14"):
         """고정한 예보값 + (흔들린) 관측 레코드 → 특징 벡터.
 
         관측에서 유도되는 편향 항(9~13번 중 뒤 세 개)은 레코드를 따라
@@ -131,10 +159,15 @@ class NWPForecastCollector:
                record.get("humidity"))
         if any(o is None for o in obs):
             return None
-        return _encode(f_now, f_tgt, win, obs)
+        return select(_encode(f_now, f_tgt, win, obs), feature_set)
 
-    def encode(self, record: dict, lead_hours: int):
-        """한 레코드의 특징 벡터. 필요한 예보가 하나라도 없으면 None."""
+    def encode(self, record: dict, lead_hours: int, feature_set: str = "full14"):
+        """한 레코드의 특징 벡터. 필요한 예보가 하나라도 없으면 None.
+
+        **결측 판정은 `feature_set` 과 무관하다** — 늘 14차원을 만들 수
+        있는지로 판단하고 그 뒤에 열을 고른다. 그래야 어떤 집합을 쓰든
+        표본 구성이 같아 대조 실험이 성립한다(기준선 불일치가 생기지 않는다).
+        """
         stn = str(record.get("stn"))
         rows = self.table.get(stn)
         if rows is None:
@@ -155,19 +188,20 @@ class NWPForecastCollector:
                record.get("humidity"))
         if any(o is None for o in obs):
             return None
-        return _encode(f_now, f_tgt, win, obs)
+        return select(_encode(f_now, f_tgt, win, obs), feature_set)
 
-    def get_batch(self, records: list, lead_hours: int):
+    def get_batch(self, records: list, lead_hours: int, feature_set: str = "full14"):
         """(N, NWP_DIM) 배열과 유효 마스크를 함께 돌려준다.
 
         학습은 마스크가 False 인 표본을 데이터셋에서 제외한다 — 결측을
         중립값으로 메우면 "예보가 없다"와 "예보가 0mm 다"가 구분되지 않는다.
         """
         vecs, mask = [], []
+        dim = feature_dim(feature_set)
         for r in records:
-            v = self.encode(r, lead_hours)
+            v = self.encode(r, lead_hours, feature_set)
             mask.append(v is not None)
-            vecs.append(v if v is not None else np.zeros(NWP_DIM, dtype=np.float32))
+            vecs.append(v if v is not None else np.zeros(dim, dtype=np.float32))
         return np.stack(vecs, axis=0), np.asarray(mask, dtype=bool)
 
 

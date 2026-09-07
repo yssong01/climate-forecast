@@ -65,7 +65,8 @@ def head_prob(model, ckpt, record, img, txt, head="coldwave", nwp_fixed=None):
         vec = np.concatenate([vec, [climatology_anomaly(record, table)]]).astype(np.float32)
     if ckpt.get("use_nwp", False):
         from nwp_collector import NWPForecastCollector
-        nv = NWPForecastCollector.encode_from(nwp_fixed, record)
+        nv = NWPForecastCollector.encode_from(
+            nwp_fixed, record, ckpt.get("nwp_feature_set", "full14"))
         if nv is None:
             raise RuntimeError("고정 예보값으로 NWP 특징을 만들 수 없다 — "
                                "기준 레코드의 관측값이 결측이다.")

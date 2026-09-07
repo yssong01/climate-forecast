@@ -35,7 +35,7 @@ from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector, TENDENCY_DIM
 from text_collector import SimulatedTextCollector
 from island_collector import IslandPrecipCollector, ISLAND_DIM
-from nwp_collector import NWPForecastCollector, NWP_DIM
+from nwp_collector import NWPForecastCollector, NWP_DIM, feature_dim as nwp_feature_dim
 from collect_nwp_archive import MODEL as NWP_ARCHIVE_MODEL
 from pipeline_model import TriCHEFPipeline
 
@@ -193,6 +193,10 @@ USE_NWP = os.getenv("USE_NWP", "0") == "1"
 # 주석 참고 — 한파 단조성 FAIL 의 원인이 이 축임을 대조군으로 확인했다.
 # USE_NWP=1 일 때만 의미가 있다. 기본값 0(끔).
 EXTREME_NWP_NEUTRAL = os.getenv("EXTREME_NWP_NEUTRAL", "0") == "1"
+# 수치예보 특징 부분집합(2026-09-07). 절제 실험에서 14차원의 기여가 극소수에
+# 몰려 있음을 확인했다(nwp_collector.FEATURE_SETS 주석 참고). 기본값은
+# `full14` 로 종전 동작이며, `compact6` 이 축소 대조 실험용이다.
+NWP_FEATURE_SET = os.getenv("NWP_FEATURE_SET", "full14")
 USE_NWP_SUBSET = os.getenv("USE_NWP_SUBSET", "0") == "1"
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
 # 그래디언트 누적(2026-09-01) — amount 헤드 pinball 재도전용. PRECIP_QUANTILE
@@ -641,6 +645,7 @@ class WeatherDataset(Dataset):
                  climatology_table: dict = None,  # build_climatology_table() 반환값 — Z축 부가 특징(평년 대비 이상편차)
                  nwp_collector=None,      # NWPForecastCollector — Z축 부가 특징(수치예보)
                  nwp_features: bool = True,  # False 면 표본 선별만 하고 특징은 안 붙인다(대조군용)
+                 nwp_feature_set: str = "full14",  # nwp_collector.FEATURE_SETS 의 키
                  offseason_negative: bool = None,  # None 이면 환경변수 기본값
 
                  lead_hours: int = 1,
@@ -681,7 +686,7 @@ class WeatherDataset(Dataset):
         # 아카이브 소급 한계(2016-01-01)와 산발적 결측이 여기서 걸러진다.
         nwp_vecs = None
         if nwp_collector is not None:
-            nwp_vecs, nwp_mask = nwp_collector.get_batch(src_records, L)
+            nwp_vecs, nwp_mask = nwp_collector.get_batch(src_records, L, nwp_feature_set)
             kept = int(nwp_mask.sum())
             if kept == 0:
                 raise ValueError(
@@ -1064,6 +1069,8 @@ def aux_dataset_kwargs(ckpt: dict) -> dict:
     # 라벨 의미를 바꾸는 스위치라 반드시 체크포인트를 따라가야 한다 —
     # 키가 없는(구버전) 체크포인트는 False 로 종전 동작 그대로다.
     kw["offseason_negative"] = bool(ckpt.get("extreme_offseason_negative", False))
+    # 특징 집합도 체크포인트를 따라간다 — 키가 없는(구버전) 것은 full14 다.
+    kw["nwp_feature_set"] = ckpt.get("nwp_feature_set", "full14")
     if ckpt.get("use_nwp", False) or ckpt.get("use_nwp_subset", False):
         from nwp_collector import shared as _nwp_shared
         # `use_nwp_subset`(대조군)은 특징을 붙이지 않지만 **표본 선별은
@@ -1224,7 +1231,10 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
     if USE_NWP or USE_NWP_SUBSET:
         nwp_collector = NWPForecastCollector()
         if verbose:
-            what = ("수치예보 특징 %d차원" % NWP_DIM) if USE_NWP else "표본 정렬만(대조군)"
+            # 실제로 붙는 차원 수를 찍는다 — NWP_DIM(14) 을 그대로 쓰면
+            # compact6 로 돌려도 "14차원"으로 찍혀 로그가 거짓말을 한다.
+            what = (f"수치예보 특징 {nwp_feature_dim(NWP_FEATURE_SET)}차원"
+                    f"({NWP_FEATURE_SET})") if USE_NWP else "표본 정렬만(대조군)"
             print(f"NWP 예보 부가 특징 — {what} · 아카이브 {nwp_collector.coverage()}")
 
     climatology_table = None
@@ -1240,6 +1250,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                              climatology_table=climatology_table,
                              nwp_collector=nwp_collector,
                              nwp_features=USE_NWP,
+                             nwp_feature_set=NWP_FEATURE_SET,
                              lead_hours=lead_hours)
     train_ds, val_ds = make_split(full_ds, SPLIT_MODE, verbose=verbose)
     n_train, n_val = len(train_ds), len(val_ds)
@@ -1490,7 +1501,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         dust_prior=dust_prior,
         signed_head_input=SIGNED_HEAD_INPUT,
         # 수치예보를 쓸 때만 그 차원 수를 넘긴다 — 0 이면 종전 동작.
-        extreme_nwp_neutral_dims=(NWP_DIM if (USE_NWP and EXTREME_NWP_NEUTRAL) else 0),
+        extreme_nwp_neutral_dims=(nwp_feature_dim(NWP_FEATURE_SET)
+                                  if (USE_NWP and EXTREME_NWP_NEUTRAL) else 0),
         signed_precip_input=SIGNED_PRECIP_INPUT,
         head_dropout=HEAD_DROPOUT,
         coldwave_dropout=COLDWAVE_DROPOUT,
@@ -1827,8 +1839,9 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # 학습한 모델은 검증된 것이 없으므로 빈 목록으로 시작한다.
                 "station_thresh_overrides": [],
                 "use_nwp":        USE_NWP,
-                "extreme_nwp_neutral_dims": (NWP_DIM if (USE_NWP and EXTREME_NWP_NEUTRAL)
-                                             else 0),
+                "extreme_nwp_neutral_dims": (nwp_feature_dim(NWP_FEATURE_SET)
+                                             if (USE_NWP and EXTREME_NWP_NEUTRAL) else 0),
+                "nwp_feature_set": NWP_FEATURE_SET,
                 "use_nwp_subset": USE_NWP_SUBSET,
                 "nwp_model":      (NWP_ARCHIVE_MODEL if (USE_NWP or USE_NWP_SUBSET)
                                    else None),
