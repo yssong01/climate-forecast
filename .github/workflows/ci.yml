@@ -34,6 +34,14 @@ jobs:
       - name: Run Phase 3-6 alarm gate tests
         run: python test_phase36.py
 
+      # 진단·게이트 스크립트가 죽지 않는지 본다(2026-09-07 신설). Z축 부가
+      # 특징을 추가하면 그 사실을 모르는 스크립트가 shape 오류로 죽는데,
+      # 2026-09-07 점검에서 이 계열 잠복 결함이 세 건 한꺼번에 드러났다 —
+      # 셋 다 "한 번 실행해 보기만 했으면" 잡혔다. 데이터셋을 만들지 않아
+      # 수 초에 끝난다.
+      - name: 진단 스크립트 연기 시험
+        run: python test_diagnostics_smoke.py
+
   # Dockerfile 이 실제로 빌드되는지 확인 — 체크포인트는 런타임 마운트 대상이라
   # 빌드 단계에서는 필요 없다.
   docker-build:

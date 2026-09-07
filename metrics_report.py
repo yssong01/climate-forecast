@@ -362,6 +362,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt", nargs="?", default=CHECKPOINT)
     ap.add_argument("--batch", type=int, default=eval_cache.DEFAULT_BATCH)
+    ap.add_argument("--no-plot", action="store_true",
+                    help="그림을 다시 그리지 않는다. docs/images/metrics_report.png 는 "
+                         "+6h 배포본 기준의 공용 산출물이라, 다른 리드타임이나 실험 "
+                         "체크포인트로 돌릴 때 덮어쓰면 화면이 엉뚱한 모델의 그림을 "
+                         "보여준다(2026-09-07 +12h 승격에서 실제로 겪었다).")
     ap.add_argument("--patch-checkpoint", action="store_true",
                     help="서빙 기준 강수 오차를 체크포인트에 기록한다"
                          "(화면의 ± 표기가 쓰는 값)")
@@ -375,7 +380,10 @@ def main():
     pre = precision_block(d, ckpt)
     cal = calibration_block(d, ckpt)
     print_report(acc, pre, cal)
-    plot(acc, pre, cal, OUT_PNG)
+    if not args.no_plot:
+        plot(acc, pre, cal, OUT_PNG)
+    else:
+        print(f"(--no-plot: {OUT_PNG} 는 그대로 둔다)")
 
     os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)
     with open(OUT_JSON, "w", encoding="utf-8") as f:

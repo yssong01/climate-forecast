@@ -343,6 +343,7 @@ class TriCHEFPipeline(nn.Module):
                  dust_prior: float = 0.05,
                  signed_head_input: bool = False,
                  extreme_nwp_neutral_dims: int = 0,
+                 extreme_neutral_idx: list = None,
                  signed_precip_input: bool = False,
                  head_dropout: float = 0.0,
                  coldwave_dropout: float = 0.0,
@@ -521,6 +522,24 @@ class TriCHEFPipeline(nn.Module):
         # 부트스트랩에서 그 이득은 폭염 +0.0144(CI 0 포함)·한파 +0.0278
         # (CI 0 포함)로 **둘 다 유의하지 않았다.**
         self.extreme_nwp_neutral_dims = int(extreme_nwp_neutral_dims)
+        # extreme_neutral_idx (2026-09-07) — 부호 경로에서 중립화할 입력
+        # 인덱스를 **명시적으로** 준다. `extreme_nwp_neutral_dims` 는 "뒤에서
+        # n 개"라는 위치 규칙이라 수치예보 외의 축(예: 연중 시각 12·13)을
+        # 지목할 수 없었다.
+        #
+        # 왜 계절 성분을 중립화하는가 — 한파 단조성 실패를 가르는 것이
+        # 계절의존도(계절진폭÷기온진폭)임을 seed 실험으로 확인했다(통과 0.47
+        # vs 실패 0.64~1.08, 겹치는 구간 없음). 헤드가 기온을 충분히 보지
+        # 않으면 순위가 계절 잡음으로 정해진다. 부호 경로에서 계절을 빼면
+        # 헤드가 기온에 의존할 수밖에 없다는 것이 이 인자의 가설이다.
+        # 계절 오탐은 이제 라벨(EXTREME_OFFSEASON_NEGATIVE)이 막으므로,
+        # 헤드가 계절을 직접 볼 필요가 줄었다는 것이 전제다 — 그 전제가
+        # 틀리면 계절 오탐 게이트가 잡는다.
+        idx = list(extreme_neutral_idx or [])
+        if self.extreme_nwp_neutral_dims > 0:
+            idx += list(range(num_features - self.extreme_nwp_neutral_dims,
+                              num_features))
+        self.extreme_neutral_idx = sorted(set(int(i) for i in idx))
         self.head_heatwave = _binary_head(_ext_dim, heatwave_prior, head_dropout)
         # coldwave_dropout (2026-08-17) — head_dropout과 별도로 한파 헤드에만
         # 거는 드롭아웃. head_dropout을 전체 헤드에 걸었더니(2026-08-17 기각)
@@ -788,12 +807,12 @@ class TriCHEFPipeline(nn.Module):
         # signed_head_input 주석 참고). magnitude 는 제곱을 거쳐 |편차| 만
         # 남으므로, 이것만으로는 한겨울과 한여름이 구분되지 않는다.
         v_z_ext = v_z
-        if self.extreme_nwp_neutral_dims > 0:
-            # 뒤쪽 n 차원(수치예보)만 0 으로 — 입력은 표준화돼 있으므로 0 이
-            # 곧 학습 평균이다. 앞쪽 지상 관측 특징은 그대로 둔다.
-            n = self.extreme_nwp_neutral_dims
+        if self.extreme_neutral_idx:
+            # 지정한 열만 0 으로 — 입력은 표준화돼 있으므로 0 이 곧 학습
+            # 평균이다. 나머지 특징은 그대로 둔다. 융합식·회귀·강수 경로는
+            # 원래 v_z 를 계속 쓰므로 그쪽 성능에는 영향이 없다.
             num_neutral = num_x.clone()
-            num_neutral[:, -n:] = 0.0
+            num_neutral[:, self.extreme_neutral_idx] = 0.0
             v_z_ext = self.enc_z(num_neutral)
         _ext_in = (torch.cat([magnitude, v_z_ext], dim=-1)
                    if self.signed_head_input else magnitude)

@@ -197,6 +197,12 @@ EXTREME_NWP_NEUTRAL = os.getenv("EXTREME_NWP_NEUTRAL", "0") == "1"
 # 몰려 있음을 확인했다(nwp_collector.FEATURE_SETS 주석 참고). 기본값은
 # `full14` 로 종전 동작이며, `compact6` 이 축소 대조 실험용이다.
 NWP_FEATURE_SET = os.getenv("NWP_FEATURE_SET", "full14")
+# 극한기상 부호 경로에서 **연중 시각(계절) 성분**도 중립화할지(2026-09-07).
+# record_to_vec 인덱스 12·13 이 연중 시각 sin/cos 다. 근거는
+# pipeline_model 의 extreme_neutral_idx 주석 참고 — 한파 단조성 실패를
+# 가르는 것이 계절의존도임을 seed 실험으로 확인했다. 기본값 0(끔).
+EXTREME_NEUTRAL_SEASON = os.getenv("EXTREME_NEUTRAL_SEASON", "0") == "1"
+_SEASON_IDX = [12, 13]
 USE_NWP_SUBSET = os.getenv("USE_NWP_SUBSET", "0") == "1"
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
 # 그래디언트 누적(2026-09-01) — amount 헤드 pinball 재도전용. PRECIP_QUANTILE
@@ -1503,6 +1509,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         # 수치예보를 쓸 때만 그 차원 수를 넘긴다 — 0 이면 종전 동작.
         extreme_nwp_neutral_dims=(nwp_feature_dim(NWP_FEATURE_SET)
                                   if (USE_NWP and EXTREME_NWP_NEUTRAL) else 0),
+        extreme_neutral_idx=(_SEASON_IDX if EXTREME_NEUTRAL_SEASON else None),
         signed_precip_input=SIGNED_PRECIP_INPUT,
         head_dropout=HEAD_DROPOUT,
         coldwave_dropout=COLDWAVE_DROPOUT,
@@ -1842,6 +1849,9 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "extreme_nwp_neutral_dims": (nwp_feature_dim(NWP_FEATURE_SET)
                                              if (USE_NWP and EXTREME_NWP_NEUTRAL) else 0),
                 "nwp_feature_set": NWP_FEATURE_SET,
+                # 해석된 최종 인덱스를 저장한다 — 서빙이 위치 규칙을 다시
+                # 계산하지 않고 그대로 복원하도록.
+                "extreme_neutral_idx": (_SEASON_IDX if EXTREME_NEUTRAL_SEASON else []),
                 "use_nwp_subset": USE_NWP_SUBSET,
                 "nwp_model":      (NWP_ARCHIVE_MODEL if (USE_NWP or USE_NWP_SUBSET)
                                    else None),

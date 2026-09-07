@@ -294,6 +294,16 @@ def main():
     # 10-1 이 자동화 사슬을 만든 바로 그 이유에 해당한다. 수치예보 후보를
     # 승격 검토하다 예측구간이 null 인 것을 보고 발견했다.
     run(["conformal_interval_fit.py", CHECKPOINT, "--apply"], "예측구간 재적합")
+    # 화면이 읽는 값을 체크포인트에 기록한다(2026-09-07 사슬 편입). 빠뜨리면
+    #   · 강수 출력값 옆의 `±` 표기가 사라지거나 옛 값으로 남고
+    #   · 극한기상 성능표가 t=0.5 기준으로 남아 서빙 판정과 어긋난다
+    #     (수치예보 모델에서 한파 F1 0.209 vs 서빙 0.552).
+    # 규칙 10-1 이 자동화 사슬을 만든 이유와 같은 유형이라 사람 기억에
+    # 맡기지 않는다. 주 경로가 아니면 그림은 건드리지 않는다.
+    _mr = ["metrics_report.py", CHECKPOINT, "--patch-checkpoint"]
+    if not _is_primary:
+        _mr.append("--no-plot")
+    run(_mr, "화면용 지표 기록(서빙 MAE·극한기상 서빙 판정선 기준)")
     if _is_primary:
         run(["calibration_plot_diagnose.py"], "관측소별 플롯 재생성")
     else:
@@ -305,7 +315,11 @@ def main():
 
     # ── 사람이 해야 할 일 ─────────────────────────────────────────
     print(f"\n{'='*78}\n 남은 수동 작업 — 자동화하지 않는다(판단이 필요하다)\n{'='*78}")
-    print("""  1. threshold_validation.py 를 돌려 임계값을 재산출하고, 채택 기준(순이득
+    print("""  0. 강수 게이팅 임계값(predict.PRECIP_PROB_GATE_BY_LEAD)을 재선정한다 —
+     규칙 9 는 극한기상 판정선만이 아니라 이 게이트에도 적용된다. 실제로
+     2026-09-07 점검에서 +12h 가 옛 모델 기준값(0.75)을 쓰고 있었고,
+     재선정(0.805)으로 평가용 F1 이 +0.0145 올랐다.
+  1. threshold_validation.py 를 돌려 임계값을 재산출하고, 채택 기준(순이득
      0.01)을 넘은 것만 predict.py 의 EXTREME_EVENT_THRESH 에 반영한다.
   2. 관측소별 예외(STATION_EVENT_THRESH_OVERRIDES)가 남아 있다면
      station_threshold_check.py 로 이 모델에서도 유효한지 재검증한다 —
