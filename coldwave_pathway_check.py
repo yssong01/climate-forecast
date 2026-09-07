@@ -103,6 +103,37 @@ def build_grid(model, ckpt, base, img, txt, head="coldwave"):
     return grid
 
 
+# 계절의존도(계절진폭 ÷ 기온진폭) 판정 기준(2026-09-07 신설).
+#
+# **왜 상관만으로는 부족한가.** 종전 판정은 기온 순위와 확률 순위의 상관
+# 하나만 봤다. 그런데 `INIT_SEED` 만 바꿔 2구성 × 3seed 를 학습해 보니
+# (한파 헤드) 판정을 가르는 것은 상관이 아니라 **계절의존도**였다:
+#
+#   구성/seed        판정   최악상관   계절의존   기온진폭
+#   full14 / 42      PASS    −0.40      0.47      0.833
+#   full14 / 43      PASS    −0.70      0.47      0.841
+#   full14 / 44      WARN    +0.27      0.99      0.387
+#   compact6 / 42    FAIL    +0.79      1.08      0.490
+#   compact6 / 43    FAIL    +0.31      0.64      0.494
+#   compact6 / 44    WARN    −0.14      0.68      0.637
+#
+# PASS 인 두 건은 계절의존 0.47 · 기온진폭 0.84 로 같고, 나머지 넷은
+# 0.64~1.08 · 0.39~0.64 다 — **겹치는 구간이 없다.** 해석: 헤드가 기온을
+# 충분히 보지 않으면(기온진폭이 작으면) 순위가 계절 성분의 잡음으로
+# 결정되고, 그 결과가 우연히 음수면 통과하고 양수면 실패한다. 즉 상관은
+# 결과이고 계절의존도가 원인에 가깝다. `compact6 / 44` 는 상관이 −0.14 로
+# 통과 방향인데 계절의존 0.68 이라 불안정한 통과다 — 종전 게이트는 이걸
+# 잡지 못했다.
+#
+# **임계값의 근거.** 1.0 은 물리적 의미가 있다 — 한파는 정의상 기온으로
+# 규정되는 사건인데 계절에 그만큼 이상 의존한다면 그 자체로 부적합이다.
+# 0.6 은 위 실측에서 PASS(0.47)와 실패(최소 0.64) 사이의 구간이며, 6개
+# 표본으로 정한 값이라 **경계로만 쓰고 차단하지 않는다**(WARN). 표본이
+# 늘면 재검토할 것 — 이 값을 FAIL 로 올리려면 고르는 표본과 채점하는
+# 표본을 분리해 다시 정해야 한다(CLAUDE.md 2절).
+SEASON_DEP_WARN = 0.60
+SEASON_DEP_FAIL = 1.00
+
 N_PROBE_BASES = 12   # 계절이 고루 섞이도록 캐시 전 구간에서 균등 표집
 # 심각도 = (역전 상관) × (그 달의 확률 진폭). A안 사고(7월 한파확률 0.999,
 # 진폭 1.0, 상관 +0.33 → 심각도 0.33)를 잡되, 진폭이 작아 실질 영향이
@@ -303,16 +334,24 @@ def main():
         bad = (corr < -0.3) if expect_up else (corr > 0.3)
         verdict = "무반응" if np.isnan(corr) else ("정상" if good else ("★역전★" if bad else "혼재"))
         name = p.split("/")[-1]
+        # 계절의존도 판정(2026-09-07 추가) — 아래 SEASON_DEP_* 주석 참고.
+        dep_code = ("FAIL" if ratio > SEASON_DEP_FAIL
+                    else ("WARN" if ratio > SEASON_DEP_WARN else "PASS"))
+        mark = "" if dep_code == "PASS" else f"  [계절의존 {dep_code}]"
         print(f"{name:<44}{at:>10.4f}{as_:>10.4f}{ratio:>10.2f}{corr:>10.2f}"
-              f"{severity:>10.3f}{n_ok:>6}/{int(valid.sum()):<4}  {verdict}"
+              f"{severity:>10.3f}{n_ok:>6}/{int(valid.sum()):<4}  {verdict}{mark}"
               + (f"  (최악 기준 {worst_ts})" if worst_ts and not good else ""))
         # promote_checkpoint.py 가 이 줄을 파싱한다 — 형식을 바꾸지 말 것.
         # 역전이면 FAIL, 방향이 뚜렷하지 않으면(혼재·무반응) WARN.
-        code = "FAIL" if verdict.startswith("★") else ("PASS" if verdict == "정상" else "WARN")
-        print(f"VERDICT monotonicity_{head} {code} corr={corr:.4f}")
+        corr_code = "FAIL" if verdict.startswith("★") else ("PASS" if verdict == "정상" else "WARN")
+        # 두 판정 중 나쁜 쪽을 채택한다 — 게이트는 보수적이어야 한다.
+        rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
+        code = max(corr_code, dep_code, key=lambda c: rank[c])
+        print(f"VERDICT monotonicity_{head} {code} corr={corr:.4f} season_dep={ratio:.2f}")
 
     print(f"\n대상 헤드: {head}")
-    print("계절의존 = 계절 진폭 ÷ 기온 진폭. 클수록 기온보다 계절에 의존한다.")
+    print(f"계절의존 = 계절 진폭 ÷ 기온 진폭. 클수록 기온보다 계절에 의존한다 "
+          f"(경계 {SEASON_DEP_WARN} · 차단 {SEASON_DEP_FAIL} — 상수 주석에 근거 실측 있음).")
     print("기온상관 = 기온 순위와 확률 순위의 상관. "
           + ("양수가 정상(기온↑ → 폭염확률↑)." if expect_up
              else "음수가 정상(기온↑ → 한파확률↓)."))
