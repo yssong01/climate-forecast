@@ -33,7 +33,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 
-from predict import CHECKPOINT, load_model, raw_event_threshold
+from predict import CHECKPOINT, load_model, event_threshold, calibrate_prob
 from train import (WeatherDataset, collect_historical, make_split,
                    aux_dataset_kwargs)
 from weather_collector import STATION_COORDS, STATIONS
@@ -83,8 +83,16 @@ def main():
 
     worst = {}
     for ev in ("heatwave", "coldwave", "dust"):
-        t = raw_event_threshold(ev, "108")
-        print(f"\n{'='*90}\n[{ev}] 판정 임계값(보정 전) {t}")
+        # 서빙이 실제로 쓰는 판정선(보정 후 공간)에서 잰다(2026-09-07 수정).
+        # 종전에는 `raw_event_threshold(ev, "108")` 로 **보정 전** 서울 기준
+        # 상수를 썼다. 확률 보정이 도입된 뒤로 그 값은 서빙 동작점과 다른
+        # 공간의 수치이고, 확률 눈금이 이동한 모델에서는 격차가 커진다 —
+        # 이 게이트가 "채점되지 않는 관측소가 얼마나 경보를 내는가"를 재는
+        # 것이므로 서빙과 같은 기준이어야 의미가 있다. metrics_report.py 가
+        # 같은 이유로 이미 서빙 판정선을 쓴다.
+        t = event_threshold(ev, "108", ckpt)
+        P[ev] = np.array([calibrate_prob(float(x), ev, ckpt) for x in P[ev]])
+        print(f"\n{'='*90}\n[{ev}] 판정 임계값(서빙, 보정 후) {t:.4f}")
         print(f"{'관측소':<8}{'검증표본':>9}{'라벨보유':>9}{'라벨비율':>9}{'양성':>7}"
               f"{'임계초과율':>11}   상태")
         unscored_alert = 0.0

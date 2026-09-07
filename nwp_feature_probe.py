@@ -16,7 +16,7 @@ NWP 는 전 지구 자료동화로 서해·중국 대륙의 상태를 이미 반
     (발표 시각이 T 보다 18h·12h 앞선다) — 시간 누수가 없다. 오히려
     실서빙에서 쓸 수 있는 리드타임(+6h·+12h)보다 **불리한** 예보이므로,
     여기서 나오는 증분은 실사용 시 기대치의 하한이다.
-  · 수집 스크립트는 이 파일 하단 `fetch_archive()` 참고.
+  · 수집은 `collect_nwp_archive.py` 가 담당한다.
 
 실행: python nwp_feature_probe.py           (LEAD_HOURS 환경변수로 6/12 선택)
 """
@@ -32,7 +32,13 @@ from sklearn.metrics import roc_auc_score, average_precision_score, precision_re
 from weather_collector import STATION_COORDS
 
 DATA_PATH = "./cache/historical_data_1y.json"
-NWP_PATH = "./cache/nwp_prevrun_openmeteo.json"
+# 기본값은 **배포가 쓰는 아카이브**다(2026-09-07 수정). 최초 측정
+# (README 의 ΔAUC +0.0285/+0.0795)은 탐색 단계의 `best_match` 아카이브
+# (`cache/nwp_prevrun_openmeteo.json`, 2022년~)로 잰 값이고, 그 뒤 소급
+# 범위를 넓히려고 자료원을 `jma_gsm`(2016년~)으로 바꿨다. 경로가 그대로
+# 남아 있으면 이 프로브가 **배포와 다른 자료원**을 재게 되므로 기본값을
+# 옮긴다. 원래 수치를 재현하려면 NWP_PATH 환경변수로 옛 파일을 지정한다.
+NWP_PATH = os.getenv("NWP_PATH", "./cache/nwp_archive.json")
 WET_THRESH = 0.1
 LEAD_HOURS = int(os.getenv("LEAD_HOURS", "6"))
 LAGS = [1, 3, 6]
@@ -101,13 +107,25 @@ def load_nwp(timestamps, stns):
         if h is None:
             print(f"  [WARN] NWP 결측 관측소 {s}")
             continue
-        keys = [t.replace("-", "").replace("T", "").replace(":", "")[:12] for t in h["time"]]
+        # 두 가지 저장 형식을 모두 받는다(2026-09-07).
+        #   ① `collect_nwp_archive.py` 산출 — {시각12: [값 7개]}  ← 배포가 쓰는 형식
+        #   ② 탐색 단계의 Open-Meteo 원응답 — {"time": [...], "<변수>_previous_day1": [...]}
+        # 형식을 고정해 두면 자료원을 바꿀 때 이 프로브만 조용히 옛 파일을
+        # 계속 읽게 된다(실제로 그럴 뻔했다).
+        if "time" in h:
+            keys = [t.replace("-", "").replace("T", "").replace(":", "")[:12]
+                    for t in h["time"]]
+            cols = [[np.nan if x is None else x for x in h[f"{v}_previous_day1"]]
+                    for v in NWP_VARS]
+        else:
+            keys = list(h.keys())
+            rows = [h[k] for k in keys]
+            cols = [[r[vi] for r in rows] for vi in range(V)]
         idx = np.array([tpos.get(k, -1) for k in keys])
         ok = idx >= 0
         matched += int(ok.sum())
-        for vi, v in enumerate(NWP_VARS):
-            arr = np.array([np.nan if x is None else x
-                            for x in h[f"{v}_previous_day1"]], dtype=np.float32)
+        for vi in range(V):
+            arr = np.asarray(cols[vi], dtype=np.float32)
             grid[idx[ok], si, vi] = arr[ok]
     print(f"NWP 정렬 — 시각축 매칭 {matched:,}건 · "
           f"강수 유효값 {int(np.isfinite(grid[:, :, 0]).sum()):,}건")

@@ -47,9 +47,13 @@ cache/*
 !cache/recent_window.json
 !cache/accuracy_log.json
 !cache/api_usage_daily.json
-# 수치예보 창 — refresh-data.yml 이 data 브랜치에 커밋하고 앱이 raw 로 읽는다.
-# 학습용 전체 아카이브(cache/nwp_archive.json, 52MB)는 여기 없으므로 계속 제외된다.
-!cache/nwp_recent.json
+# 수치예보 창은 **main 에 커밋하지 않는다**(2026-09-07 정리). refresh-data.yml
+# 이 `data` 브랜치에만 올리고 앱은 raw 로 읽는다. main 에 묵은 사본이 있으면
+# 조회 실패 시 실패 대신 낡은 예보로 조용히 굴러가므로 일부러 두지 않는다.
+# 워크플로는 `git add -f` 로 올리므로(data 브랜치는 자체 .gitignore 스냅숏을
+# 갖고 있어 예외 규칙이 어차피 안 먹는다) 여기에 예외를 둘 필요가 없다 —
+# 예외를 두면 `git status` 에 상시 `??` 로 남아 잡음만 된다.
+# 학습용 전체 아카이브(cache/nwp_archive.json, 52MB)도 같은 규칙으로 제외된다.
 *.json.bak
 *.log
 
