@@ -50,6 +50,14 @@ import time
 # 다시 만들어진다. 이 스크립트가 막으려던 "조용히 틀린 값" 사고 그 자체다.
 # 승격 대상만은 환경에 흔들리지 않아야 한다.
 PRODUCTION_CHECKPOINT = "./checkpoints/numerical_trichef.pt"
+# 리드타임마다 배포 경로가 다르다(app.py 의 CHECKPOINT / CHECKPOINT_12H).
+# `--target` 으로 고를 수 있게 하되, 목록에 있는 경로만 허용한다 — 임의
+# 경로를 받으면 실험 파일을 배포 경로로 착각해 덮어쓰는 사고가 난다
+# (2026-08-19 에 실제로 겪은 유형이다).
+PRODUCTION_TARGETS = {
+    6:  "./checkpoints/numerical_trichef.pt",
+    12: "./checkpoints/numerical_trichef_12h.pt",
+}
 CHECKPOINT = PRODUCTION_CHECKPOINT   # 이 파일 안의 기존 참조를 그대로 둔다
 
 # 게이트 임계 — seasonal_falsealarm_check.py / coldwave_pathway_check.py 와
@@ -117,6 +125,16 @@ def main():
     # 않은 표본)에서 직접 비교한다. 게이트를 끄는 것이 아니라 **더 엄격한
     # 비교로 대체**하는 것이며, 유의한 회귀가 하나라도 있으면 FAIL 한다.
     do_rebaseline = "--rebaseline" in sys.argv
+    # 승격 대상 배포 경로. 주지 않으면 +6h 경로다(종전 동작).
+    global CHECKPOINT
+    _tgt = next((a.split("=", 1)[1] for a in sys.argv[1:]
+                 if a.startswith("--target=")), None)
+    if _tgt is not None:
+        if _tgt not in PRODUCTION_TARGETS.values():
+            print(f"허용되지 않은 승격 경로: {_tgt}\n"
+                  f"  가능한 값: {', '.join(PRODUCTION_TARGETS.values())}")
+            sys.exit(2)
+        CHECKPOINT = _tgt
     if not args:
         print("사용법: python promote_checkpoint.py <후보 체크포인트> [--promote]")
         sys.exit(2)
@@ -255,15 +273,35 @@ def main():
     # (위 PRODUCTION_CHECKPOINT 주석 참고). 환경변수 자체도 제거해
     # 경로 인자를 받지 않는 자식(calibration_plot_diagnose.py)까지 보호한다.
     os.environ.pop("CHECKPOINT_PATH", None)
+    # calibration_plot_diagnose.py 는 경로 인자를 받지 않고 predict.CHECKPOINT
+    # (= CHECKPOINT_PATH 환경변수)를 본다 — 대상이 +6h 가 아니면 맞춰준다.
+    os.environ["CHECKPOINT_PATH"] = CHECKPOINT
+    # 화면에 쓰이는 그림(docs/images/*.png)은 **+6h 배포본 기준의 공용
+    # 산출물**이다. 다른 리드타임을 승격하면서 이걸 다시 그리면 화면이
+    # 엉뚱한 모델의 그림을 보여주게 된다 — 2026-09-07 +12h 승격에서 실제로
+    # calibration_plot.png·probability_calibration.png 가 12h 기준으로
+    # 덮어써졌다. 체크포인트 자체의 재적합(보정·예측구간)은 리드타임과
+    # 무관하게 필요하므로 그대로 하고, **그림만** 주 경로에서 건너뛴다.
+    _is_primary = os.path.abspath(CHECKPOINT) == os.path.abspath(PRODUCTION_CHECKPOINT)
     run(["probability_calibration_fit.py", CHECKPOINT, "--apply"], "확률 보정 재적합")
-    run(["probability_calibration_check.py", CHECKPOINT], "신뢰도 곡선 재생성")
+    if _is_primary:
+        run(["probability_calibration_check.py", CHECKPOINT], "신뢰도 곡선 재생성")
+    else:
+        print("\n(신뢰도 곡선 그림도 같은 이유로 건너뛴다 — 아래 참고)")
     # 정합적 예측구간도 반드시 다시 적합한다(2026-09-07 추가). 빠뜨리면
     # 체크포인트에 `conformal_interval` 이 없어 화면의 90% 구간이 **조용히
     # 사라진다** — 오류도 경고도 없이 기능 하나가 없어지는 유형이라, 규칙
     # 10-1 이 자동화 사슬을 만든 바로 그 이유에 해당한다. 수치예보 후보를
     # 승격 검토하다 예측구간이 null 인 것을 보고 발견했다.
     run(["conformal_interval_fit.py", CHECKPOINT, "--apply"], "예측구간 재적합")
-    run(["calibration_plot_diagnose.py"], "관측소별 플롯 재생성")
+    if _is_primary:
+        run(["calibration_plot_diagnose.py"], "관측소별 플롯 재생성")
+    else:
+        print(f"\n{'='*78}\n▶ 관측소별 플롯 재생성 — 건너뜀\n{'='*78}")
+        print("  화면 그림은 +6h 배포본 기준의 공용 산출물이라, 다른 리드타임을")
+        print("  승격하면서 다시 그리면 화면이 엉뚱한 모델의 그림을 보여준다.")
+        print(f"  필요하면 +6h 로 따로 실행할 것: "
+              f"CHECKPOINT_PATH={PRODUCTION_CHECKPOINT} python calibration_plot_diagnose.py")
 
     # ── 사람이 해야 할 일 ─────────────────────────────────────────
     print(f"\n{'='*78}\n 남은 수동 작업 — 자동화하지 않는다(판단이 필요하다)\n{'='*78}")
