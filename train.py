@@ -1822,6 +1822,10 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # 구분한다 — 둘은 검증셋이 같고 입력 차원만 다르므로, 이 두
                 # 필드가 없으면 나중에 어느 쪽 체크포인트인지 알 수 없다.
                 "extreme_offseason_negative": EXTREME_OFFSEASON_NEGATIVE,
+                # 관측소별 판정선 예외는 그 체크포인트에서 검증한 조합만
+                # 쓴다(predict._station_override_allowed 주석 참고). 새로
+                # 학습한 모델은 검증된 것이 없으므로 빈 목록으로 시작한다.
+                "station_thresh_overrides": [],
                 "use_nwp":        USE_NWP,
                 "extreme_nwp_neutral_dims": (NWP_DIM if (USE_NWP and EXTREME_NWP_NEUTRAL)
                                              else 0),

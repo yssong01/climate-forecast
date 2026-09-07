@@ -256,12 +256,37 @@ def event_threshold(event: str, stn: str, ckpt: dict = None) -> float:
     관측소별 예외가 걸린 조합은 전역 재선정값을 쓰지 않는다 — 예외는 그
     관측소 표본에서 따로 검증해 고른 값이므로 전역값으로 덮으면 근거가 사라진다.
     """
-    raw = raw_event_threshold(event, stn)
-    if (stn, event) not in STATION_EVENT_THRESH_OVERRIDES:
+    use_override = ((stn, event) in STATION_EVENT_THRESH_OVERRIDES
+                    and _station_override_allowed(event, stn, ckpt))
+    raw = (STATION_EVENT_THRESH_OVERRIDES[(stn, event)] if use_override
+           else EXTREME_EVENT_THRESH[event])
+    if not use_override:
         head = (((ckpt or {}).get("prob_calibration") or {}).get("heads") or {}).get(event)
         if head and head.get("threshold_decision") is not None:
             return float(head["threshold_decision"])
     return calibrate_prob(raw, event, ckpt)
+
+
+def _station_override_allowed(event: str, stn: str, ckpt: dict = None) -> bool:
+    """이 체크포인트에서 그 관측소 예외가 **검증된 값인지** 판단한다(2026-09-07).
+
+    `STATION_EVENT_THRESH_OVERRIDES` 는 전역 상수지만, 그 값들은 특정
+    체크포인트의 원본 확률 공간에서 검증해 고른 것이다(CLAUDE.md 2절 —
+    관측소별 임계값은 보정용/평가용을 나눠 그 모델에서 검증한 뒤에만 쓴다).
+    손실 구성이 바뀌면 확률 눈금이 통째로 이동하므로, 다른 체크포인트에
+    그대로 적용하면 근거 없는 값으로 판정하게 된다. 실제로 수치예보
+    체크포인트는 폭염 판정선이 원본 공간에서 0.271→0.740 으로 옮겨갔다.
+
+    호환 규칙 — 체크포인트에 `station_thresh_overrides` 키가 **없으면**
+    구버전이므로 종전 동작(전역 상수 적용)을 유지한다. 배포 중인 모델의
+    판정이 이 변경으로 바뀌지 않게 하기 위해서다. 새로 학습한 체크포인트는
+    이 키를 빈 목록으로 갖고 시작하며(train.py), `station_threshold_check.py`
+    로 검증한 조합만 목록에 넣는다.
+    """
+    allow = (ckpt or {}).get("station_thresh_overrides")
+    if allow is None:
+        return True                      # 구버전 — 종전 동작 유지
+    return [stn, event] in [list(x) for x in allow]
 
 
 def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):

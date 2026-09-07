@@ -18,6 +18,7 @@ promote_checkpoint.py — 후보 체크포인트를 배포로 승격하는 절�
 
 **게이트 통과 후 자동 수행**
   4. 확률 보정 재적합(`probability_calibration_fit.py --apply`)
+  4-1. 정합적 예측구간 재적합(`conformal_interval_fit.py --apply`)
   5. 신뢰도 곡선·관측소별 플롯 재생성
 
 **여전히 사람이 해야 하는 일**은 마지막에 목록으로 출력한다. 임계값 상수
@@ -232,6 +233,12 @@ def main():
     os.environ.pop("CHECKPOINT_PATH", None)
     run(["probability_calibration_fit.py", CHECKPOINT, "--apply"], "확률 보정 재적합")
     run(["probability_calibration_check.py", CHECKPOINT], "신뢰도 곡선 재생성")
+    # 정합적 예측구간도 반드시 다시 적합한다(2026-09-07 추가). 빠뜨리면
+    # 체크포인트에 `conformal_interval` 이 없어 화면의 90% 구간이 **조용히
+    # 사라진다** — 오류도 경고도 없이 기능 하나가 없어지는 유형이라, 규칙
+    # 10-1 이 자동화 사슬을 만든 바로 그 이유에 해당한다. 수치예보 후보를
+    # 승격 검토하다 예측구간이 null 인 것을 보고 발견했다.
+    run(["conformal_interval_fit.py", CHECKPOINT, "--apply"], "예측구간 재적합")
     run(["calibration_plot_diagnose.py"], "관측소별 플롯 재생성")
 
     # ── 사람이 해야 할 일 ─────────────────────────────────────────
