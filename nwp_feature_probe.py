@@ -148,7 +148,7 @@ def build_features(stns, fields, nwp, hour_idx, dates, k_neighbor=5):
     n_pr, n_tp, n_rh, n_cc, n_ws, n_wd, n_sp = range(7)
 
     groups = {"local_now": [], "local_tend": [], "nb_now": [], "nb_tend": [], "nwp": []}
-    ys, amts, ds = [], [], []
+    ys, amts, tmps, tnow, ds = [], [], [], [], []
     for tgt in range(S):
         order = sorted([j for j in range(S) if j != tgt],
                        key=lambda j: haversine(STATION_COORDS[stns[tgt]],
@@ -201,9 +201,109 @@ def build_features(stns, fields, nwp, hour_idx, dates, k_neighbor=5):
                 groups[kk].append(row[kk])
             ys.append(1 if precip[t_f, tgt] >= WET_THRESH else 0)
             amts.append(float(precip[t_f, tgt]))
+            # 기온 타깃도 함께 담는다 — 수치예보의 가장 큰 유의 이득이
+            # 기온이었으므로(1.2758→1.0961), 어느 특징이 그것을 나르는지
+            # 강수와 따로 봐야 한다.
+            tmps.append(float(temp[t_f, tgt]))
+            tnow.append(float(temp[t, tgt]))
             ds.append(dates[t])
     out = {k: np.asarray(vv, dtype=np.float32) for k, vv in groups.items()}
-    return out, np.asarray(ys), np.asarray(amts, dtype=np.float32), np.asarray(ds)
+    return (out, np.asarray(ys), np.asarray(amts, dtype=np.float32),
+            np.asarray(tmps, dtype=np.float32), np.asarray(tnow, dtype=np.float32),
+            np.asarray(ds))
+
+
+# 14차원의 설계 의도별 묶음 — `nwp_collector._encode` 의 순서와 일치한다.
+# 이 목록을 바꾸면 그쪽도 함께 고쳐야 한다.
+NWP_GROUPS = {
+    "목표시각 예보": [0, 1, 2, 3, 4, 5, 6],   # 강수·기온·습도·운량·풍u·풍v·기압
+    "타이밍 창":     [7, 8],                   # ±1h 강수 합·최댓값
+    "예보된 변화":   [9, 10],                  # 강수·기압의 T→T+L 변화
+    "동시각 편향":   [11, 12, 13],             # 예보−실측(기온·강수·습도)
+}
+NWP_NAMES = ["예보강수", "예보기온", "예보습도", "예보운량", "예보풍u", "예보풍v",
+             "예보기압", "창합계", "창최대", "강수변화", "기압변화",
+             "기온편향", "강수편향", "습도편향"]
+
+
+def part_nwp_ablation(groups, y, tmp_t, tmp_n, is_val):
+    """14차원 중 어느 것이 신호를 나르는가 — 강수·기온을 따로 본다.
+
+    왜 필요한가 — 수치예보 특징을 **한 덩어리로** 넣었을 뿐 어느 것이
+    기여하는지 잰 적이 없다. 이 저장소는 "헤드가 늘면 강수가 나빠진다"
+    (공유 magnitude 경쟁)를 반복 확인해 왔는데, 입력 차원도 같은 성격의
+    예산을 쓴다 — 신호가 없는 차원은 트렁크의 표현 용량을 축내기만 한다.
+    기여가 몇 개에 몰려 있으면 다음 재학습에서 차원을 줄일 근거가 된다.
+
+    강수(분류)와 기온(회귀)을 나눠 보는 이유는 둘의 유의 이득이 서로
+    독립적으로 확인됐기 때문이다 — 같은 특징이 둘 다 나른다는 보장이 없다.
+    """
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    obs = np.concatenate([groups[k] for k in
+                          ("local_now", "local_tend", "nb_now", "nb_tend")], axis=1)
+    nwp = groups["nwp"]
+    tr, va = ~is_val, is_val
+
+    def score(cols):
+        """cols=None 이면 관측 특징만. (강수 AUC, 기온 MAE) 를 돌려준다."""
+        X = obs if cols is None else np.concatenate([obs, nwp[:, cols]], axis=1)
+        clf = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.1,
+                                             max_depth=6, random_state=SEED)
+        clf.fit(X[tr], y[tr])
+        auc = roc_auc_score(y[va], clf.predict_proba(X[va])[:, 1])
+        # 기온은 퍼시스턴스 잔차를 맞춘다 — 배포 모델과 같은 구조라야
+        # 여기서 잰 개선이 그쪽에서도 의미를 갖는다.
+        reg = HistGradientBoostingRegressor(loss="absolute_error", max_iter=200,
+                                            learning_rate=0.1, max_depth=6,
+                                            random_state=SEED)
+        reg.fit(X[tr], (tmp_t - tmp_n)[tr])
+        mae = float(np.abs((tmp_n[va] + reg.predict(X[va])) - tmp_t[va]).mean())
+        return auc, mae
+
+    print(f"\n{'=' * 88}\n 수치예보 14차원 절제 — 어느 특징이 신호를 나르는가\n{'=' * 88}")
+    base_auc, base_mae = score(None)
+    all_cols = list(range(nwp.shape[1]))
+    full_auc, full_mae = score(all_cols)
+    print(f"  {'구성':<22}{'강수 AUC':>11}{'ΔAUC':>9}{'기온 MAE':>11}{'ΔMAE':>9}")
+    print(f"  {'관측 특징만':<22}{base_auc:11.4f}{0.0:+9.4f}{base_mae:11.4f}{0.0:+9.4f}")
+    print(f"  {'+ 수치예보 전체(14)':<22}{full_auc:11.4f}{full_auc-base_auc:+9.4f}"
+          f"{full_mae:11.4f}{full_mae-base_mae:+9.4f}")
+
+    print(f"\n  [묶음 단독] 관측 특징 + 그 묶음만")
+    for name, cols in NWP_GROUPS.items():
+        a, m = score(cols)
+        print(f"  {name:<22}{a:11.4f}{a-base_auc:+9.4f}{m:11.4f}{m-base_mae:+9.4f}")
+
+    print(f"\n  [묶음 제거] 전체에서 그 묶음만 뺀다 — 값이 클수록 그 묶음이 필수다")
+    for name, cols in NWP_GROUPS.items():
+        rest = [c for c in all_cols if c not in cols]
+        a, m = score(rest)
+        print(f"  {name+' 제거':<22}{a:11.4f}{a-full_auc:+9.4f}{m:11.4f}{m-full_mae:+9.4f}")
+
+    print(f"\n  [단일 특징 추가] 관측 특징 + 그 한 개")
+    singles = []
+    for c in all_cols:
+        a, m = score([c])
+        singles.append((NWP_NAMES[c], a - base_auc, m - base_mae))
+    for nm, da, dm in sorted(singles, key=lambda x: -x[1]):
+        print(f"  {nm:<22}{'':>11}{da:+9.4f}{'':>11}{dm:+9.4f}")
+
+    # 최소 집합 후보 — 위 단일 기여에서 상위인 것들을 조합해, 14차원 전체의
+    # 이득을 몇 개로 회수할 수 있는지 본다. 차원을 줄이면 트렁크의 표현
+    # 예산이 덜 쪼개지므로, 같은 이득을 적은 차원으로 얻는 편이 낫다.
+    CANDIDATES = {
+        "2개 {예보기온,창합계}": [1, 7],
+        "4개 +{예보습도,예보운량}": [1, 7, 2, 3],
+        "6개 +{기압변화,예보강수}": [1, 7, 2, 3, 10, 0],
+        "8개 +{창최대,강수변화}": [1, 7, 2, 3, 10, 0, 8, 9],
+    }
+    print(f"\n  [최소 집합 후보] 14차원 전체 대비 회수율")
+    print(f"  {'구성':<26}{'강수 AUC':>11}{'회수율':>9}{'기온 MAE':>11}{'회수율':>9}")
+    for name, cols in CANDIDATES.items():
+        a, m = score(cols)
+        ra = (a - base_auc) / max(full_auc - base_auc, 1e-9)
+        rm = (base_mae - m) / max(base_mae - full_mae, 1e-9)
+        print(f"  {name:<26}{a:11.4f}{ra:9.1%}{m:11.4f}{rm:9.1%}")
 
 
 def part_intensity(groups, amt, is_val):
@@ -260,7 +360,7 @@ def main():
     timestamps, dates, hour_idx, stns, fields = load_matrices()
     nwp = load_nwp(timestamps, stns)
     print(f"\n{'=' * 88}\n NWP 예보 특징 절제 — 리드타임 +{LEAD_HOURS}h\n{'=' * 88}")
-    groups, y, amt, ds = build_features(stns, fields, nwp, hour_idx, dates)
+    groups, y, amt, tmp_t, tmp_n, ds = build_features(stns, fields, nwp, hour_idx, dates)
     print(f"  표본 {len(y):,}개 · 양성률 {y.mean():.1%} "
           f"(NWP 아카이브가 있는 구간으로 한정됨)")
 
@@ -303,6 +403,9 @@ def main():
     print(f"  +{LEAD_HOURS}h 리드의 최신 예보를 쓸 수 있으므로 위 증분은 하한이다.")
 
     part_intensity(groups, amt, is_val)
+
+    if os.getenv("NWP_ABLATE", "0") == "1":
+        part_nwp_ablation(groups, y, tmp_t, tmp_n, is_val)
 
 
 if __name__ == "__main__":
