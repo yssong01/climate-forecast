@@ -110,6 +110,13 @@ def ckpt_metrics(path):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     do_promote = "--promote" in sys.argv
+    # 검증셋이 다른 후보를 위한 경로(2026-09-07). 게이트 3 의 "기준선 불일치"
+    # FAIL 은 표본 구성이 바뀐 재학습을 **원리적으로** 막는다 — 실제로 세 번
+    # 연속 승격이 막혔다. 이 플래그를 주면 저장된 지표를 나란히 놓는 대신
+    # `rebaseline_compare.py` 로 **두 검증셋의 교집합**(어느 쪽도 학습에 쓰지
+    # 않은 표본)에서 직접 비교한다. 게이트를 끄는 것이 아니라 **더 엄격한
+    # 비교로 대체**하는 것이며, 유의한 회귀가 하나라도 있으면 FAIL 한다.
+    do_rebaseline = "--rebaseline" in sys.argv
     if not args:
         print("사용법: python promote_checkpoint.py <후보 체크포인트> [--promote]")
         sys.exit(2)
@@ -168,13 +175,28 @@ def main():
                 f"예보 시계 불일치: 현행 +{pm.get('lead_hours')}h vs "
                 f"후보 +{cm.get('lead_hours')}h — 절대 MAE 비교가 성립하지 않는다. "
                 f"다른 시계의 모델은 배포 경로를 공유하지 않는다(별도 경로로 서빙할 것)")
-        for _k, _lbl in (("temp_naive", "기온 기준선"), ("precip_naive", "강수 기준선")):
-            _a, _b = pm.get(_k), cm.get(_k)
-            if _a is not None and _b is not None and abs(_a - _b) > 1e-4:
-                failures.append(
-                    f"{_lbl}(naive MAE) 불일치: {_a:.4f} vs {_b:.4f} — "
-                    f"검증셋이 다르다는 뜻이라 성능 비교가 성립하지 않는다")
+        _mismatch = [
+            (_lbl, pm.get(_k), cm.get(_k))
+            for _k, _lbl in (("temp_naive", "기온 기준선"), ("precip_naive", "강수 기준선"))
+            if pm.get(_k) is not None and cm.get(_k) is not None
+            and abs(pm[_k] - cm[_k]) > 1e-4
+        ]
+        for _lbl, _a, _b in _mismatch:
+            msg = (f"{_lbl}(naive MAE) 불일치: {_a:.4f} vs {_b:.4f} — "
+                   f"검증셋이 다르다는 뜻이라 저장된 지표의 직접 비교가 성립하지 않는다")
+            if do_rebaseline:
+                warnings.append(msg + " (교집합 비교로 대체함)")
+            else:
+                failures.append(msg + " — --rebaseline 으로 교집합 비교를 쓸 수 있다")
+        if _mismatch and do_rebaseline:
+            out, _ = run(["rebaseline_compare.py", CHECKPOINT, cand],
+                         "게이트 3′ — 교집합 재기준선 비교(학습 누수 없음)")
+            collect(out)
 
+        if _mismatch and do_rebaseline:
+            print("  저장된 지표의 직접 비교는 생략한다 — 검증셋이 다르고, 확률 눈금이")
+            print("  이동하면 t=0.5 로 잰 F1 은 서로 다른 동작점을 뜻해 비교가 성립하지")
+            print("  않는다. 위 게이트 3′(교집합 비교)의 결과를 판단 근거로 쓴다.")
         print(f"  {'지표':<12}{'현행':>12}{'후보':>12}   판정")
         for key, label, lower_better in (("temp", "기온 MAE", True),
                                          ("precip", "강수 MAE", True),
@@ -186,8 +208,10 @@ def main():
             worse = (b > a * (1 + REGRESSION_TOL)) if lower_better \
                 else (b < a * (1 - REGRESSION_TOL))
             mark = "★악화★" if worse else "OK"
-            if worse:
+            if worse and not (_mismatch and do_rebaseline):
                 warnings.append(f"{label} 악화: {a:.4f} → {b:.4f}")
+            elif worse:
+                mark = "(비교 불가)"
             print(f"  {label:<12}{a:>12.4f}{b:>12.4f}   {mark}")
 
     # ── 판정 ──────────────────────────────────────────────────────

@@ -196,6 +196,22 @@ def main():
           + f"{'·'.join(sorted(lower_better))} 는 낮을수록, 나머지 F1 은 높을수록 후보가 우세.")
     print("표본은 두 모델 모두의 검증셋 교집합이라 어느 쪽에도 학습 누수가 없다.")
 
+    # 다른 게이트 스크립트와 같은 형식의 판정 줄을 남긴다 —
+    # promote_checkpoint.py 가 이 줄을 읽어 게이트 3 을 대체한다.
+    reg, imp = [], []
+    for k in ma:
+        if k not in mb or not boot[k]:
+            continue
+        arr = np.array(boot[k])
+        lo, hi = np.percentile(arr, [2.5, 97.5])
+        if lo <= 0 <= hi:
+            continue                                  # 유의하지 않음
+        worse = (arr.mean() > 0) if k in lower_better else (arr.mean() < 0)
+        (reg if worse else imp).append(k)
+    code = "FAIL" if reg else "PASS"
+    print(f"\nVERDICT rebaseline {code} "
+          f"regressions={','.join(reg) or '없음'} improvements={','.join(imp) or '없음'}")
+
 
 if __name__ == "__main__":
     main()

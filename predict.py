@@ -61,7 +61,12 @@ def _nwp_collector():
     넣는다"는 규약(CLAUDE.md 1절 14항)과 같은 취지다. CI 가 15분마다
     nwp_recent.json 을 갱신하므로 이 경로는 실제로 자주 바뀐다.
     """
-    from nwp_collector import ARCHIVE_PATH, RECENT_PATH
+    from nwp_collector import ARCHIVE_PATH, RECENT_PATH, serving_override
+    # 앱이 메모리로 주입한 표가 있으면 그것을 쓴다 — 배포판이 디스크 쓰기에
+    # 의존하지 않게 하기 위해서다(nwp_collector.set_serving_payload 주석 참고).
+    injected = serving_override()
+    if injected is not None:
+        return injected
     global _NWP_CACHE
     sig = tuple(os.path.getmtime(p) if os.path.exists(p) else None
                 for p in (ARCHIVE_PATH, RECENT_PATH))

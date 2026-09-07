@@ -263,22 +263,33 @@ def sync_nwp_window() -> str:
         print(f"[WARN] NWP 창 조회 실패({type(e).__name__})")
         return "kept" if os.path.exists(RECENT_PATH) else "unavailable"
 
+    # 받은 내용을 **메모리에 먼저 주입한다** — 디스크 쓰기가 실패해도 예보를
+    # 만들 수 있어야 한다. 이 축은 관측과 달리 없으면 출력 자체가 불가능한
+    # 필수 입력이라, 파일시스템 가용성에 화면 전체를 걸 수 없다.
+    try:
+        import hashlib
+        from nwp_collector import set_serving_payload
+        set_serving_payload(json.loads(payload.decode()),
+                            hashlib.sha256(payload).hexdigest())
+    except Exception as e:
+        print(f"[WARN] NWP 창 해석 실패({type(e).__name__})")
+        return "kept" if os.path.exists(RECENT_PATH) else "unavailable"
+
+    # 디스크 저장은 최선 노력이다 — CLI·진단 경로가 같은 파일을 쓰므로
+    # 남겨두면 편하지만, 실패해도 서빙에는 영향이 없다.
     try:
         os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
-        if os.path.exists(RECENT_PATH):
-            with open(RECENT_PATH, "rb") as f:
-                if f.read() == payload:
-                    return "raw"       # 내용 동일 — mtime 을 흔들지 않는다
-        # 고유 tmp + os.replace(CLAUDE.md 1절 6항) — 여러 세션이 같은
-        # 파일을 동시에 쓰면 잘린 JSON 이 남아 폴백 재료가 사라진다.
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(RECENT_PATH), suffix=".tmp")
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
-        os.replace(tmp, RECENT_PATH)
-        return "raw"
+        if not (os.path.exists(RECENT_PATH)
+                and open(RECENT_PATH, "rb").read() == payload):
+            # 고유 tmp + os.replace(CLAUDE.md 1절 6항) — 여러 세션이 같은
+            # 파일을 동시에 쓰면 잘린 JSON 이 남는다.
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(RECENT_PATH), suffix=".tmp")
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+            os.replace(tmp, RECENT_PATH)
     except Exception as e:
-        print(f"[WARN] NWP 창 저장 실패({type(e).__name__})")
-        return "kept" if os.path.exists(RECENT_PATH) else "unavailable"
+        print(f"[정보] NWP 창 디스크 저장 생략({type(e).__name__}) — 메모리 표로 서빙한다")
+    return "raw"
 
 
 def load_merged_history() -> tuple[dict, str]:

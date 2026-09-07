@@ -72,17 +72,20 @@ class NWPForecastCollector:
             if not os.path.exists(p):
                 continue
             with open(p, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            for stn, rows in raw.items():
-                dst = self.table.setdefault(str(stn), {})
-                for ts, vals in rows.items():
-                    dst[ts] = np.asarray(vals, dtype=np.float32)
+                self.merge_raw(json.load(f))
             loaded.append(p)
         if required and not self.table:
             raise FileNotFoundError(
                 f"NWP 아카이브가 없다({', '.join(paths)}) — "
                 f"`python collect_nwp_archive.py --backfill` 을 먼저 실행할 것.")
         self.sources = loaded
+
+    def merge_raw(self, raw: dict) -> None:
+        """`{관측소: {시각: [값...]}}` 를 표에 합친다(나중 것이 이긴다)."""
+        for stn, rows in raw.items():
+            dst = self.table.setdefault(str(stn), {})
+            for ts, vals in rows.items():
+                dst[ts] = np.asarray(vals, dtype=np.float32)
 
     def coverage(self) -> str:
         if not self.table:
@@ -181,6 +184,29 @@ def shared(paths=(ARCHIVE_PATH,)) -> "NWPForecastCollector":
     if key not in _SHARED:
         _SHARED[key] = NWPForecastCollector(paths=paths)
     return _SHARED[key]
+
+
+# ── 메모리 주입 경로 ────────────────────────────────────────────
+# 배포 앱은 파일시스템 쓰기에 의존하면 안 된다(2026-09-07). Streamlit Cloud
+# 의 파일시스템은 휘발성이고, 쓰기가 실패하면 예보를 아예 못 만들어 화면이
+# 통째로 멈춘다 — 관측 자료는 폴백이 있지만 이 축은 없으면 출력이 불가능한
+# 필수 입력이라 실패 비용이 훨씬 크다. 그래서 앱은 내려받은 내용을 그대로
+# 메모리에 주입하고, 디스크 저장은 최선 노력(best effort)으로만 한다.
+_SERVING = {"id": None, "collector": None}
+
+
+def set_serving_payload(raw: dict, payload_id: str) -> None:
+    """서빙용 표를 메모리로 주입한다. `payload_id` 가 같으면 재구성하지 않는다."""
+    if _SERVING["id"] == payload_id and _SERVING["collector"] is not None:
+        return
+    c = NWPForecastCollector(paths=(), required=False)
+    c.merge_raw(raw)
+    _SERVING.update(id=payload_id, collector=c)
+
+
+def serving_override():
+    """주입된 표가 있으면 돌려준다 — 없으면 None(디스크 경로를 쓴다)."""
+    return _SERVING["collector"]
 
 
 def load_for_serving() -> "NWPForecastCollector":
