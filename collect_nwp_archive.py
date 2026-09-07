@@ -147,7 +147,43 @@ def incremental(days=RECENT_DAYS):
     _save(RECENT_PATH, recent)
     n = min(len(v) for v in recent.values())
     print(f"  갱신 완료 — 관측소당 최소 {n:,}시각, 배포 창 {RECENT_PATH}")
+    _freshness_gate(recent)
     return recent
+
+
+# 서빙이 필요로 하는 미래 유효시각 여유(시간). 최장 리드타임(+12h)에 타이밍
+# 완충용 ±1h 를 더한 값보다 넉넉해야 한다.
+MIN_FUTURE_HOURS = 15
+
+
+def _freshness_gate(recent: dict) -> None:
+    """미래 예보가 모자라면 CI 를 빨간불로 만든다(2026-09-07 추가).
+
+    왜 필요한가 — 관측 창에는 최신성 게이트가 있는데(`refresh_deploy_data.py`)
+    수치예보 창에는 없었다. 그래서 Open-Meteo 가 막히거나 응답 형식이 바뀌면
+    **워크플로는 계속 초록불인데 배포 화면만 조용히 묵은 예보로 굴러간다.**
+    앱이 경고 배너를 띄우긴 하지만, "경고 배너가 떠 있다는 사실과 표시된
+    숫자가 맞다는 사실은 별개"라는 것이 이 저장소가 2026-08-19 에 얻은
+    교훈이다(CLAUDE.md 4절).
+
+    관측과 달리 이 축은 **미래 시각**이 있어야 쓸모가 있다 — 과거만 가득한
+    창은 파일 크기가 정상이어도 예보를 만들지 못한다. 그래서 '얼마나 최신인가'
+    가 아니라 '현재 이후 몇 시간이 채워져 있는가'로 잰다.
+    """
+    from datetime import datetime
+    now = datetime.now().strftime("%Y%m%d%H%M")
+    worst_stn, worst_n = None, None
+    for stn, rows in recent.items():
+        n_future = sum(1 for ts in rows if ts > now)
+        if worst_n is None or n_future < worst_n:
+            worst_stn, worst_n = stn, n_future
+    print(f"  미래 예보 여유 — 최소 관측소({worst_stn}) {worst_n}시각 "
+          f"(필요 {MIN_FUTURE_HOURS}시각)")
+    if worst_n is not None and worst_n < MIN_FUTURE_HOURS:
+        print(f"::error::수치예보 최신성 게이트 실패 — 관측소 {worst_stn} 의 "
+              f"미래 예보가 {worst_n}시각뿐입니다(필요 {MIN_FUTURE_HOURS}시각). "
+              f"이대로면 배포 화면이 묵은 예보로 굴러가거나 출력을 내지 못합니다.")
+        raise SystemExit(1)
 
 
 def _save(path, obj):

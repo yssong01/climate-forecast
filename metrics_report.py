@@ -384,10 +384,10 @@ def main():
     print(f"저장: {OUT_JSON}")
 
     if args.patch_checkpoint:
-        _patch_checkpoint(args.ckpt, acc)
+        _patch_checkpoint(args.ckpt, acc, pre)
 
 
-def _patch_checkpoint(path: str, acc: dict) -> None:
+def _patch_checkpoint(path: str, acc: dict, pre: dict = None) -> None:
     """서빙 기준 강수 오차 두 개를 체크포인트에 적어 넣는다(2026-09-06).
 
     왜 필요한가 — '출력값 추이' 탭이 강수 출력값 옆에 붙이던 `±` 는
@@ -411,6 +411,20 @@ def _patch_checkpoint(path: str, acc: dict) -> None:
     ck["val_precip_mae_served"] = acc["precip_mae_served"]
     ck["val_precip_mae_wet"] = acc["precip_mae_wet"]
     ck["val_precip_baseline_mae_wet"] = acc["precip_baseline_mae_wet"]
+    if pre:
+        # 서빙 판정선 기준 극한기상 지표(2026-09-07 추가). 체크포인트의
+        # `extreme_metrics` 는 학습이 t=0.5 로 잰 값이라 서빙과 다른 동작점을
+        # 가리킨다 — 확률 눈금이 이동한 모델에서는 그 차이가 커진다(수치예보
+        # 모델에서 한파 F1 0.209 vs 0.552). 화면이 서빙과 같은 값을 보이도록
+        # 별도 키로 남긴다. `extreme_metrics` 는 학습 시점 기록으로 그대로 둔다.
+        ck["extreme_metrics_served"] = {
+            k: {"threshold": v["served"]["threshold"],
+                "precision": v["served"]["precision"],
+                "recall": v["served"]["recall"],
+                "f1": v["served"]["f1"],
+                "n_pos": v["n_pos"], "n": v["n"]}
+            for k, v in pre.items()
+        }
     torch.save(ck, path)
     print(f"체크포인트 갱신: {path} — 서빙 MAE {acc['precip_mae_served']:.4f} · "
           f"강수구간 조건부 MAE {acc['precip_mae_wet']:.4f}")
