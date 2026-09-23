@@ -356,7 +356,9 @@ def main():
        · 확률 보정 표(ECE)
        · 관측소별 성능 캡션(플롯이 바뀌었으므로 서술도 바뀐다)
        · 임계값·예외에 관한 설명
-  4. 탭 스크린샷(docs/images/tab-*.png)을 다시 찍는다.
+  4. 탭 스크린샷을 다시 찍는다: python capture_tab_screenshots.py
+     (로컬 docker 필요. 화면 문구·지표를 고쳤을 때도 함께 돌릴 것 —
+      README 와 발표 자료가 이 네 장을 싣고 있다.)
   5. CI(test_phase34.py · test_phase36.py)를 돌린다.
   6. 배포 후, import 모듈(predict.py·pipeline_model.py)의 시그니처가 바뀌었다면
      Streamlit Cloud 에서 앱을 재시작한다(모듈 캐시 때문에 재배포만으로는
