@@ -1361,11 +1361,15 @@ with tab_trend:
             + _txt
             + ". '성능 검증' 탭 수치는 +6시간 기준이다."
         )
-        # 승격 게이트 판정은 체크포인트에서 읽는다(2026-09-23 전환).
-        # 종전에는 스크립트가 표준출력으로만 남겨 화면이 상수로 적고 있었고,
-        # 승격할 때 사람이 고치지 않으면 이전 세대 판정을 현재인 양 보여줬다.
-        # `promote_checkpoint.py` 가 승격 직후 `promotion_gates` 로 적는다.
-        st.caption(promotion_gate_summary(ckpt, ckpt_12h))
+    # 승격 게이트 판정은 체크포인트에서 읽는다(2026-09-23 전환).
+    # 종전에는 스크립트가 표준출력으로만 남겨 화면이 상수로 적고 있었고,
+    # 승격할 때 사람이 고치지 않으면 이전 세대 판정을 현재인 양 보여줬다.
+    # `promote_checkpoint.py` 가 승격 직후 `promotion_gates` 로 적는다.
+    #
+    # **위 `if result_12h is not None:` 블록 밖에 둔다.** 이 판정은 +6h(배포
+    # 필수 경로)에도 해당하므로, +12h 를 못 불러왔다고 해서 함께 사라지면
+    # 안 된다 — 한 번 안쪽에 두었다가 이 점을 놓쳤다.
+    st.caption(promotion_gate_summary(ckpt, ckpt_12h))
 
     history, history_source = load_merged_history()
     series = recent_series(history, stn, hours=72)

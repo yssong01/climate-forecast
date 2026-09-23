@@ -154,6 +154,8 @@ def main():
             run(["git", "checkout", "--", ACCURACY_LOG])
             print(f"복원: {ACCURACY_LOG} (로컬 실행이 덮어썼다)")
 
+    shutil.rmtree(tmp, ignore_errors=True)   # 임시 디렉터리를 남기지 않는다
+
     missing = [t for t in TABS if not os.path.exists(f"{OUT_DIR}/{t}.png")]
     if missing:
         print("생성되지 않은 파일:", ", ".join(missing))
