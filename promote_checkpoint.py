@@ -115,6 +115,28 @@ def ckpt_metrics(path):
     }
 
 
+def _record_gates(path, records):
+    """게이트 판정을 체크포인트의 `promotion_gates` 에 적는다.
+
+    화면이 "이 배포본이 어떤 판정으로 통과했는가"를 조회할 수 있게 하는 것이
+    목적이다. 판정 시점도 함께 남긴다 — 값만 있고 언제 잰 것인지 없으면
+    다음 세대에서 또 "현재 값인가?"를 묻게 된다.
+    """
+    if not records:
+        print("\n(게이트 판정 기록 없음 — 체크포인트에 적지 않는다)")
+        return
+    import torch
+    ck = torch.load(path, map_location="cpu", weights_only=True)
+    ck["promotion_gates"] = {
+        "checked_at": time.strftime("%Y-%m-%d"),
+        "results": records,
+    }
+    torch.save(ck, path)
+    print(f"\n게이트 판정 기록: {path}")
+    for name, r in records.items():
+        print(f"  {name}: {r['verdict']} {r['detail']}")
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     do_promote = "--promote" in sys.argv
@@ -265,6 +287,11 @@ def main():
         print(f"\n현행 백업: {backup}")
         shutil.copy2(cand, CHECKPOINT)
         print(f"배포 경로 교체 완료: {CHECKPOINT}")
+
+    # ── 게이트 판정을 체크포인트에 남긴다 ─────────────────────────
+    # 승격 직후, 후속 재적합보다 **먼저** 쓴다 — 뒤 단계가 실패해도 "어떤
+    # 판정으로 배포됐는가"는 남아야 한다.
+    _record_gates(CHECKPOINT, gate_records)
 
     # ── 후속 자동 수행 ────────────────────────────────────────────
     # 자식에게 배포 경로를 **명시적으로** 넘긴다. 인자를 생략하면 자식이

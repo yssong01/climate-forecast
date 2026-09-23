@@ -25,6 +25,9 @@ sklearn을 쓰지 않는 이유 — 배포(Streamlit Cloud)는 `requirements.txt
 
 실행: python probability_calibration_fit.py [체크포인트] [--apply]
       --apply 없이 실행하면 측정만 하고 체크포인트를 건드리지 않는다.
+      --patch-metrics 는 곡선·판정선은 그대로 두고 화면이 읽는 평가용
+      지표(ECE·F1)만 기존 항목에 적어 넣는다. 재계산 결과가 저장값과
+      다르면 아무것도 쓰지 않고 실패한다.
 """
 import os
 import shutil
@@ -244,6 +247,8 @@ def load_probs(ckpt_path):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     do_apply = "--apply" in sys.argv
+    # 곡선은 건드리지 않고 화면용 지표만 채우는 경로(2026-09-23).
+    do_patch_metrics = "--patch-metrics" in sys.argv
     ckpt_path = args[0] if args else CHECKPOINT
 
     heads, ckpt = load_probs(ckpt_path)
@@ -328,7 +333,25 @@ def main():
                       "threshold_raw": t_raw,
                       "threshold_calibrated": w["t_cal"],
                       "threshold_decision": w["t_decision"],
-                      "threshold_repicked": bool(w["repick"])}
+                      "threshold_repicked": bool(w["repick"]),
+                      # 화면('성능 검증' 탭 ECE 표)이 읽는 값(2026-09-23 추가).
+                      # 종전에는 이 표가 app.py 에 상수로 박혀 있어 승격할
+                      # 때마다 사람이 이 스크립트의 요약을 손으로 옮겨 적어야
+                      # 했다 — 옮기지 않으면 화면만 이전 세대 값으로 남는다.
+                      # 전부 **평가용 절반**에서 잰 값이다(곡선 적합에 쓰지
+                      # 않은 표본이라 배포 판정의 근거가 되는 쪽).
+                      "eval_metrics": {
+                          "n_eval": int(len(pe)),
+                          "ece_before": float(e0), "ece_after": float(w["e1"]),
+                          "mce_before": float(m0), "mce_after": float(w["m1"]),
+                          # F1 세 지점: 원본 임계값 / 그 값을 곡선으로 옮긴
+                          # 임계값 / 실제 서빙 판정선. 화면이 보여야 하는
+                          # 것은 마지막 둘의 차이(= 재선정 이득)다.
+                          "f1_raw": float(f_raw),
+                          "f1_calibrated": float(w["f_cal"]),
+                          "f1_decision": float(w["f_pick"] if w["repick"]
+                                               else w["f_cal"]),
+                      }}
             if winner == "isotonic":
                 entry["x"] = [float(v) for v in xs]
                 entry["y"] = [float(v) for v in ys]
@@ -346,6 +369,58 @@ def main():
     for (key, method, e0, e1, f0, f1, _, adopt) in summary:
         print(f"  {ko[key]:<8}{method:<10}{e0:>10.4f}{e1:>10.4f}{f0:>10.4f}{f1:>10.4f}  "
               f"{'채택' if adopt else '기각'}")
+
+    if do_patch_metrics:
+        # 곡선·판정선은 **그대로 두고** 평가용 지표만 기존 항목에 적어 넣는다.
+        #
+        # 왜 별도 경로인가(2026-09-23) — 이미 배포된 체크포인트에 화면용 지표만
+        # 채우고 싶은데, `--apply` 는 곡선과 판정선까지 새로 쓴다. 같은 시드로
+        # 재적합하면 같은 값이 나와야 하지만, 그 "나와야 한다"를 확인도 없이
+        # 배포본에 덮어쓰는 것은 이 저장소가 반복해 겪은 사고 유형이다.
+        # 여기서는 재계산 결과가 저장값과 **같은지 확인만** 하고, 다르면
+        # 아무것도 쓰지 않고 실패로 끝낸다 — 다르다는 것 자체가 신호다.
+        stored = (ckpt.get("prob_calibration") or {}).get("heads") or {}
+        if not stored:
+            print("\n체크포인트에 prob_calibration 이 없다 — --apply 로 먼저 적합할 것.")
+            return 1
+        mismatched = []
+        for key, entry in calib_maps.items():
+            old_e = stored.get(key)
+            if old_e is None:
+                mismatched.append(f"{ko[key]}: 저장된 항목이 없는데 이번엔 채택됐다")
+                continue
+            if old_e.get("method") != entry["method"]:
+                mismatched.append(
+                    f"{ko[key]}: 보정 방법 불일치(저장 {old_e.get('method')} "
+                    f"vs 재계산 {entry['method']})")
+            if abs(float(old_e.get("threshold_decision", -1))
+                   - float(entry["threshold_decision"])) > 1e-6:
+                mismatched.append(
+                    f"{ko[key]}: 판정선 불일치(저장 "
+                    f"{old_e.get('threshold_decision')} vs 재계산 "
+                    f"{entry['threshold_decision']})")
+        for key in stored:
+            if key not in calib_maps:
+                mismatched.append(f"{ko.get(key, key)}: 저장돼 있으나 이번엔 기각됐다")
+        if mismatched:
+            print("\n재계산 결과가 저장값과 다르다 — 지표를 적지 않는다:")
+            for m in mismatched:
+                print("  ·", m)
+            print("  (같은 시드로 같은 값이 나와야 한다. 데이터나 코드가 바뀌었는지 확인할 것)")
+            return 1
+
+        for key, entry in calib_maps.items():
+            stored[key]["eval_metrics"] = entry["eval_metrics"]
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(ckpt_path) or ".", suffix=".pt")
+        os.close(fd)
+        torch.save(ckpt, tmp)
+        os.replace(tmp, ckpt_path)
+        print(f"\n평가용 지표만 기록(곡선·판정선 불변): {ckpt_path}")
+        for key in calib_maps:
+            m = calib_maps[key]["eval_metrics"]
+            print(f"  {ko[key]}: ECE {m['ece_before']:.4f}→{m['ece_after']:.4f} · "
+                  f"F1 {m['f1_calibrated']:.4f}→{m['f1_decision']:.4f}")
+        return 0
 
     if not do_apply:
         print("\n(--apply 를 주지 않아 체크포인트는 그대로 둔다)")

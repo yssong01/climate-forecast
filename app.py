@@ -559,6 +559,31 @@ def extreme_metrics_of(ckpt: dict) -> tuple[dict, bool]:
     return (ckpt.get("extreme_metrics") or {}), False
 
 
+def promotion_gate_summary(ckpt: dict, ckpt_12h: dict | None) -> str:
+    """승격 게이트 판정을 체크포인트에서 읽어 한 문장으로 만든다.
+
+    `promote_checkpoint.py` 가 승격 직후 `promotion_gates` 에 적는다.
+    기록이 없는(그 기능 이전에 승격된) 체크포인트에서는 **수치를 지어내지
+    않고** 없다는 사실과 이전 기록을 시점과 함께 밝힌다 — 근거 없는 숫자를
+    현재 값인 양 적는 것이 이 캡션이 실제로 겪은 사고다(2026-09-23).
+    """
+    def _fmt(ck, label):
+        g = (ck or {}).get("promotion_gates") or {}
+        res = g.get("results") or {}
+        if not res:
+            return None
+        parts = [f"{name} {r['verdict']}" for name, r in sorted(res.items())]
+        return f"{label}({g.get('checked_at', '시점 미상')} 판정) " + " · ".join(parts)
+
+    got = [t for t in (_fmt(ckpt, "+6시간"), _fmt(ckpt_12h, "+12시간")) if t]
+    if not got:
+        return ("참고 — 2026-09-07 승격 당시 게이트 기록: 계절 오탐은 두 모델 모두 "
+                "0.00%, 단조성은 각각 12/12 정상이었다. 이 두 체크포인트는 게이트 "
+                "판정을 저장하기 이전에 승격돼 화면이 현재 값을 조회하지 못한다 — "
+                "다음 승격부터 `promote_checkpoint.py` 가 기록한다.")
+    return "승격 게이트 판정 — " + " / ".join(got)
+
+
 STATION_CALIB_JSON = "./docs/calibration_plot.json"
 
 
@@ -1318,14 +1343,11 @@ with tab_trend:
             + _txt
             + ". '성능 검증' 탭 수치는 +6시간 기준이다."
         )
-        # 승격 게이트 결과는 체크포인트에 기록되지 않는다 — 스크립트가
-        # 표준출력으로만 남기므로 화면이 조회할 근거가 없다. 그래서 "현재
-        # 값"이라 말하지 않고 **언제 잰 것인지**를 밝혀 적는다(2026-09-23).
-        st.caption(
-            "참고 — 2026-09-07 승격 당시 게이트 기록: 계절 오탐은 두 모델 모두 "
-            "0.00%, 단조성은 각각 12/12 정상이었다. 이 두 항목은 체크포인트에 "
-            "저장되지 않아 화면이 현재 값을 다시 조회하지 못한다."
-        )
+        # 승격 게이트 판정은 체크포인트에서 읽는다(2026-09-23 전환).
+        # 종전에는 스크립트가 표준출력으로만 남겨 화면이 상수로 적고 있었고,
+        # 승격할 때 사람이 고치지 않으면 이전 세대 판정을 현재인 양 보여줬다.
+        # `promote_checkpoint.py` 가 승격 직후 `promotion_gates` 로 적는다.
+        st.caption(promotion_gate_summary(ckpt, ckpt_12h))
 
     history, history_source = load_merged_history()
     series = recent_series(history, stn, hours=72)
@@ -2089,45 +2111,77 @@ with tab_perf:
             "강수 행이 없는 것도 같은 이유다. 폭염·한파·황사 확률만 보정을 "
             "거친 값이다."
         )
+        # 수치는 아래 표와 **같은 출처**(체크포인트의 eval_metrics)에서 읽는다 —
+        # 따로 적어두면 같은 값이 두 문단에서 달라진다(2026-09-23에 실제로
+        # 한파가 문장 0.2106 vs 표 0.1838 로 갈렸다. 전자는 원본 임계값의 F1,
+        # 후자는 그 값을 곡선으로 옮긴 판정선의 F1이라 둘 다 맞지만, 한 화면에
+        # 설명 없이 놓이면 어느 쪽이 무엇인지 알 수 없다).
+        def _repick_gain(_k):
+            _h = _cal.get(_k) or {}
+            _m = _h.get("eval_metrics")
+            if not _m or not _h.get("threshold_repicked"):
+                return None
+            return f"{_m['f1_calibrated']:.4f}→{_m['f1_decision']:.4f}"
+
+        _gains = [f"{_ko} {_g}" for _k, _ko in (("heatwave", "폭염"),
+                                                ("coldwave", "한파"))
+                  for _g in [_repick_gain(_k)] if _g]
         st.caption(
             "등온 회귀는 단조 증가지만 순증가는 아니다 — 결과가 계단 모양이라 "
             "평탄 구간에서 서로 다른 확률이 같은 값으로 접힌다. 따라서 원본 "
             "임계값을 곡선으로 옮기는 것만으로는 판정이 보존되지 않는다. 베타 "
             "보정은 매끄러운 순증가 함수라 이 문제가 구조적으로 없다. 어느 "
-            "쪽이든 **판정선은 보정 공간에서 다시 고른다** — 현재 배포본은 "
-            "폭염 0.402, 한파 0.330이며, 재선정으로 폭염 F1이 0.7471→0.7978, "
-            "한파가 0.2106→0.5390이 됐다. 재선정도 고르는 표본과 채점하는 "
-            "표본을 분리한다."
+            "쪽이든 **판정선은 보정 공간에서 다시 고른다** — 현재 배포본은 폭염 "
+            f"{event_threshold('heatwave', stn, ckpt):.3f}, 한파 "
+            f"{event_threshold('coldwave', stn, ckpt):.3f}다."
+            + (f" 재선정으로 평가용 F1이 {' · '.join(_gains)}로 올랐다."
+               if _gains else "")
+            + " 재선정도 고르는 표본과 채점하는 표본을 분리한다."
         )
         # 보정 전 열은 검증셋 전체(probability_calibration_check.py), 보정 후 열과
         # F1 은 평가용 절반(probability_calibration_fit.py)에서 잰 값이다. 두 열의
         # 표본이 다르므로 그 사실을 캡션에 밝힌다 — 밝히지 않으면 README 와
         # 소수점 셋째 자리가 어긋나 보인다(2026-08-17에 실제로 폭염이 0.0338/0.0340
         # 으로 갈렸다. 헤드마다 다른 표본을 섞어 적은 것이 원인이었다).
-        _rows = ["| 사건 | 보정 전 ECE | 보정 후 ECE | F1 변화 |", "|---|---|---|---|"]
-        for _k, _ko, _e0, _e1, _f in (
-            # 승격할 때마다 사람이 갱신해야 하는 값이다 —
-            # `probability_calibration_fit.py`(--apply 없이 실행)의 요약표에서
-            # 그대로 옮긴다. 2026-09-07 수치예보 모델 승격 후 재측정본.
-            # F1 은 **보정 공간에서 재선정한 판정선** 기준이다(폭염 t=0.402,
-            # 한파 t=0.330) — 이 모델은 손실 구성이 바뀌어 확률 눈금이
-            # 이동했으므로, t=0.5 로 잰 값을 적으면 서빙과 다른 동작점을
-            # 보여주게 된다.
-            ("heatwave", "🔥 폭염", 0.0524, 0.0022, "0.7471 → 0.7978"),
-            ("coldwave", "🥶 한파", 0.1275, 0.0010, "0.2106 → 0.5390"),
-        ):
-            if _k in _cal:
-                _rows.append(f"| {_ko} | {_e0:.4f} | **{_e1:.4f}** | {_f} |")
+        # 이 표는 **체크포인트에서 읽는다**(2026-09-23 전환). 종전에는 승격할
+        # 때마다 사람이 `probability_calibration_fit.py` 의 요약표를 손으로
+        # 옮겨 적어야 했고, 옮기지 않으면 화면만 이전 세대 값으로 남았다 —
+        # 이 저장소가 반복해 겪은 사고 유형이다. 이제 그 스크립트가
+        # `eval_metrics` 로 적어 넣고 화면은 조회만 한다.
+        _rows = ["| 사건 | 보정 전 ECE | 보정 후 ECE | F1 (판정선 이동 → 재선정) |",
+                 "|---|---|---|---|"]
+        _missing = []
+        for _k, _ko in (("heatwave", "🔥 폭염"), ("coldwave", "🥶 한파")):
+            _h = _cal.get(_k)
+            if not _h:
+                continue
+            _m = _h.get("eval_metrics")
+            if not _m:
+                _missing.append(_ko)
+                continue
+            _f1 = (f"{_m['f1_calibrated']:.4f} → **{_m['f1_decision']:.4f}**"
+                   if _h.get("threshold_repicked")
+                   else f"{_m['f1_calibrated']:.4f}(재선정 없음)")
+            _rows.append(f"| {_ko} | {_m['ece_before']:.4f} | "
+                         f"**{_m['ece_after']:.4f}** | {_f1} |")
         # 헤더 2줄만 남으면(폭염·한파 곡선이 둘 다 없는 체크포인트) 빈 표가
         # 렌더되므로 아예 그리지 않는다.
         if len(_rows) > 2:
             st.markdown("\n".join(_rows))
+        if _missing:
+            # 근거가 없으면 수치를 지어내지 않는다 — 무엇이 없는지만 말한다.
+            st.caption(
+                f"{'·'.join(_missing)}의 보정 지표가 체크포인트에 기록돼 있지 "
+                "않다 — `probability_calibration_fit.py <체크포인트> "
+                "--patch-metrics` 로 채운다(곡선·판정선은 건드리지 않는다)."
+            )
         st.caption(
             "ECE(Expected Calibration Error)는 구간별 '표시 확률 − 실제 빈도'의 "
             "차이를 표본 수로 가중평균한 값이다. 0에 가까울수록 "
-            "표시값을 그대로 신뢰할 수 있다. 보정 전 열은 검증셋 전체에서, 보정 후 "
-            "열과 F1은 곡선 적합에 쓰지 않은 평가용 절반에서 측정했다 — 표본이 "
-            "달라 소수점 셋째 자리에서 차이가 날 수 있다."
+            "표시값을 그대로 신뢰할 수 있다. 네 열 모두 곡선 적합에 쓰지 않은 "
+            "**평가용 절반**에서 측정했다. F1 열은 '원본 임계값을 곡선으로 옮긴 "
+            "판정선'과 '보정 공간에서 다시 고른 판정선'의 차이다 — 보정 자체는 "
+            "단조 변환이라 F1을 거의 바꾸지 않고, 실제 이득은 재선정에서 나온다."
         )
         _cal_png = "./docs/images/probability_calibration.png"
         if os.path.exists(_cal_png):
