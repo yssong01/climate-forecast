@@ -79,6 +79,9 @@ DIAGNOSTIC_MODULES = [
     "promote_checkpoint", "head_decouple_finetune", "coldwave_nested_pretrain",
     "nwp_collector", "collect_nwp_archive", "aerosol_feature_probe",
     "collect_aerosol_archive",
+    # CI(refresh-data.yml)가 15분마다 호출한다 — 임포트가 깨지면 적중률
+    # 기록이 통째로 멈춘다(2026-09-23 추가).
+    "record_online_forecasts",
 ]
 
 

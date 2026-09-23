@@ -101,6 +101,18 @@ RAW_NWP_URL = (
     "cache/nwp_recent.json"
 )
 
+# 적중률 로그도 같은 브랜치에서 읽는다(2026-09-23 수정).
+#
+# `refresh-data.yml` 은 2026-08-20부터 이 파일을 **data 브랜치**에 커밋하는데,
+# 앱은 계속 `main` 스냅숏(배포 시점에 굳은 사본)을 읽고 있었다. 그래서 CI 가
+# 대기 항목을 실측과 대조해 채워 넣어도 화면에는 영영 반영되지 않았고, 두
+# 사본이 갈라졌다(점검 시점 main 70건·최종 2026-08-31 / data 67건·최종
+# 2026-08-19). 관측 창·사용량 로그가 이미 이 경로를 쓰는 것과 같은 이유다.
+RAW_ACCURACY_URL = (
+    "https://raw.githubusercontent.com/yssong01/climate-forecast/data/"
+    "cache/accuracy_log.json"
+)
+
 st.set_page_config(
     page_title="Tri-CHEF 기후 모델 출력값",
     page_icon="🌦️",
@@ -112,8 +124,8 @@ st.set_page_config(
 
 def ckpt_fingerprint(path: str = CHECKPOINT) -> str:
     """
-    체크포인트 파일의 신원(수정시각·크기). 캐시 키에 넣어 파일이 바뀌면
-    자동으로 새로 로드되게 한다.
+    체크포인트의 신원. 캐시 키에 넣어 파일이 바뀌면 자동으로 새로 로드되게
+    하고, 적중률 로그의 `model_id` 로도 쓴다.
 
     왜 필요한가 — get_model() 을 인수 없이 @st.cache_resource 로 감싸면
     캐시 키가 항상 같아서, 체크포인트를 새로 학습해 배포해도 살아 있는
@@ -122,12 +134,12 @@ def ckpt_fingerprint(path: str = CHECKPOINT) -> str:
     수치(기온 1.27 / 폭염 F1 0.822)를 그대로 보여줬고, 기준선 증감도
     "저장돼 있지 않다"로 표시됐다. cache_resource 는 스크립트 재실행은
     물론 코드 갱신 후에도 같은 프로세스면 살아남기 때문이다.
+
+    구현은 `accuracy.model_fingerprint()` 하나만 쓴다(2026-09-23) — 종전에는
+    같은 규칙(`mtime_ns:size`)을 두 곳에 각각 적어두고 있었고, 그 규칙 자체가
+    **재배포마다 값이 바뀌는** 결함이 있었다(그 함수의 docstring 참고).
     """
-    try:
-        st_ = os.stat(path)
-        return f"{st_.st_mtime_ns}:{st_.st_size}"
-    except OSError:
-        return "missing"
+    return accuracy.model_fingerprint(path)
 
 
 @st.cache_resource(show_spinner="모델 로드 중...")
@@ -374,6 +386,42 @@ def observed_age_hours(observed_at) -> float | None:
 
 
 @st.cache_resource(show_spinner=False)
+def sync_accuracy_log() -> str:
+    """data 브랜치의 적중률 로그를 로컬 경로로 내려받는다.
+
+    **프로세스당 한 번만** 수행한다(`cache_resource`). 관측 창처럼 5분마다
+    다시 받으면, 이 프로세스가 실행 중에 추가한 항목을 매번 덮어써 지운다 —
+    그 항목들은 어차피 휘발성이지만(컨테이너 파일시스템), 화면이 "실행 중
+    추가 N건"을 세는 근거가 사라진다. 시작 시점에 저장소 상태를 한 번
+    맞춰 놓는 것으로 충분하다: 이 로그는 CI 가 15분 주기로 천천히 갱신한다.
+
+    반환값은 상태 문자열이다("raw" / "local") — 화면이 출처를 밝힐 수 있게.
+    """
+    try:
+        resp = requests.get(RAW_ACCURACY_URL, timeout=8)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        entries = resp.json()
+        if not isinstance(entries, list):
+            raise ValueError("목록이 아니다")
+    except Exception as e:
+        print(f"[WARN] 적중률 로그 조회 실패({type(e).__name__}) — 로컬 사본 사용")
+        return "local"
+    try:
+        os.makedirs(os.path.dirname(accuracy.LOG_PATH), exist_ok=True)
+        # 고유 tmp + os.replace(CLAUDE.md 1절 6항).
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(accuracy.LOG_PATH),
+                                   suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False)
+        os.replace(tmp, accuracy.LOG_PATH)
+    except Exception as e:
+        print(f"[정보] 적중률 로그 저장 생략({type(e).__name__}) — 로컬 사본 사용")
+        return "local"
+    return "raw"
+
+
+@st.cache_resource(show_spinner=False)
 def accuracy_baseline() -> dict:
     """
     이 프로세스가 뜬 시점의 적중률 로그 상태 = 저장소에 커밋된 스냅샷.
@@ -509,6 +557,92 @@ def extreme_metrics_of(ckpt: dict) -> tuple[dict, bool]:
     if served:
         return served, True
     return (ckpt.get("extreme_metrics") or {}), False
+
+
+STATION_CALIB_JSON = "./docs/calibration_plot.json"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_station_calibration(mtime: float) -> dict | None:
+    """`calibration_plot_diagnose.py` 가 남긴 관측소별 채점 결과.
+
+    `mtime` 은 캐시 무효화 전용이다 — 파일이 바뀌면 다시 읽는다
+    (CLAUDE.md 1절 14항: 결과를 바꾸는 것은 캐시 키에 넣는다).
+    """
+    try:
+        with open(STATION_CALIB_JSON, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def station_calibration(ckpt: dict) -> str | None:
+    """관측소별 플롯을 설명하는 문장을 **측정값에서** 만든다.
+
+    왜 파일을 읽는가(2026-09-23) — 종전에는 이 문장이 `app.py` 에 그대로
+    적혀 있었고, 그 수치는 사람이 진단 스크립트의 표준출력 표에서 손으로
+    옮겨 적은 것이었다. 모델을 교체해도 문장은 따라오지 않아, 배포된 화면이
+    **이전 세대 값**을 현행인 양 설명하고 있었다(부산 폭염 "재현율 63.4%·
+    정밀도 54.0%" — 실제로는 69.1%·40.8%). 전사 고리를 없앤다.
+
+    근거 파일이 현행 배포본으로 잰 것인지도 확인한다. 검증셋이 같은지는
+    퍼시스턴스 기준선(`val_temp_naive_mae`)으로 대조한다 — 진단 경로가
+    이미 쓰는 방식과 같다(`eval_cache._assert_split_matches_checkpoint`).
+    어긋나면 문장을 만들지 않는다: 근거 없는 수치를 적느니 비워 두는 편이
+    낫다는 것이 이 저장소가 반복해 확인한 결론이다.
+    """
+    try:
+        _mtime = os.path.getmtime(STATION_CALIB_JSON)
+    except OSError:
+        return None
+    data = _load_station_calibration(_mtime)
+    if not data or not data.get("stations"):
+        return None
+    _want = ckpt.get("val_temp_naive_mae")
+    _got = (data.get("checkpoint") or {}).get("val_temp_naive_mae")
+    if _want is not None and _got is not None and abs(_want - _got) > 1e-4:
+        return None
+    if (data.get("checkpoint") or {}).get("lead_hours") != ckpt.get("lead_hours"):
+        return None
+
+    def _f1(r):
+        p, c = r["precision"], r["recall"]
+        return 2 * p * c / (p + c) if p + c else 0.0
+
+    parts = []
+    heat = data["stations"].get("heatwave") or []
+    if heat:
+        worst = min(heat, key=_f1)
+        rest = [r for r in heat if r["code"] != worst["code"]]
+        _lo = min(r["precision"] for r in rest) if rest else None
+        _hi = max(r["precision"] for r in rest) if rest else None
+        parts.append(
+            f"폭염은 {worst['station']}({worst['code']})이 가장 낮다 — 재현율 "
+            f"{worst['recall']:.1%}·정밀도 {worst['precision']:.1%}(사건 "
+            f"{worst['n_events_pos']}건)."
+            + (f" 나머지 11곳의 정밀도는 {_lo:.1%}~{_hi:.1%} 구간이다." if rest else "")
+        )
+    cold = data["stations"].get("coldwave") or []
+    if cold:
+        ranked = sorted(cold, key=lambda r: -r["n_events_pos"])
+        top = ranked[0]
+        thin = [r for r in ranked if r["n_events_pos"] <= 2]
+        thin_txt = ", ".join(
+            "{} {}건".format(r["station"], r["n_events_pos"]) for r in thin)
+        parts.append(
+            f"한파는 관측소별 편차가 크다 — 사건 수가 가장 많은 "
+            f"{top['station']}({top['code']})이 {top['n_events_pos']}건으로 재현율 "
+            f"{top['recall']:.1%}·정밀도 {top['precision']:.1%}인 반면, "
+            + (f"{thin_txt}처럼 사건이 2건 이하인 관측소가 {len(thin)}곳이다."
+               if thin else "사건 수가 적은 관측소일수록 구간이 넓다.")
+        )
+    if not parts:
+        return None
+    _thr = (data.get("thresholds") or {}).get("heatwave") or {}
+    _thr_txt = (f"판정선 {min(_thr.values()):.3f}" if _thr else "서빙 판정선")
+    return ("채점 기준은 화면이 실제로 쓰는 서빙 판정선이며(폭염 "
+            f"{_thr_txt}), 공식 특보 기록이 있는 표본으로 한정했다 — 위 합산 "
+            "표와 같은 동작점·같은 표본이다.  \n" + "  \n".join(parts))
 
 
 # ── 사이드바 ──────────────────────────────────────────────────────
@@ -675,6 +809,12 @@ if not os.path.exists(CHECKPOINT):
 #
 # load_merged_history() 는 5분 캐시라 여기서 먼저 불러도 추가 비용이 없다.
 set_offline_fallback(list(load_merged_history()[0].values()))
+
+# 적중률 로그를 저장소(data 브랜치) 상태로 맞춘다 — accuracy_baseline() 이
+# "이 프로세스가 뜬 시점의 저장소 상태"를 잡기 **전에** 해야 한다. 순서가
+# 뒤집히면 기준선이 배포 시점에 굳은 main 스냅숏을 가리켜, 화면의 "실행 중
+# 추가 N건"이 CI 가 채운 항목까지 이 프로세스의 것으로 세게 된다.
+_acc_log_source = sync_accuracy_log()
 
 try:
     _fp6 = ckpt_fingerprint()
@@ -1142,15 +1282,49 @@ with tab_trend:
         # 가장 크게 무너지는 것은 강수다.
         # 2026-09-07 — 두 리드타임 모두 수치예보(NWP) 입력 모델로 교체됐다.
         # 같은 세대가 됐으므로 아래 격차는 리드타임 효과로 읽어도 된다.
+        #
+        # 수치는 전부 체크포인트에서 읽는다(2026-09-23). 종전에는 여섯 개가
+        # 상수로 박혀 있었고, 그중 강수 발생 판정 F1 은 체크포인트에 없어
+        # 대조할 방법조차 없었다 — 이제 metrics_report.py --patch-checkpoint
+        # 가 `val_precip_wet_f1` 로 적어 넣는다.
+        def _lead_pair(key, fmt="{:.3f}"):
+            """두 체크포인트의 같은 지표를 'a→b' 로 만든다. 없으면 None."""
+            a, b = ckpt.get(key), (ckpt_12h or {}).get(key)
+            if a is None or b is None:
+                return None
+            return fmt.format(a) + "→" + fmt.format(b)
+
+        def _served_pair(key, fmt="{:.3f}"):
+            a = (extreme_metrics_of(ckpt)[0].get(key) or {}).get("f1")
+            b = (extreme_metrics_of(ckpt_12h or {})[0].get(key) or {}).get("f1")
+            if a is None or b is None:
+                return None
+            return fmt.format(a) + "→" + fmt.format(b)
+
+        _bits = [
+            ("기온 MAE", _lead_pair("val_temp_mae", "{:.2f}"), "°C"),
+            ("강수 발생 판정 F1", _lead_pair("val_precip_wet_f1"), ""),
+            ("폭염 F1", _served_pair("heatwave"), ""),
+            ("한파 F1", _served_pair("coldwave"), ""),
+        ]
+        _txt = " · ".join(f"{name} {pair}{unit}"
+                          for name, pair, unit in _bits if pair)
         st.caption(
-            "+12시간은 2차 산출값이다 — 절대오차가 +6시간보다 크다(기온 MAE "
-            "1.17→1.26°C, 검증셋 평균). 두 리드타임 모두 2026-09-07에 "
-            "수치예보(NWP) 예보값을 입력으로 편입한 모델로 교체됐으므로, "
-            "아래 격차는 리드타임의 효과로 읽을 수 있다. 저하 폭은 지표마다 "
-            "다르다: 강수 발생 판정 F1이 0.588→0.562, 폭염 F1은 0.800→0.805로 "
-            "사실상 유지되며, 한파는 0.552→0.590으로 오히려 +12시간이 앞선다. "
-            "계절 오탐은 두 모델 모두 0.00%이고 단조성도 각각 12/12 정상이다. "
-            "'성능 검증' 탭 수치는 +6시간 기준이다."
+            "+12시간은 2차 산출값이다 — 절대오차가 +6시간보다 크다. 두 "
+            "리드타임 모두 2026-09-07에 수치예보(NWP) 예보값을 입력으로 편입한 "
+            "모델로 교체됐으므로, 아래 격차는 리드타임의 효과로 읽을 수 있다. "
+            "저하 폭은 지표마다 다르며, 극한기상 두 헤드는 오히려 +12시간이 "
+            "앞선다(검증셋 기준, 극한기상은 서빙 판정선에서 채점). "
+            + _txt
+            + ". '성능 검증' 탭 수치는 +6시간 기준이다."
+        )
+        # 승격 게이트 결과는 체크포인트에 기록되지 않는다 — 스크립트가
+        # 표준출력으로만 남기므로 화면이 조회할 근거가 없다. 그래서 "현재
+        # 값"이라 말하지 않고 **언제 잰 것인지**를 밝혀 적는다(2026-09-23).
+        st.caption(
+            "참고 — 2026-09-07 승격 당시 게이트 기록: 계절 오탐은 두 모델 모두 "
+            "0.00%, 단조성은 각각 12/12 정상이었다. 이 두 항목은 체크포인트에 "
+            "저장되지 않아 화면이 현재 값을 다시 조회하지 못한다."
         )
 
     history, history_source = load_merged_history()
@@ -1713,14 +1887,16 @@ with tab_perf:
                 f"못했다. 강수는 MAE보다 '강수 발생 여부의 적중 여부'로 판단하는 "
                 f"것이 실용적이며, 해당 지표는 아래 '출력값 적중률'의 강수 항목을 "
                 f"참조한다.\n\n"
-                f"구간별로 쪼개면 격차의 출처가 하나로 좁혀진다(2026-08-17 실측). "
-                f"1mm 이상 전 구간에서는 모델이 기준선을 이긴다. 지는 이유는 표본의 "
-                f"93.8%인 무강수 구간에서 softplus가 정확한 0을 내지 못해 표본마다 "
-                f"평균 0.032mm를 깔기 때문이며, 이 구간 하나가 전체 격차의 201%를 "
-                f"만들었다. **다만 이 분해는 강수 확률 게이팅 도입(2026-08-29) "
-                f"이전 측정이다** — 게이팅이 무강수 구간 문제를 대부분 해소해, "
-                f"현재 배포 경로의 오차 출처는 무강수 12.3% / 강수 87.7%다. "
-                f"남은 격차를 지배하는 것은 이제 강수 구간의 강도 예측이다. "
+                f"구간별로 쪼개면 격차의 출처가 하나로 좁혀진다(2026-09-23 "
+                f"현행 배포본 재측정, 서빙 후처리 적용 기준). **1mm 이상 전 "
+                f"구간에서는 모델이 기준선을 이긴다** — 1~5mm·5~20mm·20mm 이상 "
+                f"세 구간의 기여가 모두 음수(개선)다. 지는 이유는 표본의 93.4%인 "
+                f"무강수 구간에서 softplus가 정확한 0을 내지 못해 표본마다 평균 "
+                f"0.027mm를 깔기 때문이며, 이 구간 하나가 만드는 손해(+0.0253mm)가 "
+                f"전체 격차(+0.0023mm)의 11배다. 나머지 구간의 이득이 그 대부분을 "
+                f"상쇄하고 남은 것이 현재 격차다. 확률 게이팅(2026-08-29)이 이 "
+                f"무강수 구간 문제를 크게 줄였고(후처리 전 격차 12.0% → 후처리 후 "
+                f"1.4%), 그래도 남은 손해의 출처는 여전히 무강수 구간이다. "
                 f"위 수치는 후처리 전 모델 출력 기준이고, 화면에 실제로 "
                 f"나가는 값은 강수 확률이 "
                 f"{PRECIP_PROB_GATE_BY_LEAD.get(6, PRECIP_PROB_GATE):.0%} 미만이면 "
@@ -1731,9 +1907,13 @@ with tab_perf:
                 f"{ckpt.get('val_precip_mae_wet', float('nan')):.3f}mm로 기준선"
                 f"({ckpt.get('val_precip_baseline_mae_wet', float('nan')):.3f}mm) 대비 "
                 f"{(1 - ckpt.get('val_precip_mae_wet', 1) / max(ckpt.get('val_precip_baseline_mae_wet', 1), 1e-9)):.1%} "
-                f"개선**이고, 강수 발생 판정 F1은 게이팅 적용 후 0.588이다. "
-                f"전체 MAE는 두 질문 — "
-                f"'비가 올 때 얼마나 맞히는가'와 "
+                f"개선**이고, 강수 발생 판정 F1은 게이팅 적용 후 "
+                + (f"{ckpt['val_precip_wet_f1']:.3f}이다. "
+                   if ckpt.get("val_precip_wet_f1") is not None
+                   else "체크포인트에 기록되지 않았다"
+                        "(`metrics_report.py --patch-checkpoint` 로 기록한다). ")
+                + "전체 MAE는 두 질문 — "
+                "'비가 올 때 얼마나 맞히는가'와 "
                 f"'비가 안 올 때 0을 얼마나 잘 내는가' — 을 하나로 통합하므로 어느 "
                 f"쪽도 알려주지 않는다. 정직성 차원에서 계속 표시하되 판단 근거로는 "
                 f"위 두 지표를 먼저 본다.",
@@ -1841,18 +2021,29 @@ with tab_perf:
         _calib_path = "./docs/images/calibration_plot.png"
         if os.path.exists(_calib_path):
             st.image(_calib_path, width="stretch")
+            _sc = station_calibration(ckpt)
+            if _sc is None:
+                # 근거 파일이 없거나 다른 모델의 것이면 **수치를 말하지 않는다**
+                # — 옛 값을 현행인 양 적는 것이 이 캡션이 실제로 겪은 사고다.
+                st.caption(
+                    "이 그림의 관측소별 수치를 설명하는 근거 파일"
+                    "(`docs/calibration_plot.json`)이 없거나 현행 배포본으로 "
+                    "잰 것이 아니다 — `calibration_plot_diagnose.py`를 다시 "
+                    "실행하면 그림과 함께 갱신된다. 근거가 없는 동안에는 수치를 "
+                    "적지 않는다."
+                )
+            else:
+                st.caption(_sc)
             st.caption(
-                "폭염은 부산(159)이 여전히 가장 낮으나(재현율 63.4%·정밀도 "
-                "54.0%) 이전 모델(71%·47%)보다 정밀도가 개선되었다. 부산만 공식 "
-                "판정 기준이 다른데 모델은 관측소 구분 없이 공통 기준으로 "
-                "학습된다는 구조는 그대로이므로, 격차 자체는 남아 있다. 이전 "
-                "모델에서는 이를 보완하려 부산 전용 임계값을 적용했으나 현행 "
-                "모델에서는 검증을 통과하지 못해 제거했다(아래 '판정 임계값 산출 절차' 참조).  \n"
-                "한파는 관측소별 편차가 크며 원인은 표본 부족이다. 사건 수로 세면 "
-                "춘천 40건인 반면 광주 4건·부산 2건·제주 1건에 불과하다 — 시간 "
-                "단위로는 5,300건 안팎으로 충분해 보이지만, 한파는 며칠씩 이어져 "
-                "연속 표본이 서로 독립이 아니다. 사건이 적은 관측소일수록 신뢰구간"
-                "(십자)이 크게 그려지는 것이 이 사실을 그대로 보여준다."
+                "부산만 공식 판정 기준이 다른데 모델은 관측소 구분 없이 공통 "
+                "기준으로 학습된다 — 폭염에서 부산이 뒤처지는 구조적 원인이다. "
+                "이전 모델에서는 이를 보완하려 부산 전용 임계값을 적용했으나 "
+                "현행 모델에서는 검증을 통과하지 못해 제거했다(아래 '판정 임계값 "
+                "산출 절차' 참조). 한파의 관측소별 편차는 표본 부족이 원인이다 — "
+                "시간 단위로는 4,300건 안팎이라 충분해 보이지만 한파는 며칠씩 "
+                "이어져 연속 표본이 서로 독립이 아니며, 사건 수로 세면 위와 같이 "
+                "한 자릿수인 관측소가 여럿이다. 사건이 적을수록 신뢰구간(십자)이 "
+                "크게 그려지는 것이 이 사실을 그대로 보여준다."
             )
         else:
             st.caption(
@@ -2026,7 +2217,9 @@ with tab_perf:
             f"현재 배포 중인 체크포인트로 {result['station_name']}에서 대조 완료된 "
             "출력값이 아직 없다 — 이 지표는 체크포인트를 교체하면 0에서 다시 "
             "시작한다(옛 모델의 기록과 섞으면 어느 모델의 성능도 아닌 값이 "
-            "되기 때문이다). 아래 '로그 구성'의 건수는 전 관측소·전 모델을 "
+            "되기 때문이다). 첫 대조는 기록 후 "
+            f"{result['forecast_lead_hours']}시간이 지나 목표 시각의 실측이 "
+            "확정돼야 이뤄진다. 아래 '로그 구성'의 건수는 전 관측소·전 모델을 "
             "합친 값이라 이 숫자와 범위가 다르다."
         )
     else:
@@ -2060,9 +2253,15 @@ with tab_perf:
     st.caption(
         "실행 중 추가된 항목은 이 프로세스가 유지되는 동안만 존재한다 — 배포 "
         "환경의 컨테이너 파일시스템은 재시작 시 저장소 상태로 복원된다. 영구 "
-        "누적은 GitHub Actions의 Refresh deploy data 워크플로가 담당한다. 신규 "
-        "관측을 수신하여 대기 항목을 실측과 대조한 후, 결과를 저장소에 "
-        "재커밋한다."
+        "누적은 GitHub Actions의 Refresh deploy data 워크플로가 담당한다. 매 "
+        "실행마다 갱신된 관측 창만으로 12개 관측소의 출력값을 산출해 로그에 "
+        "남기고, 목표 시각의 실측이 들어오면 대조한 뒤 저장소에 재커밋한다"
+        f"(2026-09-23 신설. 그 전에는 대조만 하고 기록을 만들지 않아 이 "
+        f"지표가 영구히 비어 있었다). 로그는 최근 {accuracy.RETAIN_DAYS}일치만 "
+        "보존한다 — 대조를 마친 오래된 항목은 정리한다."
+        + ("" if _acc_log_source == "raw" else
+           "  \n⚠️ 저장소(`data` 브랜치)의 로그를 불러오지 못해 배포 시점 "
+           "스냅숏을 쓰고 있다 — 아래 건수가 최신이 아닐 수 있다.")
     )
 
 # ── 탭 4: 모델 구조 ──────────────────────────────────────────────

@@ -52,6 +52,20 @@ ASOS_URL = "https://apihub.kma.go.kr/api/typ01/url/kma_sfctm2.php"
 # 방지용 안전장치다. (정확한 누적치가 필요하면 발급처 콘솔이 원본이다.)
 DAILY_CALL_BUDGET = int(os.getenv("KMA_DAILY_CALL_BUDGET", "3000"))
 
+def offline_only() -> bool:
+    """오프라인 전용 실행인가(2026-09-23).
+
+    "키가 없다"는 상태는 두 가지를 뜻할 수 있다 — 설정을 빠뜨린 사고이거나,
+    저장소 창만으로 돌리려고 **일부러** 비운 것이거나. 전자는 반드시 알려야
+    하고 후자는 알릴 것이 없다. 이 값은 동작을 바꾸지 않고 경고 출력만
+    가른다(호출 차단은 키가 비면 이미 된다).
+
+    모듈 상수가 아니라 함수인 이유: 상수로 두면 "이 모듈을 임포트하기 전에
+    환경변수를 세팅해야 한다"는 순서 의존이 생기고, 그런 전제는 호출부가
+    하나만 어겨도 조용히 깨진다. 매번 읽으면 순서를 신경 쓸 필요가 없다.
+    """
+    return os.getenv("KMA_OFFLINE_ONLY", "") not in ("", "0", "false", "False")
+
 _budget_lock = threading.Lock()
 _call_stats = {"date": None, "count": 0, "blocked": 0}
 
@@ -488,7 +502,12 @@ class RobustWeatherCollector:
           wind_speed, wind_dir, pressure, precip_type, stn, status
         """
         if not self.api_key or self.api_key == "여기에_발급받은_API_키_입력":
-            print("[WARN] KMA_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
+            # 키를 **의도적으로** 비운 경로(오프라인 전용 실행)에서는 경고를
+            # 내지 않는다 — record_online_forecasts.py 는 저장소 창만으로
+            # 예측하려고 키를 비우는데, 관측소 12곳 × 조회 12회마다 같은 줄을
+            # 찍으면 CI 로그가 144줄의 소음으로 덮인다(2026-09-23).
+            if not offline_only():
+                print("[WARN] KMA_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
             return self._fallback()
 
         tm = self._obs_time()

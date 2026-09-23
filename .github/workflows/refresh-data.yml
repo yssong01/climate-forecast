@@ -109,9 +109,14 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      # torch·streamlit 은 필요 없다 — 이 잡은 수집과 JSON 가공만 한다.
+      # streamlit 은 필요 없다. torch 는 필요하다(2026-09-23) — 아래
+      # `record_online_forecasts.py` 가 모델을 돌려 온라인 예측을 남긴다.
+      # CPU 휠만 받는다(러너에 GPU 가 없다). `cache: "pip"` 덕에 두 번째
+      # 실행부터는 내려받기가 캐시에서 해결된다.
       - name: Install collector dependencies
-        run: pip install requests python-dotenv numpy
+        run: |
+          pip install requests python-dotenv numpy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       # 키가 없으면 RobustWeatherCollector 가 조용히 폴백으로 내려가
       # "성공 0건"인 채로 워크플로는 초록불이 된다. 그 상태를 실패로 만든다.
@@ -167,6 +172,32 @@ jobs:
         working-directory: data
         run: |
           python ${{ github.workspace }}/code/collect_nwp_archive.py --incremental
+
+      # 적중률 로그에 온라인 예측을 남긴다(2026-09-23 신설).
+      #
+      # 왜 여기인가 — 화면의 '출력값 적중률'은 지금까지 **구조적으로 영원히
+      # 비어 있었다.** 기록을 만드는 주체가 배포 앱뿐이었는데, Streamlit
+      # Cloud 의 파일시스템은 휘발성이라 그 기록이 저장소로 돌아오지 못한다.
+      # 이 잡은 `accuracy.resolve_pending()` 으로 **대기 항목을 대조**하기만
+      # 했으므로, 대조할 대기 항목 자체가 쌓이지 않았다. 관측 창을 방금
+      # 갱신한 이 자리가 예측을 만들기에 가장 좋은 지점이다.
+      #
+      # **API 를 한 건도 더 쓰지 않는다.** 스크립트가 `KMA_API_KEY` 를 비워
+      # 컬렉터를 폴백 경로로 보내고, 방금 갱신한 저장소 창의 실측만으로
+      # 예측한다(12곳이 같은 시각이라 Re축 조건도 그대로 만족한다). 실행
+      # 끝에 호출 수가 0인지 스스로 확인하고, 0이 아니면 실패로 끝난다 —
+      # 15분마다 도는 잡이라 조용히 새면 하루 17,000건이 된다.
+      #
+      # 앞 스텝(수집·게이트)이 실패해도 돌린다. 관측 창은 그 경우에도 디스크에
+      # 저장돼 있으므로 예측을 만들 수 있고, 아래 커밋 스텝이 결과를 보존한다 —
+      # 2026-08-18에 배운 "게이트와 저장을 분리한다" 원칙 그대로다.
+      - name: Record online forecasts
+        if: ${{ !cancelled() && !inputs.dry_run }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/code
+        working-directory: data
+        run: |
+          python ${{ github.workspace }}/code/record_online_forecasts.py
 
       # 최신성 게이트가 실패해도(= 위 스텝 exit 1) 이 스텝은 반드시 돈다.
       #

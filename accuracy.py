@@ -27,15 +27,23 @@ collect_incremental.py 의 예산 관리와 별개로 쿼터를 소비하게 된
 (오늘 실측: 누적 약 9,800건에서 이 키가 막힘). 아직 캐시에 없는 시각은
 collect_incremental.py 가 채울 때까지 "대기" 상태로 남는다.
 """
+import hashlib
 import json
 import os
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 HIT_TEMP_TOL   = 1.5    # °C
 PRECIP_THRESH  = 0.1    # mm — 이 이상이면 "비"로 판정 (train.py 이벤트 정의와 동일)
 LOG_PATH       = "./cache/accuracy_log.json"
+
+# 로그 보존 기간(일). CI 가 관측소 12곳을 매시 기록하면 하루 약 288건씩
+# 늘어난다 — 항목당 230바이트 안팎이라 무제한으로 두면 1년에 20MB를 넘고,
+# CLAUDE.md 11항이 경계한 "GitHub 상한에 근접"에 그대로 들어간다. 화면이
+# 보여주는 것은 현행 체크포인트의 누적이고 승격 때마다 어차피 0부터 다시
+# 세므로, 한 달치를 남기면 표시에 필요한 범위를 충분히 덮는다.
+RETAIN_DAYS = 30
 
 # _save 자체는 이제 원자적이지만, record_prediction/resolve_pending은
 # 읽기→수정→쓰기 세 단계로 나뉘어 있어 둘 사이에는 여전히 경합이 남는다 —
@@ -46,12 +54,25 @@ _lock = threading.Lock()
 
 
 def model_fingerprint(checkpoint_path: str) -> str:
-    """체크포인트 파일의 신원(수정시각·크기) — 그 체크포인트가 만든 예측을
-    구분하는 model_id 로 쓴다. app.py 의 캐시 무효화 키(ckpt_fingerprint)와
-    같은 방식이라 여기로 모아 하나만 유지한다."""
+    """체크포인트의 신원 — 그 체크포인트가 만든 예측을 구분하는 model_id.
+
+    **내용 해시를 쓴다(2026-09-23 변경).** 종전에는 파일의 수정시각·크기
+    (`mtime_ns:size`)였는데, 그러면 같은 모델이라도 **재배포할 때마다 값이
+    바뀐다** — Streamlit Cloud 는 매 배포에서 저장소를 새로 체크아웃하므로
+    mtime 이 그때의 시각으로 갱신되기 때문이다. 그 결과 화면의 '누적 적중률'
+    이 모델을 바꾸지 않아도 배포마다 0에서 다시 시작했다. 내용이 같으면 같은
+    값이어야 "이 모델의 누적"이 성립한다.
+
+    캐시 무효화 키로도 이 값을 그대로 쓴다(app.py `ckpt_fingerprint`) —
+    승격은 배포 경로를 제자리에서 덮어쓰므로 내용이 바뀌면 해시도 바뀐다.
+    파일이 275KB 남짓이라 재실행마다 해시해도 비용이 문제되지 않는다.
+    """
     try:
-        st_ = os.stat(checkpoint_path)
-        return f"{st_.st_mtime_ns}:{st_.st_size}"
+        h = hashlib.sha256()
+        with open(checkpoint_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return "sha256:" + h.hexdigest()[:16]
     except OSError:
         return "missing"
 
@@ -151,6 +172,36 @@ def resolve_pending(lookup: dict, path: str = LOG_PATH) -> int:
         if resolved:
             _save(entries, path)
         return resolved
+
+
+def trim(retain_days: int = RETAIN_DAYS, path: str = LOG_PATH) -> int:
+    """보존 기간이 지난 **대조 완료** 항목을 지운다. 반환: 지운 건수.
+
+    대기(actual=None) 항목은 기간과 무관하게 남긴다 — 아직 실측을 기다리는
+    중일 수도 있고, 영영 대조되지 않는다면 그건 갱신 경로가 끊겼다는 신호라
+    조용히 지우면 그 신호까지 지우는 셈이 된다.
+
+    기준 시각은 목표 시각(`target_time`)이다. 벽시계가 아니라 데이터의
+    시각을 쓰므로, 실행 환경의 시간대에 좌우되지 않는다.
+    """
+    with _lock:
+        entries = _load(path)
+        if not entries:
+            return 0
+        latest = max((e["target_time"] for e in entries), default=None)
+        if not latest:
+            return 0
+        try:
+            cutoff = (datetime.strptime(str(latest)[:12], "%Y%m%d%H%M")
+                      - timedelta(days=retain_days)).strftime("%Y%m%d%H%M")
+        except ValueError:
+            return 0
+        kept = [e for e in entries
+                if e["actual_temp"] is None or str(e["target_time"])[:12] >= cutoff]
+        removed = len(entries) - len(kept)
+        if removed:
+            _save(kept, path)
+        return removed
 
 
 def log_summary(path: str = LOG_PATH) -> dict:
