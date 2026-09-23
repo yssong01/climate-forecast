@@ -25,9 +25,10 @@ capture_tab_screenshots.py — 배포 화면 4개 탭을 실제로 렌더링해 
   · **CPU 추론은 느리다.** 첫 화면은 탭이 나타날 때까지 기다린다(실측
     80초까지 걸렸고, 예측 캐시가 살아 있으면 20초면 된다). 탭 전환
     뒤에는 16초를 기다린다.
-  · **적중률 로그가 오염된다.** 로컬로 띄운 앱도 실제로 예측하며
-    `cache/accuracy_log.json`(git 추적 대상)에 항목을 추가한다. 끝나고
-    되돌린다.
+  · **적중률 로그가 오염된다.** 로컬로 띄운 앱은 data 브랜치 사본을
+    내려받아 `cache/accuracy_log.json`(git 추적 대상)을 덮어쓰고 예측도
+    덧붙인다. 끝나고 **git 기준으로** 되돌린다 — 실행 전 상태를 떠 두는
+    방식은 이미 더러운 상태에서 시작하면 그 오염을 굳혀 버린다.
 
 실행: python capture_tab_screenshots.py [--port 8599] [--keep]
       로컬에 docker 가 필요하다(이 스크립트 자체는 컨테이너 밖에서 돈다).
@@ -102,11 +103,23 @@ def main():
     with open(os.path.join(tmp, "shot.py"), "w", encoding="utf-8") as f:
         f.write(SHOT_SCRIPT.format(names=TABS, port=args.port))
 
-    # 적중률 로그는 로컬 실행이 오염시키므로 미리 백업해 둔다.
-    backup = None
-    if os.path.exists(ACCURACY_LOG):
-        backup = os.path.join(tmp, "accuracy_log.json")
-        shutil.copy2(ACCURACY_LOG, backup)
+    # 적중률 로그는 로컬 실행이 오염시킨다 — 앱이 `sync_accuracy_log()` 로
+    # data 브랜치 사본을 내려받아 이 경로를 덮어쓰고, 예측 1건도 덧붙인다.
+    #
+    # **git 기준으로 되돌린다.** 실행 직전 상태를 백업해 두는 방식은 이미
+    # 더럽혀진 상태에서 시작하면 그 오염을 "원래 상태"로 굳혀 버린다 —
+    # 2026-09-23 에 실제로 그렇게 커밋까지 갔다(앞선 수동 디버그 실행이
+    # 먼저 더럽혀 놨고, 백업은 그 상태를 떠서 복원이 무의미했다).
+    # 시작 전에 이미 더러우면 **멈춘다**. 사람이 의도한 변경일 수 있으므로
+    # 말없이 되돌리지 않는다.
+    dirty = subprocess.run(["git", "status", "--porcelain", ACCURACY_LOG],
+                           capture_output=True, text=True).stdout.strip()
+    if dirty:
+        print(f"{ACCURACY_LOG} 에 커밋되지 않은 변경이 있다 — 먼저 정리할 것.")
+        print(f"  {dirty}")
+        print("  (이 스크립트는 촬영 후 git 기준으로 되돌리므로, 지금 두면 "
+              "의도한 변경까지 사라진다)")
+        return 1
 
     name = "tabshot_app"
     run(f"docker rm -f {name}", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -135,11 +148,11 @@ def main():
         if not args.keep:
             run(f"docker rm -f {name}", stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)
-        # 오염된 적중률 로그를 되돌린다. 조용히 넘기지 않고 바뀌었는지 밝힌다.
-        if backup and os.path.exists(ACCURACY_LOG):
-            if open(backup, "rb").read() != open(ACCURACY_LOG, "rb").read():
-                shutil.copy2(backup, ACCURACY_LOG)
-                print(f"복원: {ACCURACY_LOG} (로컬 실행이 항목을 추가했다)")
+        # 오염된 적중률 로그를 git 기준으로 되돌린다. 조용히 넘기지 않는다.
+        if subprocess.run(["git", "status", "--porcelain", ACCURACY_LOG],
+                          capture_output=True, text=True).stdout.strip():
+            run(["git", "checkout", "--", ACCURACY_LOG])
+            print(f"복원: {ACCURACY_LOG} (로컬 실행이 덮어썼다)")
 
     missing = [t for t in TABS if not os.path.exists(f"{OUT_DIR}/{t}.png")]
     if missing:
