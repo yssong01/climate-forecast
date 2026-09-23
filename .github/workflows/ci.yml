@@ -28,6 +28,17 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements-app.txt
 
+      # 진단 스크립트 전용 의존성. requirements-app.txt 는 **서빙**이 쓰는
+      # 최소 집합이라 여기 없는 것이 맞다 — 배포판에 matplotlib·scikit-learn
+      # 을 넣을 이유가 없다. 그런데 아래 연기 시험은 진단 모듈을 전부
+      # 임포트하므로 이 셋이 없으면 반드시 실패한다:
+      #   · distribution_diagnostics → matplotlib, scipy
+      #   · aerosol_feature_probe    → scikit-learn
+      # 이것을 빠뜨려 연기 시험이 신설(2026-09-07) 이후 한 번도 통과하지
+      # 못했고, CI 가 16일간 빨간불로 방치됐다(2026-09-23 점검에서 발견).
+      - name: Install diagnostic-only dependencies
+        run: pip install matplotlib scipy scikit-learn
+
       - name: Run Phase 3-4 numerical stability tests
         run: python test_phase34.py
 

@@ -26,6 +26,7 @@ test_diagnostics_smoke.py — 진단·게이트 스크립트가 "적어도 죽�
 실행: python test_diagnostics_smoke.py
 """
 import importlib
+import os
 import sys
 import traceback
 
@@ -95,19 +96,40 @@ def _import_all():
 
 # ── ② 부가 특징 조합마다 aux_dataset_kwargs 가 일관된가 ──────────
 def _aux_kwargs_consistency():
+    """부가 특징 조합마다 같은 키가 일관되게 채워지는지 본다.
+
+    수집기 **객체**까지 만들려면 `cache/nwp_archive.json`(52MB)이 필요한데
+    이 파일은 gitignore 대상이라 CI 체크아웃에는 없다. 그 사실을 몰라서
+    이 시험은 신설 이후 CI 에서 한 번도 통과하지 못했다(2026-09-23 발견 —
+    `NWPForecastCollector(required=True)` 가 `FileNotFoundError` 로 죽는다).
+
+    아카이브가 없어도 확인할 수 있는 것(키 구성·특징 집합 전파·대조군
+    플래그)은 그대로 보고, 수집기 구성만 아카이브가 있을 때 확인한다.
+    "없으면 건너뛴다"를 조용히 하지 않고 결과 문구에 드러낸다.
+    """
     from train import aux_dataset_kwargs
+    from nwp_collector import ARCHIVE_PATH
+    has_archive = os.path.exists(ARCHIVE_PATH)
     cases = [
-        ("구버전(부가 특징 없음)", {}, 14),
-        ("수치예보 full14", {"use_nwp": True, "nwp_feature_set": "full14"}, 28),
-        ("수치예보 compact6", {"use_nwp": True, "nwp_feature_set": "compact6"}, 20),
-        ("수치예보 대조군", {"use_nwp_subset": True}, 14),
+        ("구버전(부가 특징 없음)", {}),
+        ("수치예보 full14", {"use_nwp": True, "nwp_feature_set": "full14"}),
+        ("수치예보 compact6", {"use_nwp": True, "nwp_feature_set": "compact6"}),
+        ("수치예보 대조군", {"use_nwp_subset": True}),
     ]
     out = []
-    for label, extra, _nf in cases:
+    for label, extra in cases:
+        uses_nwp = bool(extra.get("use_nwp") or extra.get("use_nwp_subset"))
+        if uses_nwp and not has_archive:
+            # aux_dataset_kwargs() 호출 자체가 수집기를 만들므로 이 조합은
+            # 통째로 건너뛴다 — 건너뛴 사실은 아래 결과 문구에 남긴다.
+            out.append(f"{label}(아카이브 없음 — 확인 생략)")
+            continue
         kw = aux_dataset_kwargs(extra)
         # 키가 없는 구버전이 종전 동작(예외 없이 빈 설정)을 유지하는지
         assert "offseason_negative" in kw, f"{label}: offseason_negative 누락"
-        if extra.get("use_nwp") or extra.get("use_nwp_subset"):
+        assert kw.get("nwp_feature_set") == extra.get("nwp_feature_set", "full14"), \
+            f"{label}: nwp_feature_set 전파 실패"
+        if uses_nwp:
             assert kw.get("nwp_collector") is not None, f"{label}: 수집기 누락"
             assert kw["nwp_features"] == bool(extra.get("use_nwp")), label
         out.append(label)
@@ -162,7 +184,6 @@ def _threshold_paths():
 
 # ── ⑤ 배포 체크포인트가 실제로 로드되고 추론 가능한가 ────────────
 def _deployed_checkpoints():
-    import os
     from predict import load_model
     out = []
     for p in ("./checkpoints/numerical_trichef.pt",
