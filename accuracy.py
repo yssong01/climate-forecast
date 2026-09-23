@@ -53,28 +53,62 @@ RETAIN_DAYS = 30
 _lock = threading.Lock()
 
 
+_FP_CACHE = {}
+
+
 def model_fingerprint(checkpoint_path: str) -> str:
-    """체크포인트의 신원 — 그 체크포인트가 만든 예측을 구분하는 model_id.
+    """이 체크포인트가 만드는 **예측**의 신원 — 적중률 로그의 `model_id`.
 
-    **내용 해시를 쓴다(2026-09-23 변경).** 종전에는 파일의 수정시각·크기
-    (`mtime_ns:size`)였는데, 그러면 같은 모델이라도 **재배포할 때마다 값이
-    바뀐다** — Streamlit Cloud 는 매 배포에서 저장소를 새로 체크아웃하므로
-    mtime 이 그때의 시각으로 갱신되기 때문이다. 그 결과 화면의 '누적 적중률'
-    이 모델을 바꾸지 않아도 배포마다 0에서 다시 시작했다. 내용이 같으면 같은
-    값이어야 "이 모델의 누적"이 성립한다.
+    **무엇을 해시하는가가 핵심이다(2026-09-23, 두 번 고쳤다).**
 
-    캐시 무효화 키로도 이 값을 그대로 쓴다(app.py `ckpt_fingerprint`) —
-    승격은 배포 경로를 제자리에서 덮어쓰므로 내용이 바뀌면 해시도 바뀐다.
-    파일이 275KB 남짓이라 재실행마다 해시해도 비용이 문제되지 않는다.
+    ① 처음에는 파일의 수정시각·크기(`mtime_ns:size`)였다. 그러면 같은
+       모델이라도 **재배포할 때마다 값이 바뀐다** — Streamlit Cloud 는 매
+       배포에서 저장소를 새로 체크아웃하므로 mtime 이 갱신된다. 화면의
+       누적 적중률이 모델을 바꾸지 않아도 0에서 다시 시작했다.
+
+    ② 그래서 파일 **내용** 해시로 바꿨는데, 같은 날 같은 증상이 다른 경로로
+       재발했다. `metrics_report.py --patch-checkpoint`,
+       `probability_calibration_fit.py --patch-metrics`,
+       `promote_checkpoint.py` 의 게이트 기록처럼 **예측을 바꾸지 않는
+       메타데이터만 적어 넣어도** 파일 내용이 달라져 기존 기록이 통째로
+       고아가 된다(실제로 96건이 그렇게 됐다. 두 파일의 가중치 해시가
+       동일함을 확인해 원인을 특정했다).
+
+    그래서 **예측을 결정하는 것만** 해시한다 — 가중치, 정규화 통계, 입력
+    차원, 예보 시계. 로그가 담는 것이 기온·강수 예측값이므로, 그 값을 바꾸지
+    않는 변경은 같은 신원이어야 "이 모델의 누적"이 성립한다.
+
+    **캐시 무효화 키로는 쓰지 않는다.** 화면은 확률 보정 곡선·예측구간까지
+    보여주므로 그 메타데이터가 바뀌면 캐시는 **무효화돼야 한다** — 두 용도의
+    요구가 반대다(app.py `ckpt_fingerprint` 주석 참고).
+
+    torch 는 호출 시점에 들여온다 — 이 모듈은 수집 스크립트도 임포트한다.
+    결과는 (mtime, size) 로 캐시해 매 재실행마다 다시 읽지 않는다.
     """
     try:
-        h = hashlib.sha256()
-        with open(checkpoint_path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return "sha256:" + h.hexdigest()[:16]
+        st_ = os.stat(checkpoint_path)
+        key = (checkpoint_path, st_.st_mtime_ns, st_.st_size)
     except OSError:
         return "missing"
+    if key in _FP_CACHE:
+        return _FP_CACHE[key]
+    try:
+        import torch
+        ck = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        h = hashlib.sha256()
+        for name, tensor in ck["model_state"].items():
+            h.update(name.encode())
+            h.update(tensor.numpy().tobytes())
+        for field in ("mean", "std"):
+            h.update(repr(ck.get(field)).encode())
+        h.update(f"{ck.get('num_features')}:{ck.get('lead_hours')}".encode())
+        fp = "sha256:" + h.hexdigest()[:16]
+    except Exception:                                # noqa: BLE001
+        # torch 가 없거나 읽기에 실패하면 구분을 포기한다 — 틀린 신원으로
+        # 서로 다른 모델의 기록을 뭉치는 것보다 낫다.
+        fp = "unknown"
+    _FP_CACHE[key] = fp
+    return fp
 
 
 def _load(path: str = LOG_PATH) -> list:

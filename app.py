@@ -12,6 +12,7 @@ sentence-transformers 로드 자체가 사라졌다 — 캐싱 대상은 모델 
 st.metric의 help 툴팁으로 함께 표시한다 — "이 값이 왜 이렇게 나왔는가"를
 화면만 보고 답할 수 있어야 한다는 원칙(2026-08-09 확정)을 따른다.
 """
+import hashlib
 import json
 import math
 import os
@@ -124,8 +125,8 @@ st.set_page_config(
 
 def ckpt_fingerprint(path: str = CHECKPOINT) -> str:
     """
-    체크포인트의 신원. 캐시 키에 넣어 파일이 바뀌면 자동으로 새로 로드되게
-    하고, 적중률 로그의 `model_id` 로도 쓴다.
+    체크포인트 **파일**의 신원. 캐시 키에 넣어 파일이 바뀌면 자동으로 새로
+    로드되게 한다. 적중률 로그의 `model_id` 로는 쓰지 않는다(아래 참고).
 
     왜 필요한가 — get_model() 을 인수 없이 @st.cache_resource 로 감싸면
     캐시 키가 항상 같아서, 체크포인트를 새로 학습해 배포해도 살아 있는
@@ -135,11 +136,28 @@ def ckpt_fingerprint(path: str = CHECKPOINT) -> str:
     "저장돼 있지 않다"로 표시됐다. cache_resource 는 스크립트 재실행은
     물론 코드 갱신 후에도 같은 프로세스면 살아남기 때문이다.
 
-    구현은 `accuracy.model_fingerprint()` 하나만 쓴다(2026-09-23) — 종전에는
-    같은 규칙(`mtime_ns:size`)을 두 곳에 각각 적어두고 있었고, 그 규칙 자체가
-    **재배포마다 값이 바뀌는** 결함이 있었다(그 함수의 docstring 참고).
+    **파일 내용 전체를 해시한다.** `accuracy.model_fingerprint()` 와 일부러
+    다르게 둔다(2026-09-23) — 두 용도의 요구가 반대이기 때문이다.
+
+      · 캐시 무효화(여기): 화면은 확률 보정 곡선·예측구간까지 보여주므로
+        그 메타데이터만 바뀌어도 **캐시는 무효화돼야 한다.**
+      · 적중률 로그의 `model_id`: 로그가 담는 것은 기온·강수 예측값이므로,
+        그 값을 바꾸지 않는 메타데이터 변경에 **신원이 흔들리면 안 된다.**
+
+    한때 둘을 한 함수로 합쳤다가 같은 날 되돌렸다 — 체크포인트에 화면용
+    지표를 적어 넣자(예측은 그대로인데) 파일 해시가 바뀌어 기존 적중률
+    기록 96건이 통째로 고아가 됐다. "같은 규칙을 두 곳에 적지 말라"는
+    원칙과 "다른 질문에는 다른 답을 쓰라"는 원칙이 충돌한 자리이고,
+    여기서는 후자가 맞다.
     """
-    return accuracy.model_fingerprint(path)
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return "sha256:" + h.hexdigest()[:16]
+    except OSError:
+        return "missing"
 
 
 @st.cache_resource(show_spinner="모델 로드 중...")
@@ -2257,13 +2275,15 @@ with tab_perf:
             station=stn, made_at=result["observed_at"],
             target_time=result["target_time"],
             pred_temp=f["temperature"], pred_precip=f["precipitation"],
-            source="live", model_id=ckpt_fingerprint(),
+            # 예측 신원(가중치 기준) — 파일 해시가 아니다.
+            source="live", model_id=accuracy.model_fingerprint(CHECKPOINT),
         )
     accuracy.resolve_pending(history)
 
     # model_id 로 필터링 — 체크포인트를 바꾼 뒤에는 옛 모델이 쌓아둔 기록과
     # 섞이지 않고 지금 배포된 모델의 예측만 집계한다(accuracy.stats 참고).
-    acc = accuracy.stats(station=stn, model_id=ckpt_fingerprint())
+    acc = accuracy.stats(station=stn,
+                         model_id=accuracy.model_fingerprint(CHECKPOINT))
     if acc["cum_n"] == 0:
         # 아래 '로그 구성' 줄은 로그 전체(전 관측소·전 모델)를 세는데 이 지표는
         # 현재 관측소 + 현재 체크포인트로만 좁혀 센다. 그래서 "대조된 것이
