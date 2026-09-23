@@ -30,6 +30,13 @@ from predict import CHECKPOINT, PRECIP_PROB_GATE, PRECIP_PROB_GATE_BY_LEAD
 OUT_PNG = "./docs/images/error_breakdown.png"
 OUT_JSON = "./cache/error_breakdown.json"
 
+# 이 둘은 +6h 배포본 기준의 공용 산출물이다(README 그림과 화면 서술의 근거).
+# 어떤 체크포인트를 받든 여기에 쓰면 실험 후보 한 번으로 배포본 리포트가
+# 조용히 덮어써진다 — `metrics_report.py` 와 같은 결함이라 같은 방식으로
+# 막는다(2026-09-23). 배포 +6h 가 아니면 파일명에 체크포인트 이름을 붙이고
+# 그림은 건드리지 않는다.
+PRIMARY_CHECKPOINT = "./checkpoints/numerical_trichef.pt"
+
 STATION_NAMES = {
     "101": "춘천", "105": "강릉", "108": "서울", "112": "인천", "119": "수원",
     "131": "청주", "133": "대전", "143": "대구", "146": "전주", "156": "광주",
@@ -308,11 +315,20 @@ def main():
         print("  판정: 현행 유지.")
     out["gate_sweep"] = sw
 
-    plot(precip_rows, temp_rows, totals, OUT_PNG)
-    os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)
-    with open(OUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    print(f"저장: {OUT_JSON}")
+    _is_primary = (os.path.abspath(args.ckpt)
+                   == os.path.abspath(PRIMARY_CHECKPOINT))
+    out_json = OUT_JSON
+    if _is_primary:
+        plot(precip_rows, temp_rows, totals, OUT_PNG)
+    else:
+        _stem = os.path.splitext(os.path.basename(args.ckpt))[0]
+        out_json = f"./cache/error_breakdown_{_stem}.json"
+        print(f"(배포 +6h 체크포인트가 아니므로 {OUT_PNG} 는 그대로 둔다 — "
+              f"이 그림은 화면·README 가 쓰는 공용 산출물이다)")
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump({"checkpoint": args.ckpt, **out}, f, ensure_ascii=False, indent=2)
+    print(f"저장: {out_json}")
 
 
 if __name__ == "__main__":

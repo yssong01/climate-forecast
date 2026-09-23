@@ -29,10 +29,29 @@ calibration_plot_diagnose.py — 관측소별 재현율×정밀도 신뢰도 플
 matplotlib 폰트로 등록한다(매번 재설치 — 이미지에 굽지 않고 컨테이너는
 `--rm`으로 매번 새로 뜨므로).
 
+서빙 판정선 기준으로 채점한다(2026-09-23 변경). 종전에는 보정 전 원본
+확률 t=0.5 로 채점했는데, 화면에서 이 플롯 **바로 위**에 놓이는 극한기상
+분류 성능표는 2026-09-07부터 서빙 판정선(보정 후 공간, 폭염 0.402 ·
+한파 0.330) 기준이다. 같은 화면에서 "합산 표를 관측소별로 분해한 것"이라
+설명하면서 둘이 서로 다른 동작점을 가리키고 있었다 — 실제로 부산 폭염이
+표의 설명과 어긋나는 값으로 보였다. 채점 표본도 `*_mask_official` 로
+맞춘다: 특보 비운영기간을 확정 음성으로 채운 체크포인트에서는 쉬운 음성이
+대량으로 섞여 정밀도가 부풀고, 그러면 위 표와 **같은 질문에 답한 값**이
+아니게 된다(`metrics_report.precision_block` 과 같은 이유).
+
+산출물을 JSON 으로도 남긴다(2026-09-23). 종전에는 표를 표준출력으로만
+찍어서, `app.py` 의 관측소별 성능 캡션을 사람이 손으로 옮겨 적었다 —
+그 결과 모델을 교체해도 캡션만 이전 세대 값으로 남았다(부산 폭염
+"재현율 63.4%·정밀도 54.0%"). 화면이 이 파일을 읽어 문장을 만들도록
+바꿔 전사 고리를 없앤다. `docs/` 에 두는 이유는 배포가 읽어야 하기
+때문이다(`cache/` 는 gitignore 대상이라 배포판에 실리지 않는다).
+
 실행: python calibration_plot_diagnose.py [--out calibration.png]
 """
 import argparse
+import json
 import math
+import os
 import subprocess
 import sys
 
@@ -43,10 +62,11 @@ from train import collect_historical, WeatherDataset, make_split, STATION_NAMES,
 from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector
 from weather_collector import STATION_COORDS
-from predict import load_model
+from predict import load_model, calibrate_prob, event_threshold
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH = 1024
+OUT_JSON = "./docs/calibration_plot.json"
 
 _NANUM_PATH = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
 
@@ -110,7 +130,8 @@ def main():
     records = collect_historical()
     txt = TendencyCollector(records)
     ds = WeatherDataset(
-        records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
+        records, sat_collector=InterpolatedFieldCollector(
+            records, STATION_COORDS, n_bands=ckpt.get("re_channels", 4)),
         txt_collector=txt, lead_hours=ckpt["lead_hours"],
         **aux_dataset_kwargs(ckpt),
         mean=np.array(ckpt["mean"], dtype=np.float32),
@@ -137,7 +158,31 @@ def main():
     heat_m = ds.heat_mask[idx].numpy().astype(bool)
     cold_m = ds.cold_mask[idx].numpy().astype(bool)
 
+    # 공식 라벨 전용 채점(2026-09-23) — 특보 비운영기간을 확정 음성으로 채운
+    # 체크포인트는 채점 표본이 크게 늘어난다. 쉬운 음성이 섞이면 정밀도가
+    # 부풀어, 화면에서 이 플롯 위에 놓이는 합산표와 다른 질문에 답한 값이
+    # 된다(metrics_report.precision_block 과 같은 처리).
+    def _official(mask, attr):
+        vec = getattr(ds, attr, None)
+        if vec is None:
+            return mask
+        off = vec[idx].numpy().astype(bool)
+        if off.sum() and int(off.sum()) != int(mask.sum()):
+            return mask & off
+        return mask
+
+    heat_m = _official(heat_m, "heat_mask_official")
+    cold_m = _official(cold_m, "cold_mask_official")
+
+    # 보정 후 공간에서, 서빙이 실제로 쓰는 판정선으로 채점한다(2026-09-23).
+    # 관측소별 예외가 걸린 조합은 그 관측소만 임계값이 다르므로 판정선도
+    # 관측소마다 조회한다 — 서빙과 같은 방식이어야 이 플롯이 위 표의
+    # 분해로서 성립한다.
+    heat_p = np.array([calibrate_prob(float(v), "heatwave", ckpt) for v in heat_p])
+    cold_p = np.array([calibrate_prob(float(v), "coldwave", ckpt) for v in cold_p])
+
     results = {"heatwave": [], "coldwave": []}
+    thresholds = {}
     for name, p, y, m in (("heatwave", heat_p, heat_y, heat_m),
                           ("coldwave", cold_p, cold_y, cold_m)):
         for stn_code in sorted(set(stns)):
@@ -145,7 +190,9 @@ def main():
             n = int(sel.sum())
             if n < 30:
                 continue
-            pred_pos = p[sel] >= 0.5
+            thr = event_threshold(name, str(stn_code), ckpt)
+            thresholds.setdefault(name, {})[str(stn_code)] = thr
+            pred_pos = p[sel] >= thr
             labels = y[sel]
             ts_sel = tgt_ts[sel]
             precision, recall, tp, fp, fn = prf(pred_pos, labels)
@@ -163,6 +210,7 @@ def main():
             results[name].append({
                 "station": STATION_NAMES.get(stn_code, stn_code),
                 "code": stn_code,
+                "threshold": thr,
                 "n": n, "n_pos": n_pos,
                 "n_events_pos": n_events_pos, "n_events_predpos": n_events_predpos,
                 "precision": precision, "p_lo": p_lo, "p_hi": p_hi,
@@ -170,7 +218,8 @@ def main():
             })
 
     print("=" * 90)
-    print(" 관측소별 재현율×정밀도 (t=0.5, 신뢰구간은 사건 수 기준 Wilson 95% CI)")
+    print(" 관측소별 재현율×정밀도 (서빙 판정선 기준, "
+          "신뢰구간은 사건 수 기준 Wilson 95% CI)")
     print("=" * 90)
     for name, rows in results.items():
         print(f"\n[{name}]")
@@ -181,6 +230,26 @@ def main():
                   f"{r['n_events_predpos']:>8,} | "
                   f"{r['recall']:>6.1%} [{r['r_lo']:.1%},{r['r_hi']:.1%}] | "
                   f"{r['precision']:>6.1%} [{r['p_lo']:.1%},{r['p_hi']:.1%}]")
+
+    # JSON 을 **그림보다 먼저** 쓴다 — 한글 폰트 설치나 matplotlib 쪽에서
+    # 실패해도 화면 캡션이 쓰는 값은 남아야 한다. 종전에는 이 스크립트가
+    # 승격 도중 죽으면 산출물이 통째로 이전 모델 시점에 머물렀다.
+    _payload = {
+        "checkpoint": {
+            "lead_hours": ckpt.get("lead_hours"),
+            "num_features": ckpt.get("num_features"),
+            # 어느 모델로 잰 값인지 남긴다 — 화면이 옛 값을 새 값인 양
+            # 보여주는 것을 막으려면 대조할 기준이 필요하다.
+            "val_temp_naive_mae": ckpt.get("val_temp_naive_mae"),
+        },
+        "scored_at": "serving_threshold",
+        "thresholds": thresholds,
+        "stations": results,
+    }
+    os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)
+    with open(OUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(_payload, f, ensure_ascii=False, indent=2)
+    print(f"\n저장: {OUT_JSON}")
 
     try:
         import matplotlib
@@ -226,8 +295,11 @@ def main():
                       fontsize=13, fontweight="bold")
         ax.set_ylabel("정밀도 (Precision) — 사건이라 판정한 것 중 맞은 비율",
                       fontsize=13, fontweight="bold")
+        _thr = sorted({round(v, 3) for v in thresholds.get(name, {}).values()})
+        _thr_txt = (f"판정선 {_thr[0]:.3f}" if len(_thr) == 1
+                    else f"판정선 {_thr[0]:.3f}~{_thr[-1]:.3f}(관측소별 예외 있음)")
         ax.set_title(f"{labels_ko[name]} — 관측소별\n"
-                     "(십자 = 사건 수 기준 Wilson 95% 신뢰구간)",
+                     f"({_thr_txt} · 십자 = 사건 수 기준 Wilson 95% 신뢰구간)",
                      fontsize=15, fontweight="bold")
         ax.set_xlim(-0.05, 1.05)
         ax.set_ylim(-0.05, 1.05)

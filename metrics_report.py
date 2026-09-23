@@ -35,6 +35,17 @@ from predict import (CHECKPOINT, EXTREME_EVENT_THRESH, calibrate_prob,
 OUT_PNG = "./docs/images/metrics_report.png"
 OUT_JSON = "./cache/metrics_report.json"
 
+# 이 두 경로는 **+6h 배포본 기준의 공용 산출물**이다(README 그림과 그 근거
+# 수치). 그런데 이 스크립트는 종전에 어떤 체크포인트를 받든 여기에 썼다 —
+# 실험 후보로 한 번 돌리면 배포본의 리포트가 조용히 덮어써진다. 실제로
+# 2026-09-23 점검 시점의 `cache/metrics_report.json` 은 배포본이 아닌 후보의
+# 값이었다(기온 MAE 1.0853 vs 배포 1.1657, 서빙 판정선이 0.5 로 기록됨).
+# 배포 경로가 아니면 파일명에 체크포인트 이름을 붙이고 그림은 건드리지
+# 않는다. 목록은 promote_checkpoint.PRODUCTION_TARGETS 와 같아야 한다.
+PRIMARY_CHECKPOINT = "./checkpoints/numerical_trichef.pt"
+PRODUCTION_CHECKPOINTS = (PRIMARY_CHECKPOINT,
+                          "./checkpoints/numerical_trichef_12h.pt")
+
 HIT_TEMP_TOL = 1.5    # °C — accuracy.py 와 동일 기준
 HIT_PRECIP_THRESH = 0.1
 
@@ -380,16 +391,32 @@ def main():
     pre = precision_block(d, ckpt)
     cal = calibration_block(d, ckpt)
     print_report(acc, pre, cal)
-    if not args.no_plot:
+
+    # 공용 산출물은 +6h 배포본으로 돌릴 때만 덮어쓴다(위 상수 주석 참고).
+    _abs = os.path.abspath(args.ckpt)
+    _is_primary = _abs == os.path.abspath(PRIMARY_CHECKPOINT)
+    _is_production = _abs in {os.path.abspath(p) for p in PRODUCTION_CHECKPOINTS}
+    out_json = OUT_JSON
+    if not _is_production:
+        _stem = os.path.splitext(os.path.basename(args.ckpt))[0]
+        out_json = f"./cache/metrics_report_{_stem}.json"
+    elif not _is_primary:
+        out_json = "./cache/metrics_report_12h.json"
+
+    if args.no_plot:
+        print(f"(--no-plot: {OUT_PNG} 는 그대로 둔다)")
+    elif _is_primary:
         plot(acc, pre, cal, OUT_PNG)
     else:
-        print(f"(--no-plot: {OUT_PNG} 는 그대로 둔다)")
+        print(f"(배포 +6h 체크포인트가 아니므로 {OUT_PNG} 는 그대로 둔다 — "
+              f"이 그림은 화면·README 가 쓰는 공용 산출물이다)")
 
-    os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)
-    with open(OUT_JSON, "w", encoding="utf-8") as f:
-        json.dump({"accuracy": acc, "precision": pre, "calibration": cal},
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump({"checkpoint": args.ckpt,
+                   "accuracy": acc, "precision": pre, "calibration": cal},
                   f, ensure_ascii=False, indent=2)
-    print(f"저장: {OUT_JSON}")
+    print(f"저장: {out_json}")
 
     if args.patch_checkpoint:
         _patch_checkpoint(args.ckpt, acc, pre)
@@ -419,6 +446,13 @@ def _patch_checkpoint(path: str, acc: dict, pre: dict = None) -> None:
     ck["val_precip_mae_served"] = acc["precip_mae_served"]
     ck["val_precip_mae_wet"] = acc["precip_mae_wet"]
     ck["val_precip_baseline_mae_wet"] = acc["precip_baseline_mae_wet"]
+    # 강수 발생 판정 F1 도 함께 적는다(2026-09-23 추가). 화면 두 곳이 이 값을
+    # 상수로 박아두고 있었는데(추이 탭 "+6h 0.588 → +12h 0.562", 성능 검증 탭
+    # "게이팅 적용 후 0.588"), 체크포인트에 없어 대조할 방법조차 없었다 —
+    # 모델을 교체해도 사람이 기억해 고치지 않으면 옛 값이 그대로 남는다.
+    ck["val_precip_wet_f1"] = acc["precip_wet_f1"]
+    ck["val_precip_wet_precision"] = acc["precip_wet_precision"]
+    ck["val_precip_wet_recall"] = acc["precip_wet_recall"]
     if pre:
         # 서빙 판정선 기준 극한기상 지표(2026-09-07 추가). 체크포인트의
         # `extreme_metrics` 는 학습이 t=0.5 로 잰 값이라 서빙과 다른 동작점을
@@ -435,7 +469,8 @@ def _patch_checkpoint(path: str, acc: dict, pre: dict = None) -> None:
         }
     torch.save(ck, path)
     print(f"체크포인트 갱신: {path} — 서빙 MAE {acc['precip_mae_served']:.4f} · "
-          f"강수구간 조건부 MAE {acc['precip_mae_wet']:.4f}")
+          f"강수구간 조건부 MAE {acc['precip_mae_wet']:.4f} · "
+          f"발생 판정 F1 {acc['precip_wet_f1']:.4f}")
 
 
 if __name__ == "__main__":
