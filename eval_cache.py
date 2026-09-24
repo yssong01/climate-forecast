@@ -42,6 +42,12 @@ from text_collector import SimulatedTextCollector
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CACHE_PATH = "./cache/eval_cache.npz"
+# 입력 행렬 캐시(2026-09-24 신설). `CACHE_PATH` 가 담는 것은 **검증셋의 모델
+# 출력**이라, 기준선 비교군(MOS·GBM·기후값)을 만들 수 없다 — 그것들은
+# **학습 분할에서 적합해야** 하고 원본 입력 행렬이 필요하기 때문이다.
+# 그렇다고 `baseline_suite.py` 가 데이터셋을 따로 구성하면 3절 규약(22GiB
+# 중복 구성 금지)을 어기는 여섯 번째 스크립트가 된다. 그래서 여기에 둔다.
+FEATURE_CACHE_PATH = "./cache/eval_features.npz"
 
 # 배치 기본값 — 추론만 하므로 학습보다 크게 잡을 수 있다. 실측(2026-08-16)
 # 에서 학습 중 VRAM 사용률이 12% 에 그쳤으므로 8192 로도 여유가 있다.
@@ -274,6 +280,101 @@ def load(ckpt_path: str = CHECKPOINT, batch: int = DEFAULT_BATCH, force: bool = 
         z = np.load(CACHE_PATH, allow_pickle=True)
         return {k: z[k] for k in z.files}
     return build(ckpt_path, batch)
+
+
+def _ts_to_int(seq) -> np.ndarray:
+    """'YYYYMMDDHHmm' 문자열 배열 → int64.
+
+    문자열로 두면 numpy 유니코드 배열이 글자당 4바이트라 시각 열 하나가
+    50MB 를 넘는다. int64 로 담으면 8MB 이고 월·시각 추출도 나눗셈 한 번이다.
+    """
+    return np.array([int(str(t)[:12]) for t in seq], dtype=np.int64)
+
+
+def build_features(ckpt_path: str = CHECKPOINT):
+    """학습·검증 두 분할의 **표준화 입력 행렬과 정답**을 캐시한다.
+
+    모델 출력이 아니라 입력을 담는다는 점이 `build()` 와 다르다. 기준선
+    (원시 수치예보·MOS·GBM·기후값)은 모델과 **같은 표본·같은 분할**에서
+    재야 비교가 성립하는데, 그중 셋은 학습 분할에서 적합해야 한다.
+
+    `build()` 와 같은 서명·같은 분할 대조를 쓰므로, 체크포인트나 자료가
+    바뀌면 두 캐시가 함께 무효화된다.
+    """
+    t0 = time.time()
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    records = collect_historical()
+    txt_collector = (TendencyCollector(records) if ckpt.get("im_dim", 384) < 128
+                     else SimulatedTextCollector())
+    ds = WeatherDataset(
+        records, sat_collector=InterpolatedFieldCollector(
+            records, STATION_COORDS, n_bands=ckpt.get("re_channels", 4)),
+        txt_collector=txt_collector,
+        **aux_dataset_kwargs(ckpt),
+        lead_hours=ckpt["lead_hours"],
+        mean=np.array(ckpt["mean"], dtype=np.float32),
+        std=np.array(ckpt["std"], dtype=np.float32),
+    )
+    train_ds, val_ds = make_split(ds, ckpt.get("split_mode", "random"),
+                                  verbose=True, ckpt=ckpt)
+    tr = np.array(train_ds.indices)
+    va = np.array(val_ds.indices)
+    _assert_split_matches_checkpoint(ds, va, ckpt)
+    print(f"학습 {len(tr):,} · 검증 {len(va):,} · 검증셋 대조 통과")
+
+    data = {}
+    for name, idx in (("train", tr), ("val", va)):
+        lst = idx.tolist()
+        data[f"x_{name}"] = ds.X_num[lst].numpy().astype(np.float32)
+        # Im축(경향 벡터)도 함께 담는다 — 기준선이 "Z축만"과 "Z+Im"을 갈라
+        # 재야 그 축이 값을 하는지 물을 수 있다. Re축(4×32×32 격자)은 표본당
+        # 4,096차원이라 같은 방식으로 담을 수 없어 제외한다(그 축의 기여는
+        # 별도 방법으로 재야 한다).
+        data[f"im_{name}"] = ds.X_txt[lst].numpy().astype(np.float32)
+        data[f"temp_true_{name}"] = ds.y[idx, 0].numpy()
+        data[f"precip_true_{name}"] = ds.y[idx, 1].numpy()
+        data[f"stn_{name}"] = np.array([int(ds.stns[i]) for i in lst],
+                                       dtype=np.int32)
+        data[f"src_ts_{name}"] = _ts_to_int(ds.src_timestamps[i] for i in lst)
+        data[f"tgt_ts_{name}"] = _ts_to_int(ds.tgt_timestamps[i] for i in lst)
+        for lab in ("heatwave", "coldwave", "dust"):
+            data[f"y_{lab}_{name}"] = getattr(ds, f"y_{lab}")[idx].numpy()
+        for m in ("heat_mask", "cold_mask", "dust_mask",
+                  "heat_mask_official", "cold_mask_official"):
+            data[f"{m}_{name}"] = getattr(ds, m)[idx].numpy()
+
+    data["mean"] = np.asarray(ckpt["mean"], dtype=np.float32)
+    data["std"] = np.asarray(ckpt["std"], dtype=np.float32)
+    data["wet_thresh"] = np.array(WET_THRESH)
+    # 특징 집합 기본값은 `aux_dataset_kwargs` 와 **같아야** 한다 — 거기서는
+    # 키 없는 구버전을 `full14` 로 해석하므로, 여기서 다른 기본값을 쓰면
+    # 데이터셋은 14열을 붙였는데 소비자는 "수치예보 없음"으로 읽는다(실제로
+    # 배포 체크포인트에 이 키가 없어 기준선 비교가 조용히 빠졌다).
+    data["nwp_feature_set"] = np.array(str(ckpt.get("nwp_feature_set", "full14")))
+    data["use_nwp"] = np.array(bool(ckpt.get("use_nwp", False)))
+    data.update({k: np.array(v) for k, v in cache_signature(ckpt_path, ckpt).items()})
+
+    os.makedirs(os.path.dirname(FEATURE_CACHE_PATH), exist_ok=True)
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(FEATURE_CACHE_PATH),
+                               suffix=".npz")
+    os.close(fd)
+    np.savez_compressed(tmp, **data)
+    os.replace(tmp, FEATURE_CACHE_PATH)
+    print(f"저장: {FEATURE_CACHE_PATH} "
+          f"({os.path.getsize(FEATURE_CACHE_PATH)/1e6:.0f}MB, "
+          f"{time.time()-t0:.0f}초)")
+    return data
+
+
+def load_features(ckpt_path: str = CHECKPOINT, force: bool = False):
+    """입력 행렬 캐시를 읽어 dict 로 돌려준다. 없거나 낡았으면 만든다."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    sig = cache_signature(ckpt_path, ckpt)
+    if not force and is_fresh(FEATURE_CACHE_PATH, sig):
+        z = np.load(FEATURE_CACHE_PATH, allow_pickle=True)
+        return {k: z[k] for k in z.files}
+    return build_features(ckpt_path)
 
 
 def main():
