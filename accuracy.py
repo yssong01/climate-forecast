@@ -85,23 +85,32 @@ def model_fingerprint(checkpoint_path: str) -> str:
     torch 는 호출 시점에 들여온다 — 이 모듈은 수집 스크립트도 임포트한다.
     결과는 (mtime, size) 로 캐시해 매 재실행마다 다시 읽지 않는다.
     """
+    # 기온 전용 보조 체크포인트가 켜져 있으면 **그것도 예측을 결정한다** —
+    # 신원에 빠뜨리면 기온 출처를 바꿔도 같은 model_id 로 기록돼 서로 다른
+    # 모델의 적중률이 한 줄로 뭉친다(2026-09-24 추가). 환경변수를 직접 읽는
+    # 이유는 `predict.TEMP_CHECKPOINT` 와 같은 출처를 쓰면서도 이 모듈이
+    # predict 를 임포트하지 않기 위해서다(수집 스크립트도 이 모듈을 쓴다).
+    paths = [checkpoint_path]
+    _temp = os.getenv("TEMP_CHECKPOINT_PATH", "")
+    if _temp:
+        paths.append(_temp)
     try:
-        st_ = os.stat(checkpoint_path)
-        key = (checkpoint_path, st_.st_mtime_ns, st_.st_size)
+        key = tuple((p, os.stat(p).st_mtime_ns, os.stat(p).st_size) for p in paths)
     except OSError:
         return "missing"
     if key in _FP_CACHE:
         return _FP_CACHE[key]
     try:
         import torch
-        ck = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         h = hashlib.sha256()
-        for name, tensor in ck["model_state"].items():
-            h.update(name.encode())
-            h.update(tensor.numpy().tobytes())
-        for field in ("mean", "std"):
-            h.update(repr(ck.get(field)).encode())
-        h.update(f"{ck.get('num_features')}:{ck.get('lead_hours')}".encode())
+        for p in paths:
+            ck = torch.load(p, map_location="cpu", weights_only=True)
+            for name, tensor in ck["model_state"].items():
+                h.update(name.encode())
+                h.update(tensor.numpy().tobytes())
+            for field in ("mean", "std"):
+                h.update(repr(ck.get(field)).encode())
+            h.update(f"{ck.get('num_features')}:{ck.get('lead_hours')}".encode())
         fp = "sha256:" + h.hexdigest()[:16]
     except Exception:                                # noqa: BLE001
         # torch 가 없거나 읽기에 실패하면 구분을 포기한다 — 틀린 신원으로

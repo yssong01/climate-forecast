@@ -43,6 +43,22 @@ from train import record_to_vec, STATION_NAMES
 # 디커플링을 두 번 돌린 것이었다. README·CLAUDE.md 의 해당 실험 결론은
 # 무효로 표시했다(재실행 필요).
 CHECKPOINT = os.getenv("CHECKPOINT_PATH", "./checkpoints/numerical_trichef.pt")
+# 기온 전용 보조 체크포인트(2026-09-24). 빈 문자열이면 종전 동작 — 기온도
+# 주 체크포인트에서 낸다.
+#
+# **왜 모델을 둘로 두는가(실측).** 여섯 헤드가 트렁크를 공유하는 비용이
+# 기온에서 특히 크다. 손실을 기온만 남기면 MAE 가 1.1657 → 0.8513 으로
+# 27% 낮아지고(seed 42/43/44 = 0.8513/0.8575/0.8471, 폭 0.010), 90% 예측
+# 구간 폭도 4.93 → 3.65°C 로 26% 좁아진다(커버리지 0.899 유지). 표형 GBM
+# 기준선(0.9432)도 9.7% 이긴다.
+#
+# **왜 교체가 아니라 추가인가.** 강수·극한기상 헤드는 어떤 변형에서도 거의
+# 움직이지 않았고(폭염 0.79~0.80 · 한파 0.45~0.50), 한파는 변별력 상한이
+# 오히려 현행이 가장 높다. 그 헤드들을 건드리지 않으면 계절 오탐·단조성·
+# 관측소 사각지대 게이트 결과가 **정의상 불변**이라 회귀 위험이 없다 —
+# 단조성 게이트가 seed 에 좌우돼 사실상 추첨인 상황에서(배포 구성조차
+# 1/3 PASS) 그 추첨을 아예 돌리지 않는 설계다.
+TEMP_CHECKPOINT = os.getenv("TEMP_CHECKPOINT_PATH", "")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -306,6 +322,32 @@ def _station_override_allowed(event: str, stn: str, ckpt: dict = None) -> bool:
     return [stn, event] in [list(x) for x in allow]
 
 
+def load_temp_model(main_ckpt: dict, path: str = None, device: str = DEVICE):
+    """기온 전용 보조 모델을 읽고 **주 체크포인트와 호환되는지 검증**한다.
+
+    경로가 비어 있으면 `(None, None)` — 종전 동작이다.
+
+    두 모델은 같은 표준화 입력 벡터를 함께 쓴다. 그래서 정규화 통계나 입력
+    차원이 어긋나면 **오류 없이 조용히 다른 값을 내므로** 여기서 막는다 —
+    폴백이 하드코딩 상수를 실측처럼 돌려주던 사고(4절)와 같은 부류다.
+    """
+    if not path:
+        return None, None
+    model, ckpt = load_model(path, device)
+    mismatch = [k for k in ("num_features", "lead_hours", "im_dim", "re_channels")
+                if ckpt.get(k) != main_ckpt.get(k)]
+    if mismatch:
+        raise RuntimeError(
+            f"기온 전용 체크포인트가 주 체크포인트와 다르다({', '.join(mismatch)}) — "
+            f"같은 입력 벡터를 쓸 수 없다: {path}")
+    for k in ("mean", "std"):
+        if [round(float(v), 6) for v in ckpt[k]] != [round(float(v), 6) for v in main_ckpt[k]]:
+            raise RuntimeError(
+                f"기온 전용 체크포인트의 정규화 통계({k})가 주 체크포인트와 다르다 — "
+                f"같은 입력 벡터를 쓰면 값이 조용히 어긋난다: {path}")
+    return model, ckpt
+
+
 def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
     """체크포인트에서 모델 아키텍처와 가중치를 복원한다."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -346,7 +388,8 @@ def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
 def predict(stn: str = "108",
             checkpoint_path: str = CHECKPOINT,
             device: str = DEVICE,
-            model=None, ckpt: dict = None) -> dict:
+            model=None, ckpt: dict = None,
+            temp_model=None, temp_ckpt: dict = None) -> dict:
     """
     지정 관측소의 현재 관측값으로 +lead_hours 시간 후 기온·강수를 예측.
 
@@ -375,6 +418,10 @@ def predict(stn: str = "108",
     """
     if model is None or ckpt is None:
         model, ckpt = load_model(checkpoint_path, device)
+    # 기온 전용 보조 모델(위 TEMP_CHECKPOINT 주석). 호출자가 넘기지 않았고
+    # 환경변수가 비어 있으면 종전 동작 그대로다.
+    if temp_model is None and TEMP_CHECKPOINT:
+        temp_model, temp_ckpt = load_temp_model(ckpt, TEMP_CHECKPOINT, device)
     lead_hours = ckpt["lead_hours"]
 
     # 대상 관측소 + 보간용 이웃 11개 — 전부 **같은 시각** 스냅샷이 필요하다.
@@ -509,6 +556,15 @@ def predict(stn: str = "108",
     temp_pred   = pred[0, 0].item()
     precip_pred = max(0.0, pred[0, 1].item())
 
+    # 기온만 보조 모델로 교체한다. 입력 벡터는 그대로 재사용한다 —
+    # load_temp_model() 이 정규화 통계·차원 일치를 이미 확인했다.
+    temp_source_ckpt = ckpt
+    if temp_model is not None:
+        with torch.no_grad():
+            temp_pred = temp_model(num_x=x_num, img_x=x_img,
+                                   txt_x=x_txt)[0, 0].item()
+        temp_source_ckpt = temp_ckpt
+
     # Phase 3-8/3-9 극한기상 확률 — 구버전 체크포인트(헤드 추가 전)는
     # extreme_event_probs() 가 전부 None 을 반환하므로 결과에서 빠진다.
     extreme = model.extreme_event_probs()
@@ -543,7 +599,10 @@ def predict(stn: str = "108",
     # 적합·검증(실측 커버리지 기온 0.899·강수 0.929)해 체크포인트에 저장해둔
     # 분위수를 조회만 한다. 화면의 "±MAE"는 검증셋 평균오차일 뿐 이 예측
     # 1건의 신뢰구간이 아니라는 한계(README '정직한 한계')를 이걸로 보완한다.
-    temp_ci = conformal_bounds(ckpt, "temp", stn, temp_pred)
+    # 예측구간도 **그 기온을 낸 모델**의 잔차 분위수를 쓴다 — 주 체크포인트
+    # 것을 쓰면 다른 모델의 오차 분포로 구간을 그리게 된다(보조 모델은
+    # 폭이 4.93→3.65°C 로 좁다).
+    temp_ci = conformal_bounds(temp_source_ckpt, "temp", stn, temp_pred)
     precip_ci = (None, None)
     if rain_prob is not None:
         ci_precip = ckpt.get("conformal_interval", {}).get("precip")

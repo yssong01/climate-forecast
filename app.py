@@ -43,7 +43,8 @@ from weather_collector import (
     connection_state, network_env_report, redact_secrets,
 )
 from predict import (
-    load_model, predict, CHECKPOINT, event_threshold,
+    load_model, load_temp_model, predict, CHECKPOINT, TEMP_CHECKPOINT,
+    event_threshold,
     PRECIP_PROB_GATE, PRECIP_PROB_GATE_BY_LEAD,
     STATION_EVENT_THRESH_OVERRIDES, NWPUnavailable,
     _station_override_allowed,
@@ -176,6 +177,19 @@ def get_model(fingerprint: str):
     return get_model_at(CHECKPOINT, fingerprint)
 
 
+@st.cache_resource(show_spinner=False)
+def get_temp_model(fingerprint: str, _main_ckpt):
+    """기온 전용 보조 모델(없으면 `(None, None)`).
+
+    `fingerprint` 는 캐시 무효화 전용이다. 주 체크포인트와의 호환 검증은
+    `predict.load_temp_model()` 안에서 하며, 어긋나면 예외로 멈춘다 —
+    조용히 다른 값을 내는 것보다 화면이 멈추는 편이 낫다.
+    """
+    if not TEMP_CHECKPOINT:
+        return None, None
+    return load_temp_model(_main_ckpt, TEMP_CHECKPOINT)
+
+
 def obs_hour_key() -> str:
     """
     지금 조회하면 받게 될 ASOS 관측 시각(KST, YYYYMMDDHH00).
@@ -224,8 +238,14 @@ def obs_hour_key() -> str:
 # get_model() 사고와 정확히 같은 유형이다.
 @st.cache_data(ttl=3600, show_spinner="관측 조회 중... (12개 관측소)")
 def cached_predict(stn: str, obs_hour: str, lead_hours: int, ckpt_fp: str,
-                   _model, _ckpt) -> dict:
-    return predict(stn=stn, model=_model, ckpt=_ckpt)
+                   _model, _ckpt, temp_fp: str = "", _temp_model=None,
+                   _temp_ckpt=None) -> dict:
+    # `temp_fp` 는 캐시 키 전용이다 — 기온 전용 보조 모델이 켜져 있으면
+    # 그 모델도 결과를 바꾸므로 키에 반드시 들어가야 한다. `_` 접두 인자는
+    # Streamlit 이 해시에서 제외하므로 `_temp_model` 만 넘기는 것은 캐시
+    # 키에 아무 기여도 하지 않는다(CLAUDE.md 1절 14항, 같은 사고 3회).
+    return predict(stn=stn, model=_model, ckpt=_ckpt,
+                   temp_model=_temp_model, temp_ckpt=_temp_ckpt)
 
 
 @st.cache_resource(show_spinner=False)
@@ -862,10 +882,13 @@ _acc_log_source = sync_accuracy_log()
 try:
     _fp6 = ckpt_fingerprint()
     model, ckpt = get_model(_fp6)
+    _fpT = ckpt_fingerprint(TEMP_CHECKPOINT) if TEMP_CHECKPOINT else ""
+    temp_model, temp_ckpt = get_temp_model(_fpT, ckpt)
     # 수치예보 입력을 쓰는 체크포인트라면 그 창을 먼저 내려받는다 — 없으면
     # predict() 가 NWPUnavailable 을 올린다(중립값으로 메우지 않는다).
     _nwp_status = sync_nwp_window() if ckpt.get("use_nwp", False) else None
-    result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], _fp6, model, ckpt)
+    result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], _fp6,
+                            model, ckpt, _fpT, temp_model, temp_ckpt)
 except NWPUnavailable as e:
     st.error(
         "수치예보 보조 입력을 구성할 수 없어 출력값을 낼 수 없다. "
