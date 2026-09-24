@@ -72,7 +72,8 @@ DIAGNOSTIC_MODULES = [
     "probability_calibration_fit", "probability_calibration_check",
     "calibration_plot_diagnose", "station_threshold_check",
     "station_coverage_check", "seasonal_falsealarm_check",
-    "coldwave_pathway_check", "station_anomaly_investigate",
+    "coldwave_pathway_check", "coldwave_path_attribution",
+    "station_anomaly_investigate",
     "precip_breakdown", "distribution_diagnostics", "gate_behavior_check",
     "neutral_input_check", "patch_extreme_metrics", "backtest_accuracy",
     "conformal_interval_fit", "bootstrap_ci_compare", "rebaseline_compare",
@@ -171,6 +172,73 @@ def _forward_all_dims():
         m(num_x=torch.randn(3, 28), img_x=torch.randn(3, 4, 32, 32),
           txt_x=torch.randn(3, 12))
     shapes.append("계절중립화(16개)")
+
+    # magnitude 쪽 기온 중립화(2026-09-24). 인덱스 유도가 특징 집합을 따라
+    # 달라지므로 두 집합 모두 확인한다 — compact6 에는 동시각 기온 편향 열이
+    # 없어 Z축 0번 하나만 나와야 한다. 여기서 어긋나면 기온이 중립화되지
+    # 않은 열로 새어 들어가 처방이 반쪽이 되는데, forward 는 멀쩡히 돌아
+    # 단조성 게이트까지 가서야 드러난다.
+    import os as _os
+    _prev = _os.environ.get("USE_NWP")
+    _os.environ["USE_NWP"] = "1"
+    try:
+        import importlib
+        import train as _train
+        importlib.reload(_train)
+        for fs, want in (("full14", [0, 25]), ("compact6", [0])):
+            _train.NWP_FEATURE_SET = fs
+            nf = 14 + feature_dim(fs)
+            got = _train.extreme_temp_neutral_index(nf)
+            assert got == want, f"{fs}: 기온 중립화 인덱스 {got} ≠ {want}"
+    finally:
+        if _prev is None:
+            _os.environ.pop("USE_NWP", None)
+        else:
+            _os.environ["USE_NWP"] = _prev
+        importlib.reload(_train)
+
+    x = torch.randn(3, 28)
+    img, txt = torch.randn(3, 4, 32, 32), torch.randn(3, 12)
+    x_t = x.clone(); x_t[:, 0] += 3.0                  # 기온만
+    x_n = x.clone(); x_n[:, 25] += 3.0                 # 동시각 기온 편향만
+
+    def _cold(model, xx):
+        with torch.no_grad():
+            model(num_x=xx, img_x=img, txt_x=txt)
+            return model._last_coldwave_logit.clone()
+
+    # (1) magnitude 만 보는 구성(signed_head_input=False)에서는 기온을 흔들어도
+    #     극한기상 로짓이 **전혀** 움직이지 않아야 한다 — 이것이 이 처방의 핵심
+    #     주장이고, 여기가 새면 단조성 게이트까지 가서야 드러난다.
+    m_mag = TriCHEFPipeline(
+        num_features=28, im_dim=12, signed_head_input=False,
+        extreme_temp_neutral_idx=[0, 25],
+        feat_mean=np.zeros(28, dtype=np.float32),
+        feat_std=np.ones(28, dtype=np.float32)).eval()
+    leak = float((_cold(m_mag, x_t) - _cold(m_mag, x)).abs().max())
+    assert leak < 1e-6, f"magnitude 경로로 기온이 새고 있다 ({leak:.2e})"
+
+    # (2) 배포 구성(부호 경로 있음)에서는 **기온이 계속 헤드에 닿아야** 한다.
+    #     이 처방은 기온을 빼는 것이 아니라, 단조가 불가능한 경로에서만 빼고
+    #     부호가 살아 있는 경로로 몰아주는 것이다. 여기가 0 이면 헤드가 기온을
+    #     아예 못 보게 된 것이므로 실패다.
+    m_full = TriCHEFPipeline(
+        num_features=28, im_dim=12, signed_head_input=True,
+        extreme_nwp_neutral_dims=14, extreme_temp_neutral_idx=[0, 25],
+        feat_mean=np.zeros(28, dtype=np.float32),
+        feat_std=np.ones(28, dtype=np.float32)).eval()
+    base = _cold(m_full, x)
+    assert float((_cold(m_full, x_t) - base).abs().max()) > 1e-6, \
+        "부호 경로까지 막혀 헤드가 기온을 못 본다"
+    # 동시각 기온 편향(25번)은 두 경로 모두에서 중립화되므로 아무 영향이 없다.
+    assert float((_cold(m_full, x_n) - base).abs().max()) < 1e-6, \
+        "수치예보 편향 열이 극한기상 헤드로 새고 있다"
+    # 회귀 경로는 원래 magnitude 를 그대로 쓰므로 기온에 반응해야 한다.
+    with torch.no_grad():
+        r1 = m_full(num_x=x, img_x=img, txt_x=txt).clone()
+        r2 = m_full(num_x=x_t, img_x=img, txt_x=txt).clone()
+    assert float((r2 - r1).abs().max()) > 1e-6, "회귀 경로까지 중립화됐다"
+    shapes.append("기온중립화(magnitude)")
     return " / ".join(shapes)
 
 

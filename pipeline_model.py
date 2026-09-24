@@ -344,6 +344,7 @@ class TriCHEFPipeline(nn.Module):
                  signed_head_input: bool = False,
                  extreme_nwp_neutral_dims: int = 0,
                  extreme_neutral_idx: list = None,
+                 extreme_temp_neutral_idx: list = None,
                  signed_precip_input: bool = False,
                  head_dropout: float = 0.0,
                  coldwave_dropout: float = 0.0,
@@ -540,6 +541,31 @@ class TriCHEFPipeline(nn.Module):
             idx += list(range(num_features - self.extreme_nwp_neutral_dims,
                               num_features))
         self.extreme_neutral_idx = sorted(set(int(i) for i in idx))
+        # extreme_temp_neutral_idx (2026-09-24) — 극한기상 헤드가 받는
+        # **magnitude** 에서 관측 기온을 중립화한다. 위 두 인자가 부호 경로
+        # (v_Z)를 다루는 것과 달리 이쪽은 융합 경로다. 빈 목록이면 종전 동작.
+        #
+        # 왜(실측 근거, `coldwave_path_attribution.py`): 기온은 한파 헤드에
+        # 두 갈래로 도달한다 — 부호 경로 v_Z 와 magnitude 다. 그런데
+        # magnitude = √((w·v)²+…) 는 제곱이 부호를 없애므로 **구조적으로
+        # 기온에 대해 단조가 아니다**(학습 평균 중심의 V 자). 실제로 부호
+        # 경로를 얼리고 magnitude 만 남겨 재보니 체크포인트 3종 모두 최악
+        # 상관이 +0.89~+1.00 으로 거의 완벽한 역전이었다.
+        #
+        # 반대로 magnitude 쪽 기온만 얼리면 부호 경로 단독 판정이 나온다:
+        #   배포본      −0.3997 →  −0.7823 (심각도 0.270 → 0.000)
+        #   compact6/43 +0.3070 →  −0.3576 (FAIL → PASS, 심각도 0.792 → 0.000)
+        #   compact6/42 +0.7856 →  +0.4423 (여전히 FAIL — 보편 처방은 아니다)
+        # 기온 진폭도 셋 다 함께 올랐다(0.83→0.97, 0.49→0.56, 0.49→0.71) —
+        # magnitude 가 부호 경로의 기온 반응을 **상쇄**하고 있었다는 뜻이고,
+        # "기온진폭이 작으면 단조성이 깨진다"는 종전 관찰의 기전이다.
+        #
+        # 주의 — 위 측정은 **학습을 마친** 헤드에서 경로를 사후 절제한
+        # 것이다. 이 제약을 걸고 학습했을 때 같은 결과가 나온다는 보장은
+        # 없다(단순 프로브 결과가 공유 트렁크·게이트가 있는 전체 파이프라인
+        # 에서 재현되지 않은 전례가 있다 — CLAUDE.md 5절 Re축 강수 채널).
+        self.extreme_temp_neutral_idx = sorted(
+            set(int(i) for i in (extreme_temp_neutral_idx or [])))
         self.head_heatwave = _binary_head(_ext_dim, heatwave_prior, head_dropout)
         # coldwave_dropout (2026-08-17) — head_dropout과 별도로 한파 헤드에만
         # 거는 드롭아웃. head_dropout을 전체 헤드에 걸었더니(2026-08-17 기각)
@@ -814,8 +840,28 @@ class TriCHEFPipeline(nn.Module):
             num_neutral = num_x.clone()
             num_neutral[:, self.extreme_neutral_idx] = 0.0
             v_z_ext = self.enc_z(num_neutral)
-        _ext_in = (torch.cat([magnitude, v_z_ext], dim=-1)
-                   if self.signed_head_input else magnitude)
+
+        # magnitude 쪽 기온 중립화(위 __init__ 주석 참고). v_re·v_im 은
+        # num_x 에 의존하지 않으므로 그대로 재사용하고, num_x 를 받는
+        # enc_z 와 게이트만 다시 탄다 — 새 파라미터도 인코더도 늘지 않는다.
+        magnitude_ext = magnitude
+        if self.extreme_temp_neutral_idx:
+            num_tn = num_x.clone()
+            num_tn[:, self.extreme_temp_neutral_idx] = 0.0
+            v_z_m = self.enc_z(num_tn)
+            if self.orthogonalize:
+                _, _, v_z_m = gram_schmidt_3axis(v_re, v_im, v_z_m, self.gs_eps)
+            if self.dynamic_gate:
+                w_m = self.gate(num_tn)
+                m_re, m_im, m_z = w_m[:, 0:1], w_m[:, 1:2], w_m[:, 2:3]
+            else:
+                m_re, m_im, m_z = w_re, w_im, w_z
+            magnitude_ext = torch.sqrt(
+                (m_re * v_re) ** 2 + (m_im * v_im) ** 2 + (m_z * v_z_m) ** 2 + 1e-7
+            )
+
+        _ext_in = (torch.cat([magnitude_ext, v_z_ext], dim=-1)
+                   if self.signed_head_input else magnitude_ext)
         self._last_heatwave_logit = self.head_heatwave(_ext_in)
         self._last_coldwave_logit = self.head_coldwave(_ext_in)
         self._last_dust_logit = self.head_dust(_ext_in)

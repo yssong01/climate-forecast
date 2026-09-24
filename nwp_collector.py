@@ -57,6 +57,23 @@ FEATURE_SETS = {
 }
 
 
+# `_encode` 14차원 중 **관측 기온에 의존하는** 열(2026-09-24).
+# 11번 = `f_now[I_TP] - obs[0]`(동시각 예보기온 − 실측기온) 하나뿐이다.
+# 12·13번은 강수·습도 편향이라 기온을 흔들어도 움직이지 않는다.
+#
+# 왜 필요한가 — 극한기상 헤드의 magnitude 경로에서 기온을 중립화하려면
+# "기온이 들어오는 열"을 빠짐없이 알아야 하는데, 관측 기온은 Z축 0번만이
+# 아니라 이 편향 항으로도 새어 들어온다. 번호를 호출부가 손으로 세면
+# 특징 집합이 바뀔 때 조용히 어긋난다(compact6 에는 11번이 아예 없다).
+OBS_TEMP_RAW_COLS = (11,)
+
+
+def obs_temp_cols(feature_set: str = "full14") -> list[int]:
+    """그 특징 집합 안에서 관측 기온에 의존하는 열의 **집합 내 위치**."""
+    cols = FEATURE_SETS[feature_set]
+    return [i for i, raw in enumerate(cols) if raw in OBS_TEMP_RAW_COLS]
+
+
 def feature_dim(feature_set: str = "full14") -> int:
     return len(FEATURE_SETS[feature_set])
 

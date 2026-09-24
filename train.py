@@ -35,7 +35,8 @@ from interp_field_collector import InterpolatedFieldCollector
 from tendency_collector import TendencyCollector, TENDENCY_DIM
 from text_collector import SimulatedTextCollector
 from island_collector import IslandPrecipCollector, ISLAND_DIM
-from nwp_collector import NWPForecastCollector, NWP_DIM, feature_dim as nwp_feature_dim
+from nwp_collector import (NWPForecastCollector, NWP_DIM,
+                           feature_dim as nwp_feature_dim, obs_temp_cols)
 from collect_nwp_archive import MODEL as NWP_ARCHIVE_MODEL
 from pipeline_model import TriCHEFPipeline
 
@@ -203,6 +204,33 @@ NWP_FEATURE_SET = os.getenv("NWP_FEATURE_SET", "full14")
 # 가르는 것이 계절의존도임을 seed 실험으로 확인했다. 기본값 0(끔).
 EXTREME_NEUTRAL_SEASON = os.getenv("EXTREME_NEUTRAL_SEASON", "0") == "1"
 _SEASON_IDX = [12, 13]
+# 극한기상 헤드의 **magnitude** 경로에서 관측 기온을 중립화할지(2026-09-24).
+# 위 둘이 부호 경로를 다루는 것과 달리 이쪽은 융합 경로다. 근거는
+# pipeline_model 의 extreme_temp_neutral_idx 주석 — magnitude 는 제곱이 부호를
+# 없애 구조적으로 기온에 대해 단조가 아니며, 실측으로 그 경로 단독 상관이
+# 체크포인트 3종 모두 +0.89~+1.00(거의 완벽한 역전)이었다. 기본값 0(끔).
+EXTREME_TEMP_NEUTRAL = os.getenv("EXTREME_TEMP_NEUTRAL", "0") == "1"
+_TEMP_IDX = [0]   # record_to_vec 0번 = 기온 (그 docstring 이 위치 고정을 명시)
+
+
+def extreme_temp_neutral_index(num_features: int) -> list[int]:
+    """magnitude 경로에서 중립화할 '관측 기온' 열 전체.
+
+    Z축 0번 하나가 아니다 — 수치예보를 쓰면 동시각 편향 열(`예보기온 −
+    실측기온`)도 관측 기온을 따라 움직이므로, 그걸 남기면 기온이 그리로
+    새어 들어와 중립화가 반쪽이 된다. 열 번호를 여기서 세지 않고
+    `nwp_collector.obs_temp_cols()` 에 묻는 이유는 특징 집합마다 다르기
+    때문이다(`compact6` 에는 그 열이 아예 없다).
+
+    수치예보 블록은 입력 벡터 **맨 뒤**에 붙는다 — `extreme_nwp_neutral_dims`
+    가 "뒤에서 n 개"로 잡는 것과 같은 전제이며, `make_x`/`record_to_vec` →
+    평년 아노말리 → 수치예보 순서로 이어붙이는 구성 절차가 그 근거다.
+    """
+    idx = list(_TEMP_IDX)
+    if USE_NWP:
+        base = num_features - nwp_feature_dim(NWP_FEATURE_SET)
+        idx += [base + p for p in obs_temp_cols(NWP_FEATURE_SET)]
+    return sorted(set(idx))
 USE_NWP_SUBSET = os.getenv("USE_NWP_SUBSET", "0") == "1"
 PRECIP_WEIGHT = 1.0    # 강수 손실 가중치 (기온 손실은 σ² 로 정규화되어 O(1))
 # 그래디언트 누적(2026-09-01) — amount 헤드 pinball 재도전용. PRECIP_QUANTILE
@@ -1510,6 +1538,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         extreme_nwp_neutral_dims=(nwp_feature_dim(NWP_FEATURE_SET)
                                   if (USE_NWP and EXTREME_NWP_NEUTRAL) else 0),
         extreme_neutral_idx=(_SEASON_IDX if EXTREME_NEUTRAL_SEASON else None),
+        extreme_temp_neutral_idx=(extreme_temp_neutral_index(num_features)
+                                  if EXTREME_TEMP_NEUTRAL else None),
         signed_precip_input=SIGNED_PRECIP_INPUT,
         head_dropout=HEAD_DROPOUT,
         coldwave_dropout=COLDWAVE_DROPOUT,
@@ -1852,6 +1882,9 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 # 해석된 최종 인덱스를 저장한다 — 서빙이 위치 규칙을 다시
                 # 계산하지 않고 그대로 복원하도록.
                 "extreme_neutral_idx": (_SEASON_IDX if EXTREME_NEUTRAL_SEASON else []),
+                "extreme_temp_neutral_idx": (
+                    extreme_temp_neutral_index(len(full_ds.mean))
+                    if EXTREME_TEMP_NEUTRAL else []),
                 "use_nwp_subset": USE_NWP_SUBSET,
                 "nwp_model":      (NWP_ARCHIVE_MODEL if (USE_NWP or USE_NWP_SUBSET)
                                    else None),

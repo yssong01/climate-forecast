@@ -45,13 +45,13 @@ TEMPS = list(range(-15, 36, 5))                      # −15 ~ 35 °C
 MONTHS = [(m, f"{m:02d}15") for m in range(1, 13)]   # 각 달 15일
 
 
-def head_prob(model, ckpt, record, img, txt, head="coldwave", nwp_fixed=None):
-    """`nwp_fixed` 는 기준 레코드에서 한 번 뽑은 예보값이다.
+def make_x(ckpt, record, nwp_fixed=None):
+    """레코드 → 표준화된 입력 텐서 (1, num_features).
 
-    기온·계절을 흔드는 동안 예보를 다시 조회하지 않는 이유는 두 가지다.
-    ① 한 번에 하나만 바꾼다는 원칙 — 예보까지 함께 바뀌면 확률 변화가
-       기온 때문인지 예보 때문인지 가릴 수 없다. ② 흔드는 날짜에는 애초에
-       예보가 없다(미래 날짜를 포함한다).
+    `head_prob` 에서 분리했다(2026-09-24) — `coldwave_path_attribution.py` 가
+    같은 벡터를 만들어 경로별로 다른 값을 먹여야 하는데, 구성 절차를 복사하면
+    두 파일이 조용히 어긋난다(Z축 부가 특징이 늘 때마다 실제로 겪은 결함이다,
+    CLAUDE.md 1절 7-1항).
     """
     mean = np.array(ckpt["mean"], dtype=np.float32)
     std = np.array(ckpt["std"], dtype=np.float32)
@@ -72,7 +72,18 @@ def head_prob(model, ckpt, record, img, txt, head="coldwave", nwp_fixed=None):
                                "기준 레코드의 관측값이 결측이다.")
         vec = np.concatenate([vec, nv]).astype(np.float32)
     vec = vec[:nf]
-    x = torch.tensor((vec - mean) / std, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    return torch.tensor((vec - mean) / std, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+
+def head_prob(model, ckpt, record, img, txt, head="coldwave", nwp_fixed=None):
+    """`nwp_fixed` 는 기준 레코드에서 한 번 뽑은 예보값이다.
+
+    기온·계절을 흔드는 동안 예보를 다시 조회하지 않는 이유는 두 가지다.
+    ① 한 번에 하나만 바꾼다는 원칙 — 예보까지 함께 바뀌면 확률 변화가
+       기온 때문인지 예보 때문인지 가릴 수 없다. ② 흔드는 날짜에는 애초에
+       예보가 없다(미래 날짜를 포함한다).
+    """
+    x = make_x(ckpt, record, nwp_fixed)
     with torch.no_grad():
         model(num_x=x,
               img_x=torch.tensor(img, dtype=torch.float32).unsqueeze(0).to(DEVICE),
@@ -237,7 +248,13 @@ def analyse(grid):
         cors.append(float(np.corrcoef(ranks_t, rr)[0, 1]))
         weights.append(amp)
     if not cors:
-        return amp_temp, amp_season, float("nan"), 0.0
+        # 네 번째 값은 정상 반환과 같은 (한파기준, 폭염기준) 쌍이어야 한다.
+        # 종전에는 스칼라 0.0 을 돌려줘, 호출부의 `sev_i[0]` 이 TypeError 로
+        # 죽었다(2026-09-24 발견). 이 가지는 **모든 달의 기온 진폭이 0**일 때만
+        # 타므로 — 헤드가 기온에 전혀 반응하지 않는 경우 — 여태 드러나지
+        # 않았을 뿐, 그런 체크포인트를 승격 게이트에 넣으면 '무반응' 판정이
+        # 아니라 크래시가 났다.
+        return amp_temp, amp_season, float("nan"), (0.0, 0.0)
     w = np.array(weights)
     c = np.array(cors)
     corr = float(np.sum(c * w) / w.sum())
