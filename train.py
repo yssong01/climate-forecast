@@ -220,6 +220,24 @@ FUSION = os.getenv("FUSION", "modulus")
 # 그 격차에 ① 융합 아키텍처 ② 다중과제 ③ 모델 계열이 섞여 있다. 이 스위치가
 # ②를 분리한다. 켜면 강수·극한기상 지표는 의미가 없다(경사를 안 받는다).
 SINGLE_TASK = os.getenv("SINGLE_TASK", "0") == "1"
+# 다중과제 비용의 **원인을 가르는** 두 손잡이(2026-09-24).
+#
+# `SINGLE_TASK=1` 은 한 번에 두 가지를 바꿨다 — 헤드 5개의 손실을 끄고,
+# 조기종료 기준도 기온 단독으로 바꿨다. 그래서 기온 MAE 1.1546→0.8523 이
+# ① 경사 경쟁이 사라져서인지 ② 정지 시점이 기온에 맞춰져서인지 구분되지
+# 않는다(대조군은 45에폭, SINGLE_TASK 는 192에폭에서 멈췄다). 둘은 처방이
+# 전혀 다르다 — ①이면 아키텍처를 갈라야 하고, ②면 기준만 바꾸면 된다.
+#
+#   LOSS_HEADS : all(기본) | temp | temp+precip | temp+extreme
+#   STOP_ON    : combined(기본, 기온+강수) | temp
+LOSS_HEADS = os.getenv("LOSS_HEADS", "temp" if SINGLE_TASK else "all")
+STOP_ON = os.getenv("STOP_ON", "temp" if SINGLE_TASK else "combined")
+if LOSS_HEADS not in ("all", "temp", "temp+precip", "temp+extreme"):
+    raise ValueError(f"알 수 없는 LOSS_HEADS: {LOSS_HEADS}")
+if STOP_ON not in ("combined", "temp"):
+    raise ValueError(f"알 수 없는 STOP_ON: {STOP_ON}")
+USE_PRECIP_LOSS = LOSS_HEADS in ("all", "temp+precip")
+USE_EXTREME_LOSS = LOSS_HEADS in ("all", "temp+extreme")
 
 
 def extreme_temp_neutral_index(num_features: int) -> list[int]:
@@ -1639,10 +1657,10 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
 
             pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt)
             loss = mse(pred[:, 0:1], y_b[:, 0:1]) / temp_var
-            if SINGLE_TASK:
-                # 기온 항만 남긴다(위 SINGLE_TASK 주석). 헤드는 그대로 있지만
-                # 경사를 받지 않으므로 그 출력은 초기값 근처에 머문다 —
-                # 이 실행의 강수·극한기상 지표를 읽지 말 것.
+            if not USE_PRECIP_LOSS:
+                # 강수 항을 끈다(위 LOSS_HEADS 주석). 헤드는 그대로 있지만
+                # 경사를 받지 않으므로 출력이 초기값 근처에 머문다 —
+                # 이 실행의 강수 지표를 읽지 말 것.
                 pass
             elif PRECIP_GAMMA_NLL:
                 # 강수 amount 를 MSE(대칭 손실) 대신 Gamma NLL 로 학습한다
@@ -1687,7 +1705,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             # 회귀 손실만으로는 무강수 쪽으로 정확히 0을 향할 유인이 약해서
             # (기울기가 실측치와의 차이에만 비례) 이 항이 없으면 dynamic_gate
             # 케이스가 아니어도 동일한 문제가 재현된다(precip_breakdown.py).
-            if not SINGLE_TASK and hasattr(model, "head_rain"):
+            if USE_PRECIP_LOSS and hasattr(model, "head_rain"):
                 is_wet = (y_b[:, 1:2] >= WET_THRESH).float()
                 rain_bce = nn.functional.binary_cross_entropy_with_logits(
                     model._last_rain_logit, is_wet, pos_weight=rain_pos_weight
@@ -1707,7 +1725,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
 
             _season_grp = (_season_group_from_xnum(x_num)
                           if GROUPDRO_ETA > 0 else None)
-            if (not SINGLE_TASK and hasattr(model, "head_heatwave")
+            if (USE_EXTREME_LOSS and hasattr(model, "head_heatwave")
                     and hmask_b.sum() > 0):
                 if GROUPDRO_ETA > 0:
                     loss = loss + EXTREME_BCE_WEIGHT * _groupdro_bce(
@@ -1716,7 +1734,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 else:
                     loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
                         model._last_heatwave_logit, heat_b, hmask_b, heatwave_pos_weight)
-            if (not SINGLE_TASK and hasattr(model, "head_coldwave")
+            if (USE_EXTREME_LOSS and hasattr(model, "head_coldwave")
                     and cmask_b.sum() > 0):
                 if GROUPDRO_ETA > 0:
                     loss = loss + EXTREME_BCE_WEIGHT * _groupdro_bce(
@@ -1725,7 +1743,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 else:
                     loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
                         model._last_coldwave_logit, cold_b, cmask_b, coldwave_pos_weight)
-            if (not SINGLE_TASK and DUST_LOSS_WEIGHT > 0
+            if (USE_EXTREME_LOSS and DUST_LOSS_WEIGHT > 0
                     and hasattr(model, "head_dust") and dmask_b.sum() > 0):
                 loss = loss + EXTREME_BCE_WEIGHT * DUST_LOSS_WEIGHT * _masked_bce(
                     model._last_dust_logit, dust_b, dmask_b, dust_pos_weight)
@@ -1803,9 +1821,11 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         # 조기 종료 기준: 두 baseline 대비 상대 오차의 합 (skill score)
         # 1.0 미만이면 해당 지표가 baseline 을 이긴 것.
         val_score = val_temp_mae / temp_naive + val_precip_mae / precip_naive
-        if SINGLE_TASK:
-            # 강수 헤드가 경사를 안 받으므로 그 항을 조기종료 기준에
-            # 넣으면 잡음으로 정지 시점이 정해진다.
+        if STOP_ON == "temp":
+            # 강수 항을 조기종료 기준에서 뺀다. LOSS_HEADS 로 강수를 끈
+            # 실행에서는 필수이고(경사를 안 받는 값이 정지 시점을 정한다),
+            # 손실은 그대로 둔 채 기준만 바꾸면 "정지 시점이 원인인가"를
+            # 직접 묻는 대조군이 된다.
             val_score = val_temp_mae / temp_naive
 
         best_temp_only   = min(best_temp_only,   val_temp_mae)
@@ -1908,6 +1928,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                     if EXTREME_TEMP_NEUTRAL else []),
                 "fusion": FUSION,
                 "single_task": SINGLE_TASK,
+                "loss_heads": LOSS_HEADS,
+                "stop_on": STOP_ON,
                 "use_nwp_subset": USE_NWP_SUBSET,
                 "nwp_model":      (NWP_ARCHIVE_MODEL if (USE_NWP or USE_NWP_SUBSET)
                                    else None),
