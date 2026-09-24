@@ -329,6 +329,7 @@ def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
         extreme_nwp_neutral_dims=ckpt.get("extreme_nwp_neutral_dims", 0),
         extreme_neutral_idx=ckpt.get("extreme_neutral_idx") or None,
         extreme_temp_neutral_idx=ckpt.get("extreme_temp_neutral_idx") or None,
+        fusion=ckpt.get("fusion", "modulus"),
         signed_precip_input=ckpt.get("signed_precip_input", False),
         head_dropout=ckpt.get("head_dropout", 0.0),
         coldwave_dropout=ckpt.get("coldwave_dropout", 0.0),

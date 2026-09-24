@@ -211,6 +211,15 @@ _SEASON_IDX = [12, 13]
 # 체크포인트 3종 모두 +0.89~+1.00(거의 완벽한 역전)이었다. 기본값 0(끔).
 EXTREME_TEMP_NEUTRAL = os.getenv("EXTREME_TEMP_NEUTRAL", "0") == "1"
 _TEMP_IDX = [0]   # record_to_vec 0번 = 기온 (그 docstring 이 위치 고정을 명시)
+# 3축 융합 연산(2026-09-24). `modulus`(기본) 가 논문 Eq.1 이자 종전 동작이고,
+# `linear`·`zonly` 는 대조군이다. 근거는 pipeline_model 의 `fusion` 주석.
+FUSION = os.getenv("FUSION", "modulus")
+# 단일과제 대조(2026-09-24). 기온 손실만 남기고 강수·강수확률·극한기상 3종을
+# 전부 끈다. 목적은 **다중과제 비용의 측정** 하나다 — 기준선 실측에서 Z축
+# 28특징만 받는 GBM 이 기온 MAE 0.943 으로 배포본(1.166)을 23.6% 이겼는데,
+# 그 격차에 ① 융합 아키텍처 ② 다중과제 ③ 모델 계열이 섞여 있다. 이 스위치가
+# ②를 분리한다. 켜면 강수·극한기상 지표는 의미가 없다(경사를 안 받는다).
+SINGLE_TASK = os.getenv("SINGLE_TASK", "0") == "1"
 
 
 def extreme_temp_neutral_index(num_features: int) -> list[int]:
@@ -1540,6 +1549,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         extreme_neutral_idx=(_SEASON_IDX if EXTREME_NEUTRAL_SEASON else None),
         extreme_temp_neutral_idx=(extreme_temp_neutral_index(num_features)
                                   if EXTREME_TEMP_NEUTRAL else None),
+        fusion=FUSION,
         signed_precip_input=SIGNED_PRECIP_INPUT,
         head_dropout=HEAD_DROPOUT,
         coldwave_dropout=COLDWAVE_DROPOUT,
@@ -1629,7 +1639,12 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
 
             pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt)
             loss = mse(pred[:, 0:1], y_b[:, 0:1]) / temp_var
-            if PRECIP_GAMMA_NLL:
+            if SINGLE_TASK:
+                # 기온 항만 남긴다(위 SINGLE_TASK 주석). 헤드는 그대로 있지만
+                # 경사를 받지 않으므로 그 출력은 초기값 근처에 머문다 —
+                # 이 실행의 강수·극한기상 지표를 읽지 말 것.
+                pass
+            elif PRECIP_GAMMA_NLL:
                 # 강수 amount 를 MSE(대칭 손실) 대신 Gamma NLL 로 학습한다
                 # (위 PRECIP_GAMMA_NLL 정의부 주석 참고). "오는가"는 이미
                 # head_rain(hurdle BCE)이 담당하므로, amount 항은 습윤
@@ -1672,7 +1687,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             # 회귀 손실만으로는 무강수 쪽으로 정확히 0을 향할 유인이 약해서
             # (기울기가 실측치와의 차이에만 비례) 이 항이 없으면 dynamic_gate
             # 케이스가 아니어도 동일한 문제가 재현된다(precip_breakdown.py).
-            if hasattr(model, "head_rain"):
+            if not SINGLE_TASK and hasattr(model, "head_rain"):
                 is_wet = (y_b[:, 1:2] >= WET_THRESH).float()
                 rain_bce = nn.functional.binary_cross_entropy_with_logits(
                     model._last_rain_logit, is_wet, pos_weight=rain_pos_weight
@@ -1692,7 +1707,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
 
             _season_grp = (_season_group_from_xnum(x_num)
                           if GROUPDRO_ETA > 0 else None)
-            if hasattr(model, "head_heatwave") and hmask_b.sum() > 0:
+            if (not SINGLE_TASK and hasattr(model, "head_heatwave")
+                    and hmask_b.sum() > 0):
                 if GROUPDRO_ETA > 0:
                     loss = loss + EXTREME_BCE_WEIGHT * _groupdro_bce(
                         model._last_heatwave_logit, heat_b, hmask_b,
@@ -1700,7 +1716,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 else:
                     loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
                         model._last_heatwave_logit, heat_b, hmask_b, heatwave_pos_weight)
-            if hasattr(model, "head_coldwave") and cmask_b.sum() > 0:
+            if (not SINGLE_TASK and hasattr(model, "head_coldwave")
+                    and cmask_b.sum() > 0):
                 if GROUPDRO_ETA > 0:
                     loss = loss + EXTREME_BCE_WEIGHT * _groupdro_bce(
                         model._last_coldwave_logit, cold_b, cmask_b,
@@ -1708,8 +1725,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 else:
                     loss = loss + EXTREME_BCE_WEIGHT * _masked_bce(
                         model._last_coldwave_logit, cold_b, cmask_b, coldwave_pos_weight)
-            if (DUST_LOSS_WEIGHT > 0 and hasattr(model, "head_dust")
-                    and dmask_b.sum() > 0):
+            if (not SINGLE_TASK and DUST_LOSS_WEIGHT > 0
+                    and hasattr(model, "head_dust") and dmask_b.sum() > 0):
                 loss = loss + EXTREME_BCE_WEIGHT * DUST_LOSS_WEIGHT * _masked_bce(
                     model._last_dust_logit, dust_b, dmask_b, dust_pos_weight)
             # 게이트 엔트로피 정규화 — 가중치를 소수 축에 집중시키는 압력.
@@ -1786,6 +1803,10 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         # 조기 종료 기준: 두 baseline 대비 상대 오차의 합 (skill score)
         # 1.0 미만이면 해당 지표가 baseline 을 이긴 것.
         val_score = val_temp_mae / temp_naive + val_precip_mae / precip_naive
+        if SINGLE_TASK:
+            # 강수 헤드가 경사를 안 받으므로 그 항을 조기종료 기준에
+            # 넣으면 잡음으로 정지 시점이 정해진다.
+            val_score = val_temp_mae / temp_naive
 
         best_temp_only   = min(best_temp_only,   val_temp_mae)
         best_precip_only = min(best_precip_only, val_precip_mae)
@@ -1885,6 +1906,8 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                 "extreme_temp_neutral_idx": (
                     extreme_temp_neutral_index(len(full_ds.mean))
                     if EXTREME_TEMP_NEUTRAL else []),
+                "fusion": FUSION,
+                "single_task": SINGLE_TASK,
                 "use_nwp_subset": USE_NWP_SUBSET,
                 "nwp_model":      (NWP_ARCHIVE_MODEL if (USE_NWP or USE_NWP_SUBSET)
                                    else None),

@@ -345,6 +345,7 @@ class TriCHEFPipeline(nn.Module):
                  extreme_nwp_neutral_dims: int = 0,
                  extreme_neutral_idx: list = None,
                  extreme_temp_neutral_idx: list = None,
+                 fusion: str = "modulus",
                  signed_precip_input: bool = False,
                  head_dropout: float = 0.0,
                  coldwave_dropout: float = 0.0,
@@ -566,6 +567,32 @@ class TriCHEFPipeline(nn.Module):
         # 에서 재현되지 않은 전례가 있다 — CLAUDE.md 5절 Re축 강수 채널).
         self.extreme_temp_neutral_idx = sorted(
             set(int(i) for i in (extreme_temp_neutral_idx or [])))
+        # fusion (2026-09-24) — 3축을 하나로 합치는 연산. 기본값 `modulus` 가
+        # 논문 Eq.1 이며 종전 동작이다.
+        #
+        # 왜 인자로 뺐는가 — 이 연산이 실제로 값을 하는지 한 번도 대조된 적이
+        # 없다. 수식만 따져도 남는 성질이 적다:
+        #   ① 세 인코더가 모두 F.normalize 출력이라 ‖v‖=1 이므로
+        #      ‖s‖² = w_Re² + w_Im² + w_Z² — **노름이 게이트만의 함수**이고
+        #      표본 정보를 담지 않는다.
+        #   ② 제곱이 들어가므로 축의 실제 에너지 점유는 w 가 아니라 w² 다.
+        #      배포본 게이트 (0.073, 0.270, 0.658) → 점유 (1.0%, 14.3%, 84.7%).
+        #      즉 `s ≈ w_Z·|v_Z|` 에 가깝다.
+        #   ③ 위상각은 이 구조에서 퇴화한다(README 한계 6, 실측 1.19e-07).
+        #   ④ 남는 유일한 효과가 **부호 제거**이고, 그 대가로 우회 패치가
+        #      넷이나 붙었다(v_Z 바이패스·중립화 3종).
+        # 그리고 `coldwave_path_attribution.py` 는 이 경로 단독 단조성 상관이
+        # 체크포인트 3종 모두 +0.89~+1.00(거의 완벽한 역전)임을 실측했다 —
+        # √(x²) 가 학습 평균 중심의 V 자라는 정의상 당연한 결과다.
+        #
+        #   modulus : √((w_Re·v_Re)² + (w_Im·v_Im)² + (w_Z·v_Z)²)   [현행]
+        #   linear  : w_Re·v_Re + w_Im·v_Im + w_Z·v_Z               [부호 보존]
+        #   zonly   : v_Z                                            [Re·Im 제외]
+        # 셋 다 출력이 64차원이고 파라미터 수가 **완전히 같다** — 바뀌는 것은
+        # 연산 하나뿐이라 대조 실험이 성립한다.
+        if fusion not in ("modulus", "linear", "zonly"):
+            raise ValueError(f"알 수 없는 fusion: {fusion}")
+        self.fusion = fusion
         self.head_heatwave = _binary_head(_ext_dim, heatwave_prior, head_dropout)
         # coldwave_dropout (2026-08-17) — head_dropout과 별도로 한파 헤드에만
         # 거는 드롭아웃. head_dropout을 전체 헤드에 걸었더니(2026-08-17 기각)
@@ -713,6 +740,19 @@ class TriCHEFPipeline(nn.Module):
 
     # ── 순전파 ───────────────────────────────────────────────────
 
+    def _fuse(self, v_re, v_im, v_z, w_re, w_im, w_z):
+        """3축 → 64차원 융합 벡터. 모드별 정의는 __init__ 의 `fusion` 주석."""
+        if self.fusion == "linear":
+            return w_re * v_re + w_im * v_im + w_z * v_z
+        if self.fusion == "zonly":
+            # Re·Im 을 융합에서 제외한다. 게이트는 그대로 계산되지만 여기서
+            # 쓰이지 않는다 — 모듈을 남겨 두어야 파라미터 수와 state_dict 이
+            # 다른 모드와 같아, 비교가 아키텍처 규모에 교란되지 않는다.
+            return v_z
+        return torch.sqrt(
+            (w_re * v_re) ** 2 + (w_im * v_im) ** 2 + (w_z * v_z) ** 2 + 1e-7
+        )
+
     def forward(self,
                 num_x: torch.Tensor,
                 img_x: torch.Tensor = None,
@@ -759,10 +799,9 @@ class TriCHEFPipeline(nn.Module):
             self._gate_w = None
             w_re, w_im, w_z = 1.0, self.alpha, self.phi
 
-        # Hermitian-style modulus (논문 Eq.1, 원소별)
-        magnitude = torch.sqrt(
-            (w_re * v_re) ** 2 + (w_im * v_im) ** 2 + (w_z * v_z) ** 2 + 1e-7
-        )
+        # 3축 융합 — 기본은 Hermitian-style modulus(논문 Eq.1, 원소별).
+        # 다른 모드의 근거는 __init__ 의 `fusion` 주석 참고.
+        magnitude = self._fuse(v_re, v_im, v_z, w_re, w_im, w_z)
 
         if collect_diagnostics and self._gate_w is not None:
             with torch.no_grad():
@@ -856,9 +895,7 @@ class TriCHEFPipeline(nn.Module):
                 m_re, m_im, m_z = w_m[:, 0:1], w_m[:, 1:2], w_m[:, 2:3]
             else:
                 m_re, m_im, m_z = w_re, w_im, w_z
-            magnitude_ext = torch.sqrt(
-                (m_re * v_re) ** 2 + (m_im * v_im) ** 2 + (m_z * v_z_m) ** 2 + 1e-7
-            )
+            magnitude_ext = self._fuse(v_re, v_im, v_z_m, m_re, m_im, m_z)
 
         _ext_in = (torch.cat([magnitude_ext, v_z_ext], dim=-1)
                    if self.signed_head_input else magnitude_ext)

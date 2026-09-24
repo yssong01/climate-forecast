@@ -240,6 +240,48 @@ def _forward_all_dims():
         r2 = m_full(num_x=x_t, img_x=img, txt_x=txt).clone()
     assert float((r2 - r1).abs().max()) > 1e-6, "회귀 경로까지 중립화됐다"
     shapes.append("기온중립화(magnitude)")
+
+    # 융합 모드 3종(2026-09-24). 파라미터 수가 **완전히 같아야** 대조 실험이
+    # 아키텍처 규모에 교란되지 않는다. `zonly` 는 Re·Im 을 실제로 무시하는지,
+    # `linear` 는 부호를 실제로 보존하는지도 함께 확인한다.
+    npar = {}
+    for mode in ("modulus", "linear", "zonly"):
+        m = TriCHEFPipeline(
+            num_features=28, im_dim=12, signed_head_input=True, fusion=mode,
+            feat_mean=np.zeros(28, dtype=np.float32),
+            feat_std=np.ones(28, dtype=np.float32)).eval()
+        npar[mode] = sum(p.numel() for p in m.parameters())
+        with torch.no_grad():
+            o = m(num_x=torch.randn(3, 28), img_x=torch.randn(3, 4, 32, 32),
+                  txt_x=torch.randn(3, 12))
+        assert tuple(o.shape) == (3, 2), f"{mode}: 출력 shape {o.shape}"
+    assert len(set(npar.values())) == 1, f"모드별 파라미터 수가 다르다: {npar}"
+
+    x, img, txt = torch.randn(3, 28), torch.randn(3, 4, 32, 32), torch.randn(3, 12)
+    mz = TriCHEFPipeline(
+        num_features=28, im_dim=12, signed_head_input=True, fusion="zonly",
+        feat_mean=np.zeros(28, dtype=np.float32),
+        feat_std=np.ones(28, dtype=np.float32)).eval()
+    with torch.no_grad():
+        a = mz(num_x=x, img_x=img, txt_x=txt).clone()
+        b = mz(num_x=x, img_x=torch.randn(3, 4, 32, 32),
+               txt_x=torch.randn(3, 12)).clone()
+    assert float((a - b).abs().max()) < 1e-6, "zonly 인데 Re·Im 이 출력을 바꾼다"
+
+    # 게이트를 켠 구성으로 만든다 — 배포 설정이 `dynamic_gate=True` 이고,
+    # 꺼져 있으면 `self.gate` 자체가 없다.
+    ml = TriCHEFPipeline(
+        num_features=28, im_dim=12, signed_head_input=True, fusion="linear",
+        dynamic_gate=True,
+        feat_mean=np.zeros(28, dtype=np.float32),
+        feat_std=np.ones(28, dtype=np.float32)).eval()
+    with torch.no_grad():
+        ml(num_x=x, img_x=img, txt_x=txt)
+        v_re, v_im, v_z = ml.encode(x, img, txt)
+        w = ml.gate(x)
+        s = ml._fuse(v_re, v_im, v_z, w[:, 0:1], w[:, 1:2], w[:, 2:3])
+    assert float(s.min()) < 0, "linear 인데 융합값이 전부 비음수다(부호 미보존)"
+    shapes.append(f"융합 3모드(파라미터 {next(iter(npar.values())):,} 동일)")
     return " / ".join(shapes)
 
 
