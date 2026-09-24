@@ -73,6 +73,10 @@ checkpoints/*
 *.ckpt
 !checkpoints/numerical_trichef.pt
 !checkpoints/numerical_trichef_12h.pt
+# 기온 전용 보조 체크포인트 2개(2026-09-25) — predict.load_temp_model() 이
+# 읽는 배포 경로다. 기온과 그 예측구간만 이쪽에서 나온다.
+!checkpoints/numerical_trichef_temp.pt
+!checkpoints/numerical_trichef_temp_12h.pt
 
 # ChromaDB 로컬 저장소
 chroma_db/

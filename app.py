@@ -62,6 +62,11 @@ from nwp_collector import feature_dim as nwp_feature_dim
 # +12h 도 같은 커리큘럼을 독립 2회 실행해 검증 후 적용했다(F1 0.453→0.509,
 # 계절 오탐도 5.41% WARN → 1.21% PASS 로 개선). README '+12h 2차 산출값' 참고.
 CHECKPOINT_12H = "./checkpoints/numerical_trichef_12h.pt"
+# +12h 기온 전용 보조 체크포인트(2026-09-25). +6h 는 predict.TEMP_CHECKPOINT
+# 가 기본값으로 갖고 있고, 리드타임별로 따로 둬야 하므로 여기서 지정한다 —
+# 잔차 분포가 리드타임마다 달라 예측구간 분위수를 공유할 수 없다
+# (폭 +6h 3.65 vs +12h 4.16°C).
+TEMP_CHECKPOINT_12H = "./checkpoints/numerical_trichef_temp_12h.pt"
 
 # ASOS 타임스탬프는 tz 정보 없는 KST 벽시계 표기다. 컨테이너 기본 시간대는
 # UTC라 datetime.now()를 그대로 쓰면 "최근 72시간" 커트라인이 실제로는 9시간
@@ -178,6 +183,15 @@ def get_model(fingerprint: str):
 
 
 @st.cache_resource(show_spinner=False)
+def get_temp_model_at(path: str, fingerprint: str, _main_ckpt):
+    """리드타임별 기온 전용 모델. path 를 캐시 키에 넣어 +6h/+12h 가 서로를
+    덮어쓰지 않게 한다(get_model_at 과 같은 이유)."""
+    if not path or not os.path.exists(path):
+        return None, None
+    return load_temp_model(_main_ckpt, path)
+
+
+@st.cache_resource(show_spinner=False)
 def get_temp_model(fingerprint: str, _main_ckpt):
     """기온 전용 보조 모델(없으면 `(None, None)`).
 
@@ -185,9 +199,7 @@ def get_temp_model(fingerprint: str, _main_ckpt):
     `predict.load_temp_model()` 안에서 하며, 어긋나면 예외로 멈춘다 —
     조용히 다른 값을 내는 것보다 화면이 멈추는 편이 낫다.
     """
-    if not TEMP_CHECKPOINT:
-        return None, None
-    return load_temp_model(_main_ckpt, TEMP_CHECKPOINT)
+    return get_temp_model_at(TEMP_CHECKPOINT, fingerprint, _main_ckpt)
 
 
 def obs_hour_key() -> str:
@@ -884,6 +896,14 @@ try:
     model, ckpt = get_model(_fp6)
     _fpT = ckpt_fingerprint(TEMP_CHECKPOINT) if TEMP_CHECKPOINT else ""
     temp_model, temp_ckpt = get_temp_model(_fpT, ckpt)
+    if TEMP_CHECKPOINT and temp_model is None:
+        # 조용히 주 모델로 내려가면 기온이 나빠진 것을 아무도 모른다 —
+        # 폴백이 숫자를 조용히 바꾸지 않게 한다는 규약(4절)과 같은 취지.
+        st.warning(
+            "기온 전용 모델을 찾을 수 없어 주 모델의 기온을 표시한다 — "
+            f"`{TEMP_CHECKPOINT}` 가 없다. 정확도(MAE 0.85 → 1.17°C)와 "
+            "예측구간 폭이 그만큼 나빠진 값이다."
+        )
     # 수치예보 입력을 쓰는 체크포인트라면 그 창을 먼저 내려받는다 — 없으면
     # predict() 가 NWPUnavailable 을 올린다(중립값으로 메우지 않는다).
     _nwp_status = sync_nwp_window() if ckpt.get("use_nwp", False) else None
@@ -1330,8 +1350,12 @@ with tab_trend:
     try:
         _fp12 = ckpt_fingerprint(CHECKPOINT_12H)
         model_12h, ckpt_12h = get_model_at(CHECKPOINT_12H, _fp12)
+        _fpT12 = ckpt_fingerprint(TEMP_CHECKPOINT_12H)
+        tmodel_12h, tckpt_12h = get_temp_model_at(TEMP_CHECKPOINT_12H, _fpT12,
+                                                  ckpt_12h)
         result_12h = cached_predict(
-            stn, obs_hour_key(), ckpt_12h["lead_hours"], _fp12, model_12h, ckpt_12h)
+            stn, obs_hour_key(), ckpt_12h["lead_hours"], _fp12, model_12h,
+            ckpt_12h, _fpT12, tmodel_12h, tckpt_12h)
     except Exception as e:
         # +6h(배포 필수 경로)와 달리 +12h 는 2차 산출값이라 없어도 앱
         # 전체가 멈출 이유는 없다 — 실패하면 그 부분만 빠진 채 표시한다.
@@ -1353,9 +1377,14 @@ with tab_trend:
         # 상수로 박혀 있었고, 그중 강수 발생 판정 F1 은 체크포인트에 없어
         # 대조할 방법조차 없었다 — 이제 metrics_report.py --patch-checkpoint
         # 가 `val_precip_wet_f1` 로 적어 넣는다.
-        def _lead_pair(key, fmt="{:.3f}"):
-            """두 체크포인트의 같은 지표를 'a→b' 로 만든다. 없으면 None."""
-            a, b = ckpt.get(key), (ckpt_12h or {}).get(key)
+        def _lead_pair(key, fmt="{:.3f}", a_ckpt=None, b_ckpt=None):
+            """두 체크포인트의 같은 지표를 'a→b' 로 만든다. 없으면 None.
+
+            기온처럼 **다른 모델이 내는 값**은 그 모델의 체크포인트를 넘긴다
+            (2026-09-25 — 기온 전용 보조 모델 도입).
+            """
+            a = (a_ckpt if a_ckpt is not None else ckpt).get(key)
+            b = ((b_ckpt if b_ckpt is not None else ckpt_12h) or {}).get(key)
             if a is None or b is None:
                 return None
             return fmt.format(a) + "→" + fmt.format(b)
@@ -1368,7 +1397,9 @@ with tab_trend:
             return fmt.format(a) + "→" + fmt.format(b)
 
         _bits = [
-            ("기온 MAE", _lead_pair("val_temp_mae", "{:.2f}"), "°C"),
+            ("기온 MAE", _lead_pair("val_temp_mae", "{:.2f}",
+                                   a_ckpt=(temp_ckpt or ckpt),
+                                   b_ckpt=(tckpt_12h or ckpt_12h)), "°C"),
             ("강수 발생 판정 F1", _lead_pair("val_precip_wet_f1"), ""),
             ("폭염 F1", _served_pair("heatwave"), ""),
             ("한파 F1", _served_pair("coldwave"), ""),
@@ -1587,7 +1618,9 @@ with tab_trend:
         st.caption(_star_caption)
 
     st.markdown("#### 모델 출력값")
-    _val_temp_mae6 = ckpt.get("val_temp_mae")
+    # 기온 지표는 **그 기온을 낸 모델**에서 읽는다 — 주 체크포인트 값을 쓰면
+    # 화면의 ± 가 실제로 표시 중인 예측의 오차가 아니게 된다(2026-09-25).
+    _val_temp_mae6 = (temp_ckpt or ckpt).get("val_temp_mae")
     _d_temp6 = f6["temperature"] - c6["temperature"]
     _d_precip6 = f6["precipitation"] - c6["precipitation"]
     # 90% 예측구간(분포무관, split conformal) — 2026-09-01 연결. "±MAE"는
@@ -1667,7 +1700,7 @@ with tab_trend:
                # 않는다 — 0 이면 _color_by_delta 가 빈 스타일을 돌려준다.
                {"항목": "강수 확률", "+6시간(기본)": 0.0}]
     if result_12h is not None:
-        _val_temp_mae12 = ckpt_12h.get("val_temp_mae")
+        _val_temp_mae12 = (tckpt_12h or ckpt_12h).get("val_temp_mae")
         _d_temp12 = f12["temperature"] - c12["temperature"]
         _d_precip12 = f12["precipitation"] - c12["precipitation"]
         _ti12 = f12.get("temp_interval_90")
@@ -1883,7 +1916,7 @@ with tab_extreme:
 # ── 탭 3: 성능 검증 ──────────────────────────────────────────────
 
 with tab_perf:
-    val_temp = ckpt.get("val_temp_mae")
+    val_temp = (temp_ckpt or ckpt).get("val_temp_mae")
     val_precip = ckpt.get("val_precip_mae")
     if val_temp is not None:
         st.markdown("#### 회귀(regression) 성능 — 기온·강수 오차")
@@ -2371,6 +2404,20 @@ with tab_perf:
 # ── 탭 4: 모델 구조 ──────────────────────────────────────────────
 
 with tab_model:
+    # 2026-09-25 부터 리드타임마다 모델이 둘이다 — 화면이 한 모델을 전제로
+    # 설명하면 아래 축 배분·융합 수식이 어느 출력의 것인지 오해된다.
+    if temp_ckpt is not None:
+        _t_solo = temp_ckpt.get("val_temp_mae")
+        _t_multi = ckpt.get("val_temp_mae")
+        st.info(
+            "**이 화면은 모델 두 개의 출력을 함께 보여준다.** 기온과 그 90% 예측구간은 "
+            f"**기온 전용 모델**(검증 MAE {_t_solo:.2f}°C)이, 강수·극한기상 확률은 아래 "
+            "구조의 **다중과제 모델**이 낸다. 두 모델은 구조와 파라미터 수(각 60,729개)가 "
+            "같고 학습 손실만 다르다 — 헤드 여섯 개가 트렁크를 공유하는 비용이 기온에서 "
+            f"특히 커서, 기온만 따로 학습하면 MAE 가 {_t_multi:.2f} → {_t_solo:.2f}°C 로 "
+            "낮아진다(시간 분할 검증 포함). **아래 축 배분과 융합 수식은 다중과제 모델 "
+            "기준이다.**"
+        )
     gw = result["gate_weights"]
     if gw:
         st.markdown("#### 축 기여도 — 이번 출력값에 대한 3축 배분")

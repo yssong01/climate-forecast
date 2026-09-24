@@ -58,7 +58,8 @@ CHECKPOINT = os.getenv("CHECKPOINT_PATH", "./checkpoints/numerical_trichef.pt")
 # 관측소 사각지대 게이트 결과가 **정의상 불변**이라 회귀 위험이 없다 —
 # 단조성 게이트가 seed 에 좌우돼 사실상 추첨인 상황에서(배포 구성조차
 # 1/3 PASS) 그 추첨을 아예 돌리지 않는 설계다.
-TEMP_CHECKPOINT = os.getenv("TEMP_CHECKPOINT_PATH", "")
+TEMP_CHECKPOINT = os.getenv("TEMP_CHECKPOINT_PATH",
+                            "./checkpoints/numerical_trichef_temp.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 

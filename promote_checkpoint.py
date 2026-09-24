@@ -57,7 +57,18 @@ PRODUCTION_CHECKPOINT = "./checkpoints/numerical_trichef.pt"
 PRODUCTION_TARGETS = {
     6:  "./checkpoints/numerical_trichef.pt",
     12: "./checkpoints/numerical_trichef_12h.pt",
+    # 기온 전용 보조 모델(2026-09-25). 기온과 그 예측구간만 낸다 —
+    # predict.TEMP_CHECKPOINT / app.TEMP_CHECKPOINT_12H 가 읽는 경로다.
+    "temp6":  "./checkpoints/numerical_trichef_temp.pt",
+    "temp12": "./checkpoints/numerical_trichef_temp_12h.pt",
 }
+# 기온 전용 후보는 극한기상 헤드가 경사를 받지 않아 그 게이트가 의미가 없다
+# (확률이 초기값 근처에 머물러 FAIL 로 잡히지만, 그 헤드는 **서빙에서 쓰이지
+# 않는다**). 대신 **주 모델을 건드리지 않으므로 그 게이트들의 결과가 정의상
+# 불변**이다 — 건너뛰는 것이 아니라 해당 사항이 없는 것이다. 회귀 성능
+# 게이트와 예측구간 재적합은 그대로 받는다.
+TEMP_ONLY_TARGETS = ("./checkpoints/numerical_trichef_temp.pt",
+                     "./checkpoints/numerical_trichef_temp_12h.pt")
 CHECKPOINT = PRODUCTION_CHECKPOINT   # 이 파일 안의 기존 참조를 그대로 둔다
 
 # 게이트 임계 — seasonal_falsealarm_check.py / coldwave_pathway_check.py 와
@@ -180,18 +191,27 @@ def main():
             elif code == "WARN":
                 warnings.append(f"{name}: WARN {extra}")
 
-    out, _ = run(["seasonal_falsealarm_check.py", cand], "게이트 1 — 계절 오탐")
-    collect(out)
-
-    for head in ("coldwave", "heatwave"):
-        out, _ = run(["coldwave_pathway_check.py", f"--head={head}", cand],
-                     f"게이트 2 — 단조성({head})")
+    _temp_only = CHECKPOINT in TEMP_ONLY_TARGETS
+    if _temp_only:
+        print(f"\n{'='*78}\n▶ 게이트 1·2·2-1 — 해당 없음(기온 전용 후보)\n{'='*78}")
+        print("  이 후보는 기온과 그 예측구간만 낸다. 극한기상 헤드는 손실을 받지\n"
+              "  않아 확률이 초기값 근처이고, **서빙에서 쓰이지 않는다** — 주 모델을\n"
+              "  건드리지 않으므로 계절 오탐·단조성·관측소 사각지대 판정은 정의상\n"
+              "  불변이다. 회귀 성능 게이트는 그대로 적용한다.")
+    else:
+        out, _ = run(["seasonal_falsealarm_check.py", cand], "게이트 1 — 계절 오탐")
         collect(out)
 
-    # 계절 축과 같은 사각지대가 관측소 축에도 있는지 본다. 라벨이 없는
-    # 관측소의 출력은 채점된 적이 없으므로, 경보를 얼마나 내는지 확인한다.
-    out, _ = run(["station_coverage_check.py", cand], "게이트 2-1 — 관측소 라벨 사각지대")
-    collect(out)
+        for head in ("coldwave", "heatwave"):
+            out, _ = run(["coldwave_pathway_check.py", f"--head={head}", cand],
+                         f"게이트 2 — 단조성({head})")
+            collect(out)
+
+        # 계절 축과 같은 사각지대가 관측소 축에도 있는지 본다. 라벨이 없는
+        # 관측소의 출력은 채점된 적이 없으므로, 경보를 얼마나 내는지 확인한다.
+        out, _ = run(["station_coverage_check.py", cand],
+                     "게이트 2-1 — 관측소 라벨 사각지대")
+        collect(out)
 
     # ── 게이트 3 — 회귀 성능이 뒷걸음질 치지 않는지 ────────────────
     print(f"\n{'='*78}\n▶ 게이트 3 — 회귀 성능 비교\n{'='*78}")
