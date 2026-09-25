@@ -430,7 +430,11 @@ def main():
 
     os.makedirs(os.path.dirname(out_json), exist_ok=True)
     with open(out_json, "w", encoding="utf-8") as f:
+        # 기온 출처를 함께 적는다 — 기온 칸이 다른 모델에서 왔는데 그 사실이
+        # 산출물에 없으면, 나중에 이 JSON 을 근거로 쓰는 쪽이 어느 세대의
+        # 값인지 알 수 없다(이 저장소가 반복해 겪은 드리프트의 입구다).
         json.dump({"checkpoint": args.ckpt,
+                   "temp_checkpoint": args.temp_checkpoint,
                    "accuracy": acc, "precision": pre, "calibration": cal},
                   f, ensure_ascii=False, indent=2)
     print(f"저장: {out_json}")
