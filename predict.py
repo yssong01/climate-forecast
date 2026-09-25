@@ -58,8 +58,16 @@ CHECKPOINT = os.getenv("CHECKPOINT_PATH", "./checkpoints/numerical_trichef.pt")
 # 관측소 사각지대 게이트 결과가 **정의상 불변**이라 회귀 위험이 없다 —
 # 단조성 게이트가 seed 에 좌우돼 사실상 추첨인 상황에서(배포 구성조차
 # 1/3 PASS) 그 추첨을 아예 돌리지 않는 설계다.
-TEMP_CHECKPOINT = os.getenv("TEMP_CHECKPOINT_PATH",
-                            "./checkpoints/numerical_trichef_temp.pt")
+# 기본값은 **이 파일이 있는 디렉터리** 기준 절대경로다. 상대경로로 두면
+# `refresh-data.yml` 처럼 코드와 데이터를 다른 디렉터리에 체크아웃하고
+# 데이터 쪽을 작업 디렉터리로 쓰는 경로에서 찾지 못한다 —
+# `record_online_forecasts.DEFAULT_CHECKPOINT` 가 같은 이유로 이미 절대경로를
+# 쓰고 있었는데, 2026-09-25 에 이 상수를 상대경로로 넣어 그 함정을 다시
+# 만들었다(CI 시뮬레이션에서 12개 관측소 전부 FileNotFoundError 로 실패).
+TEMP_CHECKPOINT = os.getenv(
+    "TEMP_CHECKPOINT_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "checkpoints", "numerical_trichef_temp.pt"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 

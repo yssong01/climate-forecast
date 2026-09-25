@@ -285,6 +285,59 @@ def _forward_all_dims():
     return " / ".join(shapes)
 
 
+# ── ③-2 기온 전용 보조 체크포인트 경로 ──────────────────────────
+def _temp_checkpoint_path():
+    """배포 경로가 **절대경로**이고 `accuracy` 와 **같은 값**인지 확인한다.
+
+    왜 시험으로 고정하는가(2026-09-25) — 이 상수를 상대경로로 넣었다가
+    `refresh-data.yml` 의 레이아웃(코드와 데이터를 다른 디렉터리에 체크아웃하고
+    데이터 쪽을 작업 디렉터리로 사용)에서 12개 관측소 전부가
+    FileNotFoundError 로 실패했다. `record_online_forecasts.DEFAULT_CHECKPOINT`
+    가 같은 이유로 이미 절대경로를 쓰고 있었는데 그 함정을 다시 만든 것이다.
+
+    두 모듈이 기본값을 따로 갖는 이유는 `accuracy` 가 predict 를 임포트하면
+    torch·train 까지 끌고 오기 때문이다(수집 스크립트도 이 모듈을 쓴다).
+    한 곳으로 합칠 수 없으므로 **일치를 여기서 강제한다.**
+    """
+    import os
+    import importlib
+    import predict
+    import accuracy as _acc
+
+    assert os.path.isabs(predict.TEMP_CHECKPOINT), (
+        f"TEMP_CHECKPOINT 가 상대경로다: {predict.TEMP_CHECKPOINT}")
+
+    # accuracy 의 기본값을 꺼내 비교한다 — 환경변수가 없을 때의 경로.
+    prev = os.environ.pop("TEMP_CHECKPOINT_PATH", None)
+    try:
+        importlib.reload(_acc)
+        acc_default = os.path.join(
+            os.path.dirname(os.path.abspath(_acc.__file__)),
+            "checkpoints", "numerical_trichef_temp.pt")
+        assert os.path.abspath(acc_default) == os.path.abspath(
+            predict.TEMP_CHECKPOINT), (
+            f"predict 와 accuracy 의 기본 경로가 다르다:\n"
+            f"  predict  {predict.TEMP_CHECKPOINT}\n  accuracy {acc_default}")
+        # 실제로 존재해야 배포가 성립한다(gitignore 부정 규칙으로 추적 중).
+        assert os.path.exists(predict.TEMP_CHECKPOINT), (
+            f"배포 경로에 기온 전용 체크포인트가 없다: {predict.TEMP_CHECKPOINT}")
+        # 신원에 보조 모델이 실제로 섞이는가 — 빠뜨리면 서로 다른 세대의
+        # 적중률이 한 줄로 뭉친다.
+        main = os.path.join(os.path.dirname(os.path.abspath(_acc.__file__)),
+                            "checkpoints", "numerical_trichef.pt")
+        with_temp = _acc.model_fingerprint(main)
+        os.environ["TEMP_CHECKPOINT_PATH"] = "/nonexistent.pt"
+        importlib.reload(_acc)
+        without = _acc.model_fingerprint(main)
+        assert with_temp != without, "model_id 가 보조 모델을 반영하지 않는다"
+    finally:
+        os.environ.pop("TEMP_CHECKPOINT_PATH", None)
+        if prev is not None:
+            os.environ["TEMP_CHECKPOINT_PATH"] = prev
+        importlib.reload(_acc)
+    return f"절대경로 · predict≡accuracy · 신원 반영"
+
+
 # ── ④ 판정선 조회가 모든 체크포인트 형태에서 동작하는가 ──────────
 def _threshold_paths():
     from predict import event_threshold, STATION_EVENT_THRESH_OVERRIDES
@@ -327,6 +380,8 @@ def main():
     check("aux_dataset_kwargs", _aux_kwargs_consistency)
     print("\n[T3] 부가 특징 차원별 모델 forward")
     check("forward", _forward_all_dims)
+    print("\n[T3-2] 기온 전용 보조 체크포인트 경로·신원")
+    check("temp_checkpoint", _temp_checkpoint_path)
     print("\n[T4] 판정선 조회(구버전/신버전 체크포인트)")
     check("event_threshold", _threshold_paths)
     print("\n[T5] 배포 체크포인트 로드·추론")

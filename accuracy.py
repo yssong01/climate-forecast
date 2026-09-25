@@ -90,9 +90,16 @@ def model_fingerprint(checkpoint_path: str) -> str:
     # 모델의 적중률이 한 줄로 뭉친다(2026-09-24 추가). 환경변수를 직접 읽는
     # 이유는 `predict.TEMP_CHECKPOINT` 와 같은 출처를 쓰면서도 이 모듈이
     # predict 를 임포트하지 않기 위해서다(수집 스크립트도 이 모듈을 쓴다).
+    # 기본값은 `predict.TEMP_CHECKPOINT` 와 **같아야 한다** — 다르면 예측은
+    # 보조 모델이 내는데 신원에는 안 들어가 서로 다른 세대의 적중률이 한
+    # 줄로 뭉친다. 여기서 predict 를 임포트하지 않는 이유는 그 모듈이
+    # torch·train 을 끌고 와 무겁고, 이 모듈은 수집 스크립트도 쓰기
+    # 때문이다. 두 곳이 일치하는지는 연기 시험이 확인한다.
     paths = [checkpoint_path]
-    _temp = os.getenv("TEMP_CHECKPOINT_PATH", "")
-    if _temp:
+    _temp = os.getenv("TEMP_CHECKPOINT_PATH") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "checkpoints", "numerical_trichef_temp.pt")
+    if _temp and os.path.exists(_temp):
         paths.append(_temp)
     try:
         key = tuple((p, os.stat(p).st_mtime_ns, os.stat(p).st_size) for p in paths)
