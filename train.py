@@ -232,12 +232,14 @@ SINGLE_TASK = os.getenv("SINGLE_TASK", "0") == "1"
 #   STOP_ON    : combined(기본, 기온+강수) | temp
 LOSS_HEADS = os.getenv("LOSS_HEADS", "temp" if SINGLE_TASK else "all")
 STOP_ON = os.getenv("STOP_ON", "temp" if SINGLE_TASK else "combined")
-if LOSS_HEADS not in ("all", "temp", "temp+precip", "temp+extreme"):
+if LOSS_HEADS not in ("all", "temp", "temp+precip", "temp+extreme",
+                      "precip+extreme", "precip", "extreme"):
     raise ValueError(f"알 수 없는 LOSS_HEADS: {LOSS_HEADS}")
-if STOP_ON not in ("combined", "temp"):
+if STOP_ON not in ("combined", "temp", "precip", "extreme"):
     raise ValueError(f"알 수 없는 STOP_ON: {STOP_ON}")
-USE_PRECIP_LOSS = LOSS_HEADS in ("all", "temp+precip")
-USE_EXTREME_LOSS = LOSS_HEADS in ("all", "temp+extreme")
+USE_TEMP_LOSS = LOSS_HEADS in ("all", "temp", "temp+precip", "temp+extreme")
+USE_PRECIP_LOSS = LOSS_HEADS in ("all", "temp+precip", "precip+extreme", "precip")
+USE_EXTREME_LOSS = LOSS_HEADS in ("all", "temp+extreme", "precip+extreme", "extreme")
 
 
 def extreme_temp_neutral_index(num_features: int) -> list[int]:
@@ -652,6 +654,32 @@ def collect_historical(n_hours: int = N_HOURS,
 def _parse_ts(ts) -> datetime:
     """YYYYMMDDHHmm 문자열 → datetime."""
     return datetime.strptime(str(ts)[:12], "%Y%m%d%H%M")
+
+
+def _auc(probs: torch.Tensor, labels: torch.Tensor) -> float:
+    """ROC AUC — 순위(Mann-Whitney U)로 계산한다. 양성·음성이 한쪽뿐이면 NaN.
+
+    **왜 F1 이 아니라 AUC 인가.** 조기종료 기준은 판정선에 의존하면 안 된다.
+    2026-09-24 에 `t=0.5` 로 두 구성을 비교했다가 한파 F1 이 0.212 vs 0.450
+    으로 갈려 "두 배 좋다"고 결론냈는데, 판정선을 각자 고르자 0.4721 vs
+    0.4453 으로 **뒤집혔다** — 긴 학습이 확률 눈금을 옮겼을 뿐이었다.
+    AUC 는 순위만 보므로 그 눈금 이동에 흔들리지 않는다.
+    """
+    y = (labels > 0.5).float()
+    n_pos, n_neg = float(y.sum()), float((1 - y).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    # 동점은 평균 순위를 준다 — argsort 두 번으로는 동점 처리가 안 되므로
+    # 고유값 단위로 평균 순위를 만든다.
+    order = torch.argsort(probs)
+    ranks = torch.empty_like(probs, dtype=torch.float64)
+    ranks[order] = torch.arange(1, len(probs) + 1, dtype=torch.float64)
+    uniq, inv = torch.unique(probs, return_inverse=True)
+    sums = torch.zeros(len(uniq), dtype=torch.float64).index_add_(0, inv, ranks)
+    cnts = torch.zeros(len(uniq), dtype=torch.float64).index_add_(
+        0, inv, torch.ones_like(ranks))
+    ranks = (sums / cnts)[inv]
+    return float((ranks[y > 0.5].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
 def _prf_metrics(probs: torch.Tensor, labels: torch.Tensor,
@@ -1656,7 +1684,14 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
             x_txt = x_txt.to(DEVICE, **_nb) if use_im else None
 
             pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt)
-            loss = mse(pred[:, 0:1], y_b[:, 0:1]) / temp_var
+            # 기온 항도 끌 수 있다(2026-09-25). 기온을 전용 모델이 내게 된
+            # 뒤로 주 모델의 기온 헤드는 표시에 쓰이지 않는데, 그 손실은
+            # 여전히 강수·극한기상과 트렁크를 두고 경쟁한다 — 그 비용을
+            # 재려면 끌 수 있어야 한다. 다만 기온은 **모든 표본에 라벨이
+            # 있는 유일한 축**이라 보조 과제로서 도움이 될 수도 있어,
+            # 끄는 것이 이득인지는 실측으로 가린다.
+            loss = (mse(pred[:, 0:1], y_b[:, 0:1]) / temp_var if USE_TEMP_LOSS
+                    else torch.zeros((), device=DEVICE))
             if not USE_PRECIP_LOSS:
                 # 강수 항을 끈다(위 LOSS_HEADS 주석). 헤드는 그대로 있지만
                 # 경사를 받지 않으므로 출력이 초기값 근처에 머문다 —
@@ -1821,7 +1856,23 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
         # 조기 종료 기준: 두 baseline 대비 상대 오차의 합 (skill score)
         # 1.0 미만이면 해당 지표가 baseline 을 이긴 것.
         val_score = val_temp_mae / temp_naive + val_precip_mae / precip_naive
-        if STOP_ON == "temp":
+        if STOP_ON == "precip":
+            val_score = val_precip_mae / precip_naive
+        elif STOP_ON == "extreme":
+            # 극한기상만 학습할 때는 기온·강수 지표가 경사를 안 받아 정지
+            # 시점을 잡음이 정한다. 세 헤드의 AUC 평균을 쓴다 — **판정선에
+            # 의존하지 않는** 지표라야 한다(t=0.5 로 비교했다가 결론이
+            # 뒤집힌 사고가 2026-09-24 에 있었다). 낮을수록 좋은 척도로
+            # 맞추려 1 에서 뺀다.
+            _aucs = [_auc(torch.cat(_p)[torch.cat(_m).bool()],
+                          torch.cat(_t)[torch.cat(_m).bool()])
+                     for _p, _t, _m in ((heat_probs, heat_true, heat_mask_all),
+                                        (cold_probs, cold_true, cold_mask_all),
+                                        (dust_probs, dust_true, dust_mask_all))
+                     if _p and torch.cat(_m).bool().sum() > 0]
+            _aucs = [a for a in _aucs if a == a]          # NaN 제외
+            val_score = 1.0 - (sum(_aucs) / len(_aucs) if _aucs else 0.0)
+        elif STOP_ON == "temp":
             # 강수 항을 조기종료 기준에서 뺀다. LOSS_HEADS 로 강수를 끈
             # 실행에서는 필수이고(경사를 안 받는 값이 정지 시점을 정한다),
             # 손실은 그대로 둔 채 기준만 바꾸면 "정지 시점이 원인인가"를
