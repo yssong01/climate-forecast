@@ -373,6 +373,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt", nargs="?", default=CHECKPOINT)
     ap.add_argument("--batch", type=int, default=eval_cache.DEFAULT_BATCH)
+    ap.add_argument("--temp-checkpoint", default=None,
+                    help="기온 예측만 이 체크포인트에서 가져온다(서빙과 같은 구성). "
+                         "2026-09-25 부터 배포는 기온을 전용 모델이 낸다.")
     ap.add_argument("--no-plot", action="store_true",
                     help="그림을 다시 그리지 않는다. docs/images/metrics_report.png 는 "
                          "+6h 배포본 기준의 공용 산출물이라, 다른 리드타임이나 실험 "
@@ -386,6 +389,20 @@ def main():
     import torch
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
     d = eval_cache.load(args.ckpt, args.batch)
+    if args.temp_checkpoint:
+        # 서빙이 기온을 전용 모델에서 내므로 리포트도 그래야 한다 — 안 하면
+        # 그림·JSON 의 기온 칸만 한 세대 뒤처진다(이 저장소가 반복해 겪은
+        # "수치는 바뀌었는데 서술은 그대로" 유형이다).
+        dt = eval_cache.build(args.temp_checkpoint, args.batch)
+        same = (len(dt["temp_true"]) == len(d["temp_true"])
+                and (dt["tgt_ts"] == d["tgt_ts"]).all()
+                and (dt["stn"] == d["stn"]).all())
+        if not same:
+            raise SystemExit("기온 체크포인트의 검증 표본이 주 체크포인트와 "
+                             "다르다 — 같은 표에 섞을 수 없다.")
+        d = dict(d)
+        d["temp_pred"] = dt["temp_pred"]
+        print(f"기온 예측 출처: {args.temp_checkpoint} (서빙과 동일)")
 
     acc = accuracy_block(d, ckpt)
     pre = precision_block(d, ckpt)

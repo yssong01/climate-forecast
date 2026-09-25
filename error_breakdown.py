@@ -232,6 +232,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt", nargs="?", default=CHECKPOINT)
     ap.add_argument("--batch", type=int, default=eval_cache.DEFAULT_BATCH)
+    ap.add_argument("--temp-checkpoint", default=None,
+                    help="기온 예측만 이 체크포인트에서 가져온다(서빙과 동일).")
     ap.add_argument("--served", action="store_true",
                     help="서빙 후처리(rain_prob < PRECIP_PROB_GATE 면 0)를 적용한 값으로 분해한다")
     args = ap.parse_args()
@@ -241,6 +243,17 @@ def main():
     prob_gate = PRECIP_PROB_GATE_BY_LEAD.get(ckpt.get("lead_hours"), PRECIP_PROB_GATE)
 
     d = eval_cache.load(args.ckpt, args.batch)
+    if args.temp_checkpoint:
+        # metrics_report.py 와 같은 이유 — 서빙이 기온을 전용 모델에서 내므로
+        # 기온 구간 분해도 그 모델의 오차로 그려야 한다.
+        dt = eval_cache.build(args.temp_checkpoint, args.batch)
+        if not (len(dt["temp_true"]) == len(d["temp_true"])
+                and (dt["tgt_ts"] == d["tgt_ts"]).all()
+                and (dt["stn"] == d["stn"]).all()):
+            raise SystemExit("기온 체크포인트의 검증 표본이 다르다 — 섞을 수 없다.")
+        d = dict(d)
+        d["temp_pred"] = dt["temp_pred"]
+        print(f"기온 예측 출처: {args.temp_checkpoint} (서빙과 동일)")
     pp = d["precip_pred"]
     if args.served:
         pp = np.where(d["rain_prob"] < prob_gate, 0.0, pp)
