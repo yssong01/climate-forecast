@@ -137,11 +137,30 @@ def snapshot():
     if os.path.exists(SNAPSHOT_PATH):
         with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
             snaps = json.load(f)
+
+    # **6시간 버킷당 한 번만 뜬다.** CI 는 15분마다 도는 잡에 얹혀 있어,
+    # 시(hour)만 보고 거르면 같은 시간대의 네 번이 전부 통과한다 — 하루
+    # 16회가 되고 보관 20회가 **30시간치**밖에 안 남아 며칠에 걸친 갱신을
+    # 볼 수 없다. 이 측정의 목적이 정확히 그 '며칠'이므로 여기서 막는다
+    # (호출부가 어떻게 부르든 스스로 보장한다).
+    def _bucket(ts12):
+        """'YYYYMMDDHHmm' → 6시간 버킷 키. **키 앞자리를 그대로 비교하면
+        안 된다** — 키의 앞 10자리는 실제 조회 시(hour)라 버킷 시와 다르다
+        (16시 조회의 버킷은 12시다). 첫 구현이 이 때문에 같은 버킷을 두 번
+        떴고, 실제로 파일에 2회가 쌓여 드러났다."""
+        return f"{str(ts12)[:8]}{int(str(ts12)[8:10]) // 6 * 6:02d}"
+
+    bucket = _bucket(fetched_at)
+    if any(_bucket(k) == bucket for k in snaps):
+        print(f"에어로졸 스냅숏: {bucket}xx 버킷은 이미 있다 — 건너뛴다 "
+              f"(보관 {len(snaps)}회)")
+        return snaps
+
     for name, (lat, lon) in points.items():
         rows = _to_records(_request(lat, lon, start, end))
         snaps.setdefault(fetched_at, {})[name] = rows
         time.sleep(1)
-    # 파일이 무한히 자라지 않게 최근 조회 20회만 남긴다.
+    # 6시간마다 1회 × 20회 = 약 5일치. 드리프트는 그 안에서 드러난다.
     for k in sorted(snaps)[:-20]:
         snaps.pop(k)
     _save(SNAPSHOT_PATH, snaps)
@@ -177,13 +196,31 @@ def drift_report():
                           for x, y in zip(a, b) if x is not None and y is not None)
                 if gap > worst[0]:
                     worst = (gap, f"{name} {ts}")
-    print(f"\n스냅숏 대조 — {keys[0]} vs {keys[-1]}")
+    from datetime import datetime
+    t0 = datetime.strptime(keys[0], "%Y%m%d%H%M")
+    t1 = datetime.strptime(keys[-1], "%Y%m%d%H%M")
+    gap_h = (t1 - t0).total_seconds() / 3600
+
+    print(f"\n스냅숏 대조 — {keys[0]} vs {keys[-1]} (간격 {gap_h:.1f}시간)")
     print(f"  같은 유효시각 {n_cmp:,}개 중 값이 바뀐 것 {n_diff:,}개 "
           f"({n_diff / max(n_cmp, 1):.1%})")
     if n_diff:
         print(f"  최대 변화 {worst[0]:.2f} ({worst[1]})")
         print("  → 조회 시점에 따라 값이 달라진다. 학습(아카이브)과 서빙의 "
               "분포가 어긋나므로 `aerosol_gbm_check.py` 의 이득은 **상한**이다.")
+        print("  (변화가 있다는 결론은 간격과 무관하게 성립한다 — 한 번이라도 "
+              "바뀌었으면 바뀌는 것이다.)")
+        return n_cmp, n_diff
+
+    # **'안 바뀐다'는 결론에는 간격 조건이 붙는다.** CAMS 는 하루 두 번
+    # 발표하므로, 그보다 짧은 간격에서 값이 같은 것은 당연하고 아무것도
+    # 증명하지 않는다. 짧은 간격의 0% 를 "채택해도 된다"로 읽으면 정확히
+    # 이 저장소가 반복해 경고한 오류(측정하지 않은 것을 주장한다)가 된다.
+    MIN_GAP_H = 48
+    if gap_h < MIN_GAP_H:
+        print(f"  → **아직 결론이 아니다.** 간격이 {gap_h:.1f}시간뿐이라 "
+              f"CAMS 발표 주기(하루 2회)보다 짧거나 비슷하다. "
+              f"{MIN_GAP_H}시간 이상 벌어진 뒤 다시 볼 것.")
     else:
         print("  → 조회 시점과 무관하게 같은 값이다. 학습·서빙 분포가 일치하므로 "
               "측정된 이득을 그대로 기대할 수 있다.")

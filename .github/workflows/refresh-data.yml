@@ -193,11 +193,9 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/code
         working-directory: data
         run: |
-          H=$(date -u +%H)
-          if [ $((10#$H % 6)) -ne 0 ]; then
-            echo "6시간 주기가 아니다(UTC ${H}시) — 건너뛴다"
-            exit 0
-          fi
+          # 주기 제한은 **스크립트가 스스로** 건다(6시간 버킷당 1회). 여기서
+          # 시(hour)만 보고 거르면 같은 시간대의 네 번이 전부 통과한다 —
+          # 15분마다 도는 잡이기 때문이다.
           python ${{ github.workspace }}/code/collect_aerosol_archive.py --snapshot
 
       # 적중률 로그에 온라인 예측을 남긴다(2026-09-23 신설).
