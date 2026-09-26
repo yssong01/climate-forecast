@@ -51,7 +51,12 @@ BANDS = [
 
 
 def main():
-    paths = sys.argv[1:] or [CHECKPOINT]
+    # 극한기상을 전용 GBM 이 내는 구성(2026-09-26)에서는 **그 모델**을 재야
+    # 한다. 신경망 헤드는 배포에서 쓰이지 않으므로, 그것을 검사하는 게이트는
+    # 배포와 무관한 것을 재고 통과시킨다.
+    gbm_path = next((a.split("=", 1)[1] for a in sys.argv[1:]
+                     if a.startswith("--extreme-gbm=")), None)
+    paths = [a for a in sys.argv[1:] if not a.startswith("--")] or [CHECKPOINT]
     records = collect_historical()
     sat = InterpolatedFieldCollector(records, STATION_COORDS)
     tnd = TendencyCollector(records)
@@ -67,7 +72,22 @@ def main():
         # 표준화된 값에서 실제 기온을 복원한다(인덱스 0 = 기온).
         temps = ds.X_num[:, 0].numpy() * ckpt["std"][0] + ckpt["mean"][0]
 
+        gmodels = gmeta = None
+        if gbm_path:
+            import extreme_gbm as _eg
+            gmodels, gmeta = _eg.load(gbm_path)
+            if not gmodels:
+                raise SystemExit(f"극한기상 GBM 이 없다: {gbm_path}")
+            if int(gmeta["meta_num_features"]) != ckpt["num_features"]:
+                raise SystemExit("GBM 의 입력 차원이 체크포인트와 다르다.")
+            print(f"극한기상 확률 출처: {gbm_path} (서빙과 동일)")
+
         def probs(idx):
+            if gmodels is not None:
+                import extreme_gbm as _eg
+                xv = ds.X_num[idx.tolist()].numpy().astype(np.float32)
+                return (_eg.calibrated_batch(gmodels, gmeta, "heatwave", xv),
+                        _eg.calibrated_batch(gmodels, gmeta, "coldwave", xv))
             hs, cs = [], []
             for b in range(0, len(idx), BATCH):
                 s = idx[b:b + BATCH].tolist()
@@ -89,8 +109,14 @@ def main():
             if len(idx) == 0:
                 continue
             h, c = probs(idx)
-            rate = (h > 0.5).mean() if watch == "heatwave" else (
-                   (c > 0.5).mean() if watch == "coldwave" else 0.0)
+            if gmodels is not None:
+                import extreme_gbm as _eg
+                th, tc = (_eg.threshold(gmeta, "heatwave"),
+                          _eg.threshold(gmeta, "coldwave"))
+            else:
+                th = tc = 0.5
+            rate = (h > th).mean() if watch == "heatwave" else (
+                   (c > tc).mean() if watch == "coldwave" else 0.0)
             if watch:
                 worst = max(worst, rate)
                 mark = "★오탐★" if rate > 0.10 else ("주의" if rate > 0.02 else "정상")

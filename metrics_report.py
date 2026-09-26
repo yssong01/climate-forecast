@@ -183,7 +183,13 @@ def precision_block(d, ckpt):
         if len(prob) == 0:
             continue
         t_raw = EXTREME_EVENT_THRESH.get(key, 0.5)
-        prob_cal = np.array([calibrate_prob(float(p), key, ckpt) for p in prob])
+        _gthr = (d.get("extreme_thresholds") or {}).get(key)
+        if _gthr is not None:
+            # GBM 확률은 이미 그 모델의 보정 공간이다 — 신경망 곡선을
+            # 덧씌우면 눈금이 두 번 옮겨진다.
+            prob_cal = prob
+        else:
+            prob_cal = np.array([calibrate_prob(float(p), key, ckpt) for p in prob])
         # 판정선은 표본의 **실제 관측소별로** 구한다(2026-08-29 총점검에서 수정).
         # 종전에는 event_threshold(key, "108", ckpt) 로 서울 기준 하나만 써서
         # 전 관측소 표본을 채점했는데, predict.STATION_EVENT_THRESH_OVERRIDES
@@ -193,7 +199,8 @@ def precision_block(d, ckpt):
         # 정면으로 어긋난다. app.py 는 event_threshold(event, stn, ckpt) 로
         # 실제 관측소를 넘긴다.
         stns = d["stn"].astype(str)[mask]
-        t_by_stn = {s: event_threshold(key, s, ckpt) for s in np.unique(stns)}
+        t_by_stn = ({s: _gthr for s in np.unique(stns)} if _gthr is not None
+                    else {s: event_threshold(key, s, ckpt) for s in np.unique(stns)})
         t_served_vec = np.array([t_by_stn[s] for s in stns])
         # 표에는 한 값만 적어야 하므로 최빈 임계값을 대표로 쓰고, 그와 다른
         # 임계값이 적용된 표본 수를 함께 남겨 예외의 존재를 드러낸다.
@@ -225,7 +232,13 @@ def calibration_block(d, ckpt):
             label = d[f"y_{key}"][mask].astype(int)
         if len(prob) == 0:
             continue
-        prob_cal = np.array([calibrate_prob(float(p), key, ckpt) for p in prob])
+        _gthr = (d.get("extreme_thresholds") or {}).get(key)
+        if _gthr is not None:
+            # GBM 확률은 이미 그 모델의 보정 공간이다 — 신경망 곡선을
+            # 덧씌우면 눈금이 두 번 옮겨진다.
+            prob_cal = prob
+        else:
+            prob_cal = np.array([calibrate_prob(float(p), key, ckpt) for p in prob])
         rows_raw, ece0, mce0, br0 = reliability(prob, label)
         rows_cal, ece1, mce1, br1 = reliability(prob_cal, label)
         out[key] = {
@@ -378,6 +391,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt", nargs="?", default=CHECKPOINT)
     ap.add_argument("--batch", type=int, default=eval_cache.DEFAULT_BATCH)
+    ap.add_argument("--extreme-gbm", default=None,
+                    help="극한기상 확률을 이 GBM 에서 가져온다(서빙과 동일). "
+                         "2026-09-26 부터 배포는 극한기상을 전용 GBM 이 낸다.")
     ap.add_argument("--precip-gbm", default=None,
                     help="강수 예측만 이 GBM 에서 가져온다(서빙과 같은 구성). "
                          "2026-09-26 부터 배포는 강수를 전용 GBM 이 낸다.")
@@ -429,6 +445,26 @@ def main():
         print(f"강수 예측 출처: {args.precip_gbm} "
               f"(판정선 τ={float(gmeta['meta_gate_tau']):.3f})")
 
+    if args.extreme_gbm:
+        # **섞으면 안 된다.** `event_threshold` 는 체크포인트 패치 이후 GBM 의
+        # 판정선을 돌려주는데, 확률은 여전히 신경망 것이었다 — 서로 다른
+        # 모델의 확률과 판정선으로 채점하고 있었다(2026-09-26 발견).
+        import extreme_gbm as _eg
+        gmodels, gmeta = _eg.load(args.extreme_gbm)
+        if not gmodels:
+            raise SystemExit(f"극한기상 GBM 이 없다: {args.extreme_gbm}")
+        feat = eval_cache.load_features(args.ckpt)
+        if len(feat["tgt_ts_val"]) != len(d["tgt_ts"]):
+            raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
+        d = dict(d)
+        for _k, _short in (("heatwave", "heat"), ("coldwave", "cold"),
+                           ("dust", "dust")):
+            d[f"{_short}_prob"] = _eg.calibrated_batch(
+                gmodels, gmeta, _k, feat["x_val"])
+        d["extreme_thresholds"] = {k: _eg.threshold(gmeta, k)
+                                   for k in ("heatwave", "coldwave", "dust")}
+        print(f"극한기상 확률 출처: {args.extreme_gbm} (서빙과 동일)")
+
     acc = accuracy_block(d, ckpt)
     pre = precision_block(d, ckpt)
     cal = calibration_block(d, ckpt)
@@ -461,6 +497,7 @@ def main():
         json.dump({"checkpoint": args.ckpt,
                    "temp_checkpoint": args.temp_checkpoint,
                    "precip_gbm": args.precip_gbm,
+                   "extreme_gbm": args.extreme_gbm,
                    "accuracy": acc, "precision": pre, "calibration": cal},
                   f, ensure_ascii=False, indent=2)
     print(f"저장: {out_json}")

@@ -47,7 +47,12 @@ UNSCORED_ALERT_WARN = 0.02
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else CHECKPOINT
+    # 극한기상을 전용 GBM 이 내면 **그 모델**을 재야 한다 — 신경망 헤드는
+    # 배포에서 쓰이지 않으므로 그것을 검사하는 게이트는 배포와 무관하다.
+    gbm_path = next((a.split("=", 1)[1] for a in sys.argv[1:]
+                     if a.startswith("--extreme-gbm=")), None)
+    _args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    path = _args[0] if _args else CHECKPOINT
     model, ckpt = load_model(path, DEVICE)
     model.eval()
 
@@ -74,6 +79,18 @@ def main():
             acc["coldwave"].append(torch.sigmoid(model._last_coldwave_logit).squeeze(-1).cpu().numpy())
             acc["dust"].append(torch.sigmoid(model._last_dust_logit).squeeze(-1).cpu().numpy())
     P = {k: np.concatenate(v) for k, v in acc.items()}
+    gmeta = None
+    if gbm_path:
+        import extreme_gbm as _eg
+        gmodels, gmeta = _eg.load(gbm_path)
+        if not gmodels:
+            raise SystemExit(f"극한기상 GBM 이 없다: {gbm_path}")
+        if int(gmeta["meta_num_features"]) != ckpt["num_features"]:
+            raise SystemExit("GBM 의 입력 차원이 체크포인트와 다르다.")
+        xv = ds.X_num[vi.tolist()].numpy().astype(np.float32)
+        P = {k: _eg.calibrated_batch(gmodels, gmeta, k, xv)
+             for k in ("heatwave", "coldwave", "dust")}
+        print(f"극한기상 확률 출처: {gbm_path} (서빙과 동일)")
     M = {"heatwave": ds.heat_mask[vi].numpy().astype(bool),
          "coldwave": ds.cold_mask[vi].numpy().astype(bool),
          "dust":     ds.dust_mask[vi].numpy().astype(bool)}
@@ -90,8 +107,13 @@ def main():
         # 이 게이트가 "채점되지 않는 관측소가 얼마나 경보를 내는가"를 재는
         # 것이므로 서빙과 같은 기준이어야 의미가 있다. metrics_report.py 가
         # 같은 이유로 이미 서빙 판정선을 쓴다.
-        t = event_threshold(ev, "108", ckpt)
-        P[ev] = np.array([calibrate_prob(float(x), ev, ckpt) for x in P[ev]])
+        if gmeta is not None:
+            # 확률은 이미 GBM 의 보정 공간이다 — 신경망 곡선을 덧씌우지 않는다.
+            import extreme_gbm as _eg
+            t = _eg.threshold(gmeta, ev)
+        else:
+            t = event_threshold(ev, "108", ckpt)
+            P[ev] = np.array([calibrate_prob(float(x), ev, ckpt) for x in P[ev]])
         print(f"\n{'='*90}\n[{ev}] 판정 임계값(서빙, 보정 후) {t:.4f}")
         print(f"{'관측소':<8}{'검증표본':>9}{'라벨보유':>9}{'라벨비율':>9}{'양성':>7}"
               f"{'임계초과율':>11}   상태")

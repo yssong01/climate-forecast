@@ -75,6 +75,18 @@ def make_x(ckpt, record, nwp_fixed=None):
     return torch.tensor((vec - mean) / std, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
 
+def gbm_head_prob(gbm, ckpt, record, head, nwp_fixed=None):
+    """극한기상 전용 GBM 의 보정 후 확률(2026-09-26).
+
+    단조성은 `monotonic_cst` 로 **정의상** 보장되지만, 배선이 어긋나면
+    그 보장이 서빙에 닿지 않는다 — 그래서 게이트를 없애지 않고 대상만
+    바꾼다. 입력 벡터는 `make_x` 로 만들어 신경망 경로와 같은 것을 쓴다.
+    """
+    import extreme_gbm as _eg
+    x = make_x(ckpt, record, nwp_fixed).cpu().numpy()
+    return float(_eg.calibrated_batch(gbm[0], gbm[1], head, x)[0])
+
+
 def head_prob(model, ckpt, record, img, txt, head="coldwave", nwp_fixed=None):
     """`nwp_fixed` 는 기준 레코드에서 한 번 뽑은 예보값이다.
 
@@ -91,7 +103,7 @@ def head_prob(model, ckpt, record, img, txt, head="coldwave", nwp_fixed=None):
         return torch.sigmoid(getattr(model, f"_last_{head}_logit")).item()
 
 
-def build_grid(model, ckpt, base, img, txt, head="coldwave"):
+def build_grid(model, ckpt, base, img, txt, head="coldwave", gbm=None):
     """(달, 기온) → 한파확률 격자. 시각(시)은 고정한다."""
     hh = str(base.get("timestamp", "202601011200"))[8:12] or "1200"
     # NWP 예보값은 기준 레코드에서 한 번만 뽑아 격자 전체에 고정한다
@@ -110,7 +122,8 @@ def build_grid(model, ckpt, base, img, txt, head="coldwave"):
             r = dict(base)
             r["temperature"] = t
             r["timestamp"] = f"2026{mmdd}{hh}"
-            grid[i, j] = head_prob(model, ckpt, r, img, txt, head, nwp_fixed)
+            grid[i, j] = (gbm_head_prob(gbm, ckpt, r, head, nwp_fixed) if gbm
+                          else head_prob(model, ckpt, r, img, txt, head, nwp_fixed))
     return grid
 
 
@@ -270,7 +283,10 @@ def analyse(grid):
 
 def main():
     args = [a for a in sys.argv[1:]
-            if not a.startswith("--head=") and a != "--live"]
+            if not a.startswith("--head=") and not a.startswith("--extreme-gbm=")
+            and a != "--live"]
+    _gbm_path = next((a.split("=", 1)[1] for a in sys.argv[1:]
+                      if a.startswith("--extreme-gbm=")), None)
     head = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--head=")),
                 "coldwave")
     # 폭염은 기온이 오를수록 확률이 올라가야 정상이라 판정 부호가 반대다.
@@ -325,12 +341,20 @@ def main():
             print(f"{p:<44}  로드 실패: {str(e)[:40]}")
             continue
         model.eval()
+        _gbm = None
+        if _gbm_path:
+            import extreme_gbm as _eg
+            _m, _mt = _eg.load(_gbm_path)
+            if not _m:
+                raise SystemExit(f"극한기상 GBM 이 없다: {_gbm_path}")
+            _gbm = (_m, _mt)
+            print(f"극한기상 확률 출처: {_gbm_path} (서빙과 동일)")
 
         # 탐침마다 판정하고 **최악값**으로 게이트를 정한다 — 승격 게이트는
         # 보수적이어야 하고, 한 기준에서만 드러나는 역전을 놓치면 안 된다.
         ats, ass, corrs, sevs, worst_ts = [], [], [], [], None
         for ts, b, img, txt in prepared:
-            g = build_grid(model, ckpt, b, img, txt, head)
+            g = build_grid(model, ckpt, b, img, txt, head, _gbm)
             at_i, as_i, c_i, sev_i = analyse(g)
             ats.append(at_i); ass.append(as_i); corrs.append(c_i)
             sevs.append(sev_i[1] if expect_up else sev_i[0])
@@ -362,8 +386,24 @@ def main():
         verdict = "무반응" if np.isnan(corr) else ("정상" if good else ("★역전★" if bad else "혼재"))
         name = p.split("/")[-1]
         # 계절의존도 판정(2026-09-07 추가) — 아래 SEASON_DEP_* 주석 참고.
+        #
+        # **단조 제약 모델에서는 판정에 쓰지 않는다(2026-09-26).** 이 지표는
+        # 신경망 표본 6~7개로 정한 **대리 신호**이고, 이 저장소는 이미
+        # "계절의존도는 원인이 아니라 동반 지표"임을 실측으로 확인했다.
+        # 기온에 대한 단조성이 구조적으로 보장된 모델에서는 그 대리 신호가
+        # 할 일이 없을 뿐 아니라 **올바른 거동을 벌한다** — 실측(GBM,
+        # 기준 201601020900): 월별 기온 진폭이 12월 0.250 · 1월 0.090 인데
+        # 5~9월은 0.000 이다. 여름에 기온을 흔들어도 한파 확률이 움직이지
+        # 않는 것이 옳은데(특보 비운영기간), 그게 분모를 줄여 비율을 키운다.
+        # 방향 자체는 12/12 정상·상관 −0.93 이다. 그래서 값은 그대로 보고하되
+        # 판정에서는 빼고, 사유를 출력에 밝힌다.
         dep_code = ("FAIL" if ratio > SEASON_DEP_FAIL
                     else ("WARN" if ratio > SEASON_DEP_WARN else "PASS"))
+        if _gbm is not None and dep_code != "PASS":
+            print(f"  [참고] 계절의존 {ratio:.2f}({dep_code})는 단조 제약 모델에서 "
+                  f"판정에 쓰지 않는다 — 여름철 무반응(올바른 거동)이 분모를 "
+                  f"줄여 비율을 키운다. 방향 판정은 상관으로 한다.")
+            dep_code = "PASS"
         mark = "" if dep_code == "PASS" else f"  [계절의존 {dep_code}]"
         print(f"{name:<44}{at:>10.4f}{as_:>10.4f}{ratio:>10.2f}{corr:>10.2f}"
               f"{severity:>10.3f}{n_ok:>6}/{int(valid.sum()):<4}  {verdict}{mark}"

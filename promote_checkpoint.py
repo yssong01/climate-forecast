@@ -192,6 +192,25 @@ def main():
                 warnings.append(f"{name}: WARN {extra}")
 
     _temp_only = CHECKPOINT in TEMP_ONLY_TARGETS
+    # 극한기상을 전용 GBM 이 내면 게이트도 **그 모델**을 재야 한다
+    # (2026-09-26). 신경망 헤드는 배포에서 쓰이지 않으므로, 그것을
+    # 검사하는 게이트는 배포와 무관한 것을 재고 통과시킨다 — 절차가
+    # 아무것도 지키지 못하는 상태가 된다.
+    _ex_gbm = None
+    if not _temp_only:
+        import torch as _t
+        try:
+            _ck = _t.load(CHECKPOINT, map_location="cpu", weights_only=True)
+            _ex_gbm = _ck.get("extreme_source")
+        except Exception:                      # noqa: BLE001
+            _ex_gbm = None
+        if _ex_gbm and not os.path.exists(_ex_gbm):
+            print(f"배포 체크포인트가 극한기상 GBM({_ex_gbm})을 가리키는데 "
+                  f"파일이 없다 — 게이트를 신뢰할 수 없다.")
+            sys.exit(2)
+    _gopt = ([f"--extreme-gbm={_ex_gbm}"] if _ex_gbm else [])
+    if _ex_gbm:
+        print(f"\n극한기상 게이트 대상: {_ex_gbm} (서빙과 동일)")
     if _temp_only:
         print(f"\n{'='*78}\n▶ 게이트 1·2·2-1 — 해당 없음(기온 전용 후보)\n{'='*78}")
         print("  이 후보는 기온과 그 예측구간만 낸다. 극한기상 헤드는 손실을 받지\n"
@@ -199,17 +218,18 @@ def main():
               "  건드리지 않으므로 계절 오탐·단조성·관측소 사각지대 판정은 정의상\n"
               "  불변이다. 회귀 성능 게이트는 그대로 적용한다.")
     else:
-        out, _ = run(["seasonal_falsealarm_check.py", cand], "게이트 1 — 계절 오탐")
+        out, _ = run(["seasonal_falsealarm_check.py", cand] + _gopt,
+                     "게이트 1 — 계절 오탐")
         collect(out)
 
         for head in ("coldwave", "heatwave"):
-            out, _ = run(["coldwave_pathway_check.py", f"--head={head}", cand],
-                         f"게이트 2 — 단조성({head})")
+            out, _ = run(["coldwave_pathway_check.py", f"--head={head}", cand]
+                         + _gopt, f"게이트 2 — 단조성({head})")
             collect(out)
 
         # 계절 축과 같은 사각지대가 관측소 축에도 있는지 본다. 라벨이 없는
         # 관측소의 출력은 채점된 적이 없으므로, 경보를 얼마나 내는지 확인한다.
-        out, _ = run(["station_coverage_check.py", cand],
+        out, _ = run(["station_coverage_check.py", cand] + _gopt,
                      "게이트 2-1 — 관측소 라벨 사각지대")
         collect(out)
 
