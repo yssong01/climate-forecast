@@ -124,6 +124,9 @@ def prf(pred_pos, labels):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="./docs/images/calibration_plot.png")
+    ap.add_argument("--extreme-gbm", default=None,
+                    help="극한기상 확률을 이 GBM 에서 가져온다(서빙과 동일). "
+                         "2026-09-26 부터 배포는 극한기상을 전용 GBM 이 낸다.")
     args = ap.parse_args()
 
     model, ckpt = load_model()
@@ -178,8 +181,27 @@ def main():
     # 관측소별 예외가 걸린 조합은 그 관측소만 임계값이 다르므로 판정선도
     # 관측소마다 조회한다 — 서빙과 같은 방식이어야 이 플롯이 위 표의
     # 분해로서 성립한다.
-    heat_p = np.array([calibrate_prob(float(v), "heatwave", ckpt) for v in heat_p])
-    cold_p = np.array([calibrate_prob(float(v), "coldwave", ckpt) for v in cold_p])
+    gbm = None
+    if args.extreme_gbm:
+        # 서빙이 극한기상을 GBM 에서 내므로 이 플롯도 그래야 한다 — 신경망
+        # 확률로 그리면 바로 위 합산표와 다른 동작점을 재게 되고, "합산표를
+        # 관측소별로 분해한 것"이라는 설명이 성립하지 않는다(2026-09-23 에
+        # 정확히 그 어긋남을 겪었다). 데이터셋은 이미 만들어져 있으므로
+        # 그 입력 행렬을 그대로 쓴다 — 추가 구성을 하지 않는다.
+        import extreme_gbm as _eg
+        models, meta = _eg.load(args.extreme_gbm)
+        if not models:
+            raise SystemExit(f"극한기상 GBM 이 없다: {args.extreme_gbm}")
+        if int(meta["meta_num_features"]) != ckpt["num_features"]:
+            raise SystemExit("GBM 의 입력 차원이 체크포인트와 다르다.")
+        xv = ds.X_num[idx.tolist()].numpy().astype(np.float32)
+        heat_p = _eg.calibrated_batch(models, meta, "heatwave", xv)
+        cold_p = _eg.calibrated_batch(models, meta, "coldwave", xv)
+        gbm = (models, meta)
+        print(f"극한기상 확률 출처: {args.extreme_gbm} (서빙과 동일)")
+    else:
+        heat_p = np.array([calibrate_prob(float(v), "heatwave", ckpt) for v in heat_p])
+        cold_p = np.array([calibrate_prob(float(v), "coldwave", ckpt) for v in cold_p])
 
     results = {"heatwave": [], "coldwave": []}
     thresholds = {}
@@ -190,7 +212,8 @@ def main():
             n = int(sel.sum())
             if n < 30:
                 continue
-            thr = event_threshold(name, str(stn_code), ckpt)
+            thr = (__import__("extreme_gbm").threshold(gbm[1], name) if gbm
+                   else event_threshold(name, str(stn_code), ckpt))
             thresholds.setdefault(name, {})[str(stn_code)] = thr
             pred_pos = p[sel] >= thr
             labels = y[sel]

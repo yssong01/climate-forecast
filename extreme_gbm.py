@@ -91,6 +91,20 @@ def calibrated(models, meta, head, x):
     return p
 
 
+def calibrated_batch(models, meta, head, x):
+    """`calibrated()` 의 배치판 — 진단 스크립트가 검증셋 전체에 쓴다."""
+    p = models[head].predict_proba1(x)
+    method = str(meta.get(f"meta_{head}_cal_method", "none"))
+    import probability_calibration_fit as _pc
+    if method == "beta":
+        a_, b_, c_ = [float(v) for v in meta[f"{head}_cal_beta"]]
+        return _pc.apply_beta(p, a_, b_, c_)
+    if method == "isotonic":
+        return _pc.apply_calibration(p, meta[f"{head}_cal_xs"],
+                                     meta[f"{head}_cal_ys"])
+    return p
+
+
 def threshold(meta, head):
     """서빙 판정선 — 보정 공간에서 재선정한 값(모델 파일에 저장)."""
     return float(meta[f"meta_{head}_tau_cal"])
