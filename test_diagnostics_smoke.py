@@ -420,6 +420,71 @@ def _precip_gbm_path():
             f"화면 상수 누출 0")
 
 
+def _accuracy_wet_stats():
+    """온라인 적중률의 강수 항목이 **기저율과 함께** 나오는가(2026-09-27).
+
+    왜 필요한가 — 강수 적중률은 모델이 아니라 **날씨**에 따라 움직인다.
+    배포 로그 실측: 건조한 구간(실제 강수 2/396)에서 99.5%, 비 온 구간
+    (91/264)에서 65.2% 였는데, 후자의 F1 은 0.562 로 그 세대 검증값
+    (0.588)과 사실상 같았다. 숫자만 보면 성능이 무너진 것처럼 읽힌다.
+    저장소 규약(§2 양성이 희박하면 accuracy 대신 precision/recall/F1)을
+    정작 이 화면이 지키지 않고 있었다.
+
+    세 가지 경계를 모두 시험한다 — 비가 온 구간, 비가 없는 구간, 그리고
+    **비가 왔는데 강수를 한 번도 예측하지 않은 구간**(정밀도의 분모가 0).
+    셋째가 실제 로그에 있었고, `None` 을 f-string 에 꽂으면 화면이 죽는다.
+    """
+    import json
+    import tempfile
+    import accuracy
+
+    def _mk(rows):
+        fd, p = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(rows, fh)
+        return p
+
+    def _row(pred, act):
+        return {"station": "108", "made_at": "202609270000",
+                "target_time": "202609270600", "pred_temp": 20.0,
+                "pred_precip": pred, "actual_temp": 20.0, "actual_precip": act,
+                "hit_temp": True,
+                "hit_precip": (pred >= accuracy.PRECIP_THRESH) ==
+                              (act >= accuracy.PRECIP_THRESH),
+                "source": "ci", "model_id": "sha256:test"}
+
+    # ① 비가 온 구간 — TP 2 · FP 1 · FN 1 → 정밀도 2/3 · 재현율 2/3 · F1 2/3
+    p1 = _mk([_row(1.0, 1.0), _row(1.0, 2.0), _row(1.0, 0.0), _row(0.0, 3.0)])
+    w1 = accuracy.stats(path=p1, model_id="sha256:test")["cum_wet"]
+    assert w1["n_pos"] == 3, w1
+    assert abs(w1["precision"] - 2 / 3) < 1e-9, w1
+    assert abs(w1["recall"] - 2 / 3) < 1e-9, w1
+    assert abs(w1["f1"] - 2 / 3) < 1e-9, w1
+
+    # ② 비가 전혀 없는 구간 — 적중률은 100% 인데 판별력은 잰 적이 없다
+    p2 = _mk([_row(0.0, 0.0) for _ in range(5)])
+    s2 = accuracy.stats(path=p2, model_id="sha256:test")
+    assert s2["cum_precip"] == 1.0, s2
+    assert s2["cum_wet"]["n_pos"] == 0, s2
+    assert s2["cum_wet"]["f1"] is None, "양성이 없으면 F1 은 정의되지 않는다"
+
+    # ③ 비가 왔는데 강수를 한 번도 예측하지 않음 — 정밀도 분모 0
+    p3 = _mk([_row(0.0, 1.0), _row(0.0, 0.0)])
+    w3 = accuracy.stats(path=p3, model_id="sha256:test")["cum_wet"]
+    assert w3["n_pos"] == 1 and w3["precision"] is None and w3["recall"] == 0.0, w3
+    assert w3["f1"] == 0.0, w3
+
+    # 화면이 그 None 을 그대로 포맷하지 않는지 — 소스 수준으로 막는다.
+    app_src = os.path.join(os.path.dirname(os.path.abspath(accuracy.__file__)),
+                           "app.py")
+    src = open(app_src, encoding="utf-8").read()
+    assert "_w['precision']:.1%" not in src and '_w["precision"]:.1%' not in src, \
+        "app.py 가 None 일 수 있는 정밀도를 직접 포맷한다 — 화면이 죽는다"
+    for p in (p1, p2, p3):
+        os.unlink(p)
+    return "기저율·정밀도·재현율·F1 · 분모 0 경계 · 화면 포맷 보호"
+
+
 # ── ④ 판정선 조회가 모든 체크포인트 형태에서 동작하는가 ──────────
 def _threshold_paths():
     from predict import event_threshold, STATION_EVENT_THRESH_OVERRIDES
@@ -466,6 +531,8 @@ def main():
     check("temp_checkpoint", _temp_checkpoint_path)
     print("\n[T3-3] 강수 전용 GBM 경로·추론·구간 출처")
     check("precip_gbm", _precip_gbm_path)
+    print("\n[T3-4] 온라인 적중률 — 강수는 기저율과 함께 읽는가")
+    check("accuracy_wet", _accuracy_wet_stats)
     print("\n[T4] 판정선 조회(구버전/신버전 체크포인트)")
     check("event_threshold", _threshold_paths)
     print("\n[T5] 배포 체크포인트 로드·추론")

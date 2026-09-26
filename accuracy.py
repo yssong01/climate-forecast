@@ -317,6 +317,25 @@ def stats(station: str = None, recent_n: int = 20, path: str = LOG_PATH,
         return (sum(1 for e in es if e[key]) / len(es)) if es else None
 
     recent = entries[-recent_n:]
+
+    # 강수는 **적중률만으로 읽으면 안 된다(2026-09-27 추가).** 이 지표는
+    # 모델이 아니라 **날씨**에 따라 움직인다 — 온라인 기록 실측: 건조한
+    # 구간(실제 강수 2/396)에서 99.5%, 비 온 구간(91/264)에서 65.2% 였다.
+    # 전자는 "항상 0"이 맞은 것이고 후자는 F1 0.561 로 검증값(그 세대 0.588)과
+    # 사실상 같다. 저장소 규약(§2 "양성이 희박한 이벤트는 accuracy 대신
+    # precision/recall/F1")을 정작 이 화면이 지키지 않고 있었다.
+    # 그래서 실제 강수가 있었던 표본의 수(=기저율)와 정밀도·재현율·F1 을
+    # 함께 돌려주어, 호출부가 "무엇 때문에 이 숫자가 이런지"를 밝힐 수 있게 한다.
+    def _wet(es):
+        tp = sum(1 for e in es if _is_wet(e["actual_precip"]) and _is_wet(e["pred_precip"]))
+        fp = sum(1 for e in es if not _is_wet(e["actual_precip"]) and _is_wet(e["pred_precip"]))
+        fn = sum(1 for e in es if _is_wet(e["actual_precip"]) and not _is_wet(e["pred_precip"]))
+        n_pos = tp + fn
+        prec = tp / (tp + fp) if (tp + fp) else None
+        rec = tp / n_pos if n_pos else None
+        f1 = (2 * prec * rec / (prec + rec)) if (prec and rec) else (0.0 if n_pos else None)
+        return {"n_pos": n_pos, "precision": prec, "recall": rec, "f1": f1}
+
     return {
         "cum_n": len(entries),
         "cum_temp": _rate(entries, "hit_temp"),
@@ -324,4 +343,11 @@ def stats(station: str = None, recent_n: int = 20, path: str = LOG_PATH,
         "recent_n": len(recent),
         "recent_temp": _rate(recent, "hit_temp"),
         "recent_precip": _rate(recent, "hit_precip"),
+        "cum_wet": _wet(entries),
+        "recent_wet": _wet(recent),
     }
+
+
+def _is_wet(v) -> bool:
+    """`PRECIP_THRESH` 기준 강수 여부. 결측은 무강수로 보지 않고 False."""
+    return v is not None and float(v) >= PRECIP_THRESH
