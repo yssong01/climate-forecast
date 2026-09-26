@@ -564,12 +564,27 @@ def _patch_checkpoint(path: str, acc: dict, pre: dict = None,
         # `extreme_metrics` 는 학습이 t=0.5 로 잰 값이라 서빙과 다른 동작점을
         # 가리킨다 — 확률 눈금이 이동한 모델에서는 그 차이가 커진다(수치예보
         # 모델에서 한파 F1 0.209 vs 0.552). 화면이 서빙과 같은 값을 보이도록
-        # 별도 키로 남긴다. `extreme_metrics` 는 학습 시점 기록으로 그대로 둔다.
+        # 별도 키로 남긴다.
         ck["extreme_metrics_served"] = {
             k: {"threshold": v["served"]["threshold"],
                 "precision": v["served"]["precision"],
                 "recall": v["served"]["recall"],
                 "f1": v["served"]["f1"],
+                "n_pos": v["n_pos"], "n": v["n"]}
+            for k, v in pre.items()
+        }
+        # `extreme_metrics` 도 여기서 쓴다(2026-09-26 추가). 이 키의 뜻은
+        # **`t=0.5` 기준 지표**이고 화면의 폴백 캡션이 그렇게 설명하는데,
+        # 극한기상을 GBM 으로 옮기는 과정에서 `extreme_gbm --patch-checkpoint`
+        # 가 한때 여기에 **평가용 절반의 실험 채점값**을 써 넣었다(한파
+        # 0.6077). 두 채점을 섞지 말라는 규약을 정작 이 키가 어기고 있었던
+        # 셈이다 — 서빙 키가 있으면 화면에 안 보이지만, 없는 체크포인트에서는
+        # "원본 확률 0.5 기준" 이라는 거짓 설명이 붙는다. 같은 도구가 같은
+        # 표본에서 잰 `raw`(t=0.5)로 되돌린다.
+        ck["extreme_metrics"] = {
+            k: {"precision": v["raw"]["precision"],
+                "recall": v["raw"]["recall"],
+                "f1": v["raw"]["f1"],
                 "n_pos": v["n_pos"], "n": v["n"]}
             for k, v in pre.items()
         }
