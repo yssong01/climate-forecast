@@ -105,6 +105,91 @@ def backfill(end_date=None):
     return archive
 
 
+SNAPSHOT_PATH = "./cache/aerosol_snapshots.json"
+
+
+def snapshot():
+    """**서빙 시점의 값을 그대로 떠 둔다 — 시간 정합성을 재기 위해서다.**
+
+    왜 필요한가(2026-09-27). 에어로졸 특징이 황사 F1 을 0.179→0.224 로
+    올린다는 측정이 나왔는데(`aerosol_gbm_check.py`), 그 값이 **상한**인지
+    실제 이득인지 가릴 수단이 없었다. 학습은 아카이브의 T 시점 값을 쓰고
+    서빙은 그 시각에 조회 가능한 값을 쓰는데, 둘이 같은지 **아무도 재지
+    않았다.** 수치예보에서는 `previous_day1` 이 리드타임을 보존해 이 문제가
+    없었지만(CLAUDE.md 4절), 대기질 API 에는 그 필드가 없다.
+
+    그래서 추측 대신 기록한다 — 지금 조회한 값을 **조회 시각과 함께** 남기고,
+    며칠 뒤 같은 시각을 아카이브에서 다시 받아 대조한다. 값이 같으면 상한이
+    아니라 실측 이득이고, 다르면 그 차이가 곧 학습·서빙 분포 격차다.
+
+    파일은 조회 시각(`fetched_at`)으로 키를 잡아 **덮어쓰지 않는다** — 같은
+    유효시각을 여러 번 조회한 기록이 남아야 "언제 갱신됐는가"를 볼 수 있다.
+    """
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    # 최근 2일만 본다 — 갱신이 일어난다면 그 구간에서 일어난다.
+    start = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+    end = now.strftime("%Y-%m-%d")
+    fetched_at = now.strftime("%Y%m%d%H%M")
+    points = {**STATION_COORDS, **UPSTREAM}
+
+    snaps = {}
+    if os.path.exists(SNAPSHOT_PATH):
+        with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+            snaps = json.load(f)
+    for name, (lat, lon) in points.items():
+        rows = _to_records(_request(lat, lon, start, end))
+        snaps.setdefault(fetched_at, {})[name] = rows
+        time.sleep(1)
+    # 파일이 무한히 자라지 않게 최근 조회 20회만 남긴다.
+    for k in sorted(snaps)[:-20]:
+        snaps.pop(k)
+    _save(SNAPSHOT_PATH, snaps)
+    n = sum(len(v) for v in snaps[fetched_at].values())
+    print(f"에어로졸 스냅숏: {fetched_at} · 지점 {len(points)}곳 · {n:,}시각 "
+          f"(보관 {len(snaps)}회)")
+    return snaps
+
+
+def drift_report():
+    """스냅숏끼리 대조해 **같은 유효시각의 값이 바뀌었는지** 본다."""
+    if not os.path.exists(SNAPSHOT_PATH):
+        raise SystemExit(f"스냅숏이 없다: {SNAPSHOT_PATH} — --snapshot 을 먼저 돌릴 것")
+    with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+        snaps = json.load(f)
+    keys = sorted(snaps)
+    if len(keys) < 2:
+        raise SystemExit(f"스냅숏이 {len(keys)}회뿐이라 대조할 수 없다 — "
+                         f"시간 간격을 두고 다시 돌릴 것")
+    first, last = snaps[keys[0]], snaps[keys[-1]]
+    n_cmp = n_diff = 0
+    worst = (0.0, None)
+    for name, rows in last.items():
+        old_rows = first.get(name, {})
+        for ts, vals in rows.items():
+            if ts not in old_rows:
+                continue
+            n_cmp += 1
+            a, b = old_rows[ts], vals
+            if a != b:
+                n_diff += 1
+                gap = max(abs(float(x) - float(y))
+                          for x, y in zip(a, b) if x is not None and y is not None)
+                if gap > worst[0]:
+                    worst = (gap, f"{name} {ts}")
+    print(f"\n스냅숏 대조 — {keys[0]} vs {keys[-1]}")
+    print(f"  같은 유효시각 {n_cmp:,}개 중 값이 바뀐 것 {n_diff:,}개 "
+          f"({n_diff / max(n_cmp, 1):.1%})")
+    if n_diff:
+        print(f"  최대 변화 {worst[0]:.2f} ({worst[1]})")
+        print("  → 조회 시점에 따라 값이 달라진다. 학습(아카이브)과 서빙의 "
+              "분포가 어긋나므로 `aerosol_gbm_check.py` 의 이득은 **상한**이다.")
+    else:
+        print("  → 조회 시점과 무관하게 같은 값이다. 학습·서빙 분포가 일치하므로 "
+              "측정된 이득을 그대로 기대할 수 있다.")
+    return n_cmp, n_diff
+
+
 def _save(path, obj):
     """고유 tmp + os.replace 원자적 저장(CLAUDE.md 1절 6항)."""
     import tempfile
@@ -126,11 +211,20 @@ def _save(path, obj):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backfill", action="store_true")
+    ap.add_argument("--snapshot", action="store_true",
+                    help="지금 조회 가능한 값을 조회 시각과 함께 남긴다 "
+                         "(학습·서빙 시간 정합성 측정용)")
+    ap.add_argument("--drift", action="store_true",
+                    help="스냅숏끼리 대조해 값이 갱신되는지 본다")
     args = ap.parse_args()
     if args.backfill:
         print(f"에어로졸 아카이브 백필 — CAMS {ARCHIVE_START}~현재, "
               f"관측소 {len(STATION_COORDS)}곳 + 상류 {len(UPSTREAM)}곳")
         backfill()
+    elif args.snapshot:
+        snapshot()
+    elif args.drift:
+        drift_report()
     else:
         ap.print_help()
 

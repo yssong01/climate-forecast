@@ -173,6 +173,33 @@ jobs:
         run: |
           python ${{ github.workspace }}/code/collect_nwp_archive.py --incremental
 
+      # 에어로졸 값을 **조회 시각과 함께** 떠 둔다(2026-09-27 신설).
+      #
+      # 왜 필요한가 — 외부 에어로졸 특징이 황사 F1 을 0.179→0.224 로 올린다는
+      # 측정이 나왔는데(`aerosol_gbm_check.py`), 그 값이 **상한**인지 실측
+      # 이득인지 가릴 수단이 없다. 학습은 아카이브의 T 시점 값을 쓰고 서빙은
+      # 그 시각에 조회 가능한 값을 쓰는데, 대기질 API 에는 수치예보의
+      # `previous_day1` 같은 리드타임 보존 필드가 없어 **둘이 같은지 아무도
+      # 재지 않았다.** 추측으로 채택하거나 기각하지 않고, 지금 조회한 값을
+      # 남겨 며칠 뒤 아카이브와 대조한다(`--drift`).
+      #
+      # 비용은 작다 — 17지점 × 1회이고 15분마다가 아니라 **6시간마다**만
+      # 돌린다(스냅숏은 최근 20회만 보관하므로 파일도 0.1MB 수준이다).
+      # 실패해도 다른 스텝을 막지 않는다: 이 측정은 배포 산출물이 아니다.
+      - name: Snapshot aerosol values (drift measurement)
+        if: ${{ !cancelled() && !inputs.dry_run && github.event.schedule != '*/15 * * * *' }}
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ github.workspace }}/code
+        working-directory: data
+        run: |
+          H=$(date -u +%H)
+          if [ $((10#$H % 6)) -ne 0 ]; then
+            echo "6시간 주기가 아니다(UTC ${H}시) — 건너뛴다"
+            exit 0
+          fi
+          python ${{ github.workspace }}/code/collect_aerosol_archive.py --snapshot
+
       # 적중률 로그에 온라인 예측을 남긴다(2026-09-23 신설).
       #
       # 왜 여기인가 — 화면의 '출력값 적중률'은 지금까지 **구조적으로 영원히
@@ -234,6 +261,12 @@ jobs:
             git add -f cache/nwp_recent.json
           else
             echo "::warning::cache/nwp_recent.json 이 없다 — NWP 수집 스텝을 확인할 것"
+          fi
+          # 에어로졸 스냅숏(2026-09-27). 6시간마다만 생기므로 없는 실행이
+          # 대부분이고, 그건 경고가 아니다 — 위 NWP 창과 달리 배포 산출물이
+          # 아니라 측정용 기록이라서다.
+          if [ -f cache/aerosol_snapshots.json ]; then
+            git add -f cache/aerosol_snapshots.json
           fi
           if git diff --cached --quiet; then
             echo "변경 없음 — 커밋 생략 (이미 최신이거나 신규 관측 0건)"

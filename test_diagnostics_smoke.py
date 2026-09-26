@@ -84,6 +84,8 @@ DIAGNOSTIC_MODULES = [
     # CI(refresh-data.yml)가 15분마다 호출한다 — 임포트가 깨지면 적중률
     # 기록이 통째로 멈춘다(2026-09-23 추가).
     "record_online_forecasts",
+    # 2026-09-27 신설 — 남아 있던 세 항목을 닫은 측정 도구들.
+    "aerosol_gbm_check", "precip_floor_check",
     # 승격 절차의 수동 작업 4번이 이 스크립트를 부른다(2026-09-23 추가).
     "capture_tab_screenshots",
 ]

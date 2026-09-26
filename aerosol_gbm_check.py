@@ -48,7 +48,7 @@ import os
 import numpy as np
 
 import eval_cache
-from aerosol_feature_probe import (AERO_PATH, LAGS, I_DUST, I_PM10, _ts_add)
+from aerosol_feature_probe import AERO_PATH, LAGS, I_DUST, I_PM10, _ts_add
 from collect_aerosol_archive import UPSTREAM
 
 SEED = 42
@@ -119,7 +119,7 @@ def attach(stns, ts_ints, _up, _local, up_cache):
 
 def main():
     from sklearn.ensemble import HistGradientBoostingClassifier as H
-    from baseline_suite import honest_f1
+    from baseline_suite import honest_f1, max_f1
     import extreme_gbm as EG
 
     print(f"\n{'=' * 84}\n 황사 — 에어로졸 특징이 배포 GBM 을 개선하는가"
@@ -150,35 +150,82 @@ def main():
     def run(tag, xtr, ytr, xva, yva, hv):
         m = H(random_state=SEED, **grid).fit(xtr, ytr)
         s = m.predict_proba(xva)[:, 1]
-        f1, thr = honest_f1(s, yva, hv)
-        return tag, f1, thr, len(ytr), int(yva.sum())
+        # `honest_f1` 은 F1 만 돌려준다 — 판정선은 보정용 절반에서 따로 얻는다.
+        thr = max_f1(s[hv], yva[hv])[1]
+        return tag, honest_f1(s, yva, hv), thr, len(ytr), int(yva.sum())
 
-    rows = []
-    # ref — 배포 구성(전체 표본)
-    rows.append(run("ref  28특징·전체", x_tr[m_tr], y_tr[m_tr],
-                    x_va[m_va], y_va[m_va], half[m_va]))
-    # A — 표본만 줄인다
     tr_a = m_tr & a_tr_m
     va_a = m_va & a_va_m
-    rows.append(run("A    28특징·축소", x_tr[tr_a], y_tr[tr_a],
-                    x_va[va_a], y_va[va_a], half[va_a]))
-    # B — 같은 축소 표본에 에어로졸을 붙인다
     idx_tr = np.cumsum(a_tr_m) - 1          # 전체 행 → 에어로졸 행렬의 행
     idx_va = np.cumsum(a_va_m) - 1
-    xb_tr = np.concatenate([x_tr[tr_a], a_tr[idx_tr[tr_a]]], axis=1)
-    xb_va = np.concatenate([x_va[va_a], a_va[idx_va[va_a]]], axis=1)
-    rows.append(run("B    28+에어로졸·축소", xb_tr, y_tr[tr_a],
-                    xb_va, y_va[va_a], half[va_a]))
+    n_local = 5 + 2 * len(LAGS)             # 관측소 에어로졸 블록의 너비
 
-    print(f"\n  {'구성':<24}{'F1':>9}{'판정선':>9}{'학습표본':>11}{'평가양성':>10}")
+    rows = []
+    # ref — 배포 구성. **평가 표본이 다른 값을 나란히 놓지 않는다**: 같은
+    # 모델을 전체 검증셋과 축소 검증셋에서 각각 채점해 둘 다 보고한다.
+    # 이걸 빼면 "표본 감소의 비용"에 **채점 표본이 달라진 효과**가 섞여
+    # 들어가는데, 그건 모델의 성질이 아니라 문제의 난이도 차이다.
+    rows.append(run("ref  28특징·전체학습/전체채점", x_tr[m_tr], y_tr[m_tr],
+                    x_va[m_va], y_va[m_va], half[m_va]))
+    rows.append(run("ref' 28특징·전체학습/축소채점", x_tr[m_tr], y_tr[m_tr],
+                    x_va[va_a], y_va[va_a], half[va_a]))
+    rows.append(run("A    28특징·축소학습/축소채점", x_tr[tr_a], y_tr[tr_a],
+                    x_va[va_a], y_va[va_a], half[va_a]))
+
+    # B 계열 — 에어로졸 블록을 관측소/상류로 갈라서도 본다. 이득이 상류에서
+    # 오면 "지금 상류에 떠 있는 것"이라는 설계 가설이 지지되고, 관측소값에서
+    # 오면 **진행 중인 사건의 지속성**을 다시 읽은 것에 가깝다(황사는 며칠씩
+    # 이어지므로 그 값은 서빙에서 예보로 대체되는 순간 크게 약해진다).
+    def _cat(sel, idx, block):
+        return np.concatenate([x_va[sel] if block is a_va else x_tr[sel],
+                               block[idx[sel]]], axis=1)
+    for tag, sl in (("B    +에어로졸(전부)", slice(None)),
+                    ("B1   +관측소 에어로졸만", slice(0, n_local)),
+                    ("B2   +상류 에어로졸만", slice(n_local, None))):
+        xb_tr = np.concatenate([x_tr[tr_a], a_tr[idx_tr[tr_a]][:, sl]], axis=1)
+        xb_va = np.concatenate([x_va[va_a], a_va[idx_va[va_a]][:, sl]], axis=1)
+        rows.append(run(tag, xb_tr, y_tr[tr_a], xb_va, y_va[va_a], half[va_a]))
+
+    print(f"\n  {'구성':<30}{'F1':>9}{'판정선':>9}{'학습표본':>11}{'평가양성':>10}")
     for tag, f1, thr, ntr, npos in rows:
-        print(f"  {tag:<24}{f1:9.4f}{thr:9.3f}{ntr:11,}{npos:10,}")
+        print(f"  {tag:<30}{f1:9.4f}{thr:9.3f}{ntr:11,}{npos:10,}")
 
-    ref, a, b = rows[0][1], rows[1][1], rows[2][1]
-    print(f"\n  표본 감소의 비용 (A − ref) : {a - ref:+.4f}")
-    print(f"  에어로졸의 이득  (B − A)   : {b - a:+.4f}")
-    print(f"  최종 (B − ref)             : {b - ref:+.4f}  "
-          + ("← 채택 후보" if b - ref > 0.01 else "← 기각 (배포 대비 이득 없음)"))
+    ref, refp, a, b, b1, b2 = [r[1] for r in rows]
+    print(f"\n  [채점 표본이 같은 것끼리만 비교한다 — 아래는 전부 '축소 채점']")
+    print(f"  학습 표본 감소의 비용 (A − ref')  : {a - refp:+.4f}")
+    print(f"  에어로졸 전체의 이득  (B − A)     : {b - a:+.4f}")
+    print(f"    · 관측소값만        (B1 − A)    : {b1 - a:+.4f}")
+    print(f"    · 상류값만          (B2 − A)    : {b2 - a:+.4f}  ← 설계 가설")
+    print(f"  최종 (B − ref')                   : {b - refp:+.4f}  "
+          + ("← 채택 후보" if b - refp > 0.01 else "← 기각 (이득 없음)"))
+    print(f"\n  참고 — 배포 전체 채점 ref {ref:.4f} 는 **표본이 달라** 위 값들과")
+    print(f"  직접 비교할 수 없다(축소 채점은 양성 {rows[1][4]:,}개 · 전체는 {rows[0][4]:,}개).")
+
+    # ── 배포 가능한 형태로 다시 — 결측 허용 단일 모델 ──────────────
+    #
+    # 위 B 는 "에어로졸이 있는 32% 에서만" 성립한다. 배포는 나머지 68% 에도
+    # 값을 내야 하므로, 그 구성을 그대로 채택할 수 없다. `HistGradientBoosting`
+    # 은 결측(NaN)을 분기에서 직접 다루므로, **없는 곳은 NaN 으로 두고 한 모델**
+    # 로 학습하는 것이 배포 가능한 설계다. 이것을 **전체 검증셋**에서 배포
+    # 구성과 나란히 채점한다 — 여기서 이기지 못하면 채택할 수 없다.
+    def _fill(x, mask, block, idx):
+        out = np.full((len(x), block.shape[1]), np.nan, dtype=np.float32)
+        out[mask] = block[idx[mask]]
+        return np.concatenate([x, out], axis=1)
+
+    xd_tr = _fill(x_tr, a_tr_m, a_tr, idx_tr)
+    xd_va = _fill(x_va, a_va_m, a_va, idx_va)
+    tag, f1_d, thr_d, ntr_d, npos_d = run(
+        "D    28+에어로졸(결측 NaN)·전체", xd_tr[m_tr], y_tr[m_tr],
+        xd_va[m_va], y_va[m_va], half[m_va])
+
+    print(f"\n  [배포 가능한 형태 — 전체 표본, 결측은 NaN]")
+    print(f"  {'구성':<30}{'F1':>9}{'판정선':>9}{'학습표본':>11}{'평가양성':>10}")
+    print(f"  {'ref  28특징만':<30}{ref:9.4f}{rows[0][2]:9.3f}{rows[0][3]:11,}{rows[0][4]:10,}")
+    print(f"  {tag:<30}{f1_d:9.4f}{thr_d:9.3f}{ntr_d:11,}{npos_d:10,}")
+    print(f"  차이 (D − ref) : {f1_d - ref:+.4f}  "
+          + ("← 채택 후보 — 배포 형태에서도 이긴다" if f1_d - ref > 0.01
+             else "← 기각 (배포 형태에서는 이득이 남지 않는다)"))
     print("\n  주의: 이 값은 **상한**이다. 대기질 API 에 리드타임 보존")
     print("  아카이브가 없어 학습이 서빙보다 유리하다 — 작으면 그대로 기각한다.")
 
