@@ -259,14 +259,30 @@ def calibrate_prob(prob: float, event: str, ckpt: dict) -> float:
     바꾸면 학습된 곱이 깨져 강수량 자체가 틀어진다. 곡선은 분석용으로
     체크포인트에 남겨두되 서빙 경로에서는 호출하지 않는다.
     """
+    # 극한기상을 전용 GBM 이 내는 체크포인트에서는 이 함수를 호출하면 안
+    # 된다(2026-09-26). 곡선은 GBM 파일에 있고 여기엔 표시용 메타만 남는다 —
+    # 그대로 적용을 시도하면 `KeyError` 로 죽거나(실제로 그랬다) 더 나쁘게는
+    # 신경망 곡선을 GBM 확률에 덧씌운다. 호출부가 GBM 경로를 쓰도록 유도한다.
+    if (ckpt or {}).get("extreme_source") and event in (
+            "heatwave", "coldwave", "dust"):
+        raise RuntimeError(
+            f"이 체크포인트는 극한기상을 '{ckpt['extreme_source']}' 로 낸다 — "
+            f"calibrate_prob() 대신 extreme_gbm.calibrated() 를 쓸 것"
+            f"(진단 스크립트라면 --extreme-gbm 옵션을 줄 것).")
     cal = (ckpt or {}).get("prob_calibration") or {}
     head = (cal.get("heads") or {}).get(event)
     if not head or prob is None:
         return prob
     if head.get("method") == "beta":
+        if not all(k in head for k in ("a", "b", "c")):
+            raise RuntimeError(
+                f"{event} 보정이 beta 로 기록됐는데 계수(a·b·c)가 없다 — "
+                f"체크포인트의 보정 기록이 깨졌다.")
         p = min(max(float(prob), 1e-6), 1 - 1e-6)
         z = head["a"] * np.log(p) - head["b"] * np.log(1 - p) + head["c"]
         return float(1.0 / (1.0 + np.exp(-z)))
+    if "x" not in head or "y" not in head:
+        return prob            # 곡선이 없으면 보정하지 않는다
     return float(np.interp(prob, head["x"], head["y"]))
 
 

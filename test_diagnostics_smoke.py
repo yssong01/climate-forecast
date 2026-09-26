@@ -391,8 +391,33 @@ def _precip_gbm_path():
         raise AssertionError("리드타임 불일치를 통과시켰다")
     except RuntimeError:
         pass
+    # ④ 화면이 판정선 상수를 따로 읽지 않는가(2026-09-26 추가).
+    #
+    # 서빙은 모델 파일의 `meta_gate_tau`(0.310)를 쓰는데 화면 서술 여덟
+    # 군데가 신경망 시절 상수(0.85/0.805)를 계속 읽고 있었다 — 화면이
+    # "85% 미만이면 0으로 처리한다"고 설명하는 동안 모델은 31% 를 기준으로
+    # 잘랐다. 같은 유형이 2026-09-23 에 한 번 났고, 그때 상수를 남겨 둔 채
+    # 서술만 고쳐 재발했다. 그래서 **소스 수준으로** 막는다: `app.py` 에서
+    # 그 상수를 읽는 곳은 `_gate()` 정의부(임포트·폴백·주석)뿐이어야 한다.
+    app_src = os.path.join(os.path.dirname(os.path.abspath(predict.__file__)),
+                           "app.py")
+    with open(app_src, encoding="utf-8") as fh:
+        hits = [(i, ln.strip()) for i, ln in enumerate(fh, 1)
+                if "PRECIP_PROB_GATE" in ln]
+    # 허용: 임포트 1줄 · `_gate()` 안의 폴백 1줄 · 그 docstring 의 언급.
+    stray = [h for h in hits
+             if not (h[1].startswith("PRECIP_PROB_GATE")
+                     or h[1].startswith("return PRECIP_PROB_GATE_BY_LEAD")
+                     or h[1].startswith("근접 판정 표시만"))]
+    assert not stray, (
+        "app.py 가 강수 판정선 상수를 `_gate()` 밖에서 읽는다 — 서빙과 "
+        f"어긋날 수 있다: {stray}")
+    assert any("def _gate(" in ln for ln in open(app_src, encoding="utf-8")), \
+        "app.py 에 강수 판정선 라우터 `_gate()` 가 없다"
+
     return (f"τ={float(meta['meta_gate_tau']):.3f} · "
-            f"F1 {float(meta['meta_val_precip_wet_f1']):.4f} · 구간 출처 확인")
+            f"F1 {float(meta['meta_val_precip_wet_f1']):.4f} · 구간 출처 확인 · "
+            f"화면 상수 누출 0")
 
 
 # ── ④ 판정선 조회가 모든 체크포인트 형태에서 동작하는가 ──────────

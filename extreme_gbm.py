@@ -314,12 +314,18 @@ def main():
             # x/y 는 신경망용이라 지운다 — 남겨 두면 어느 곡선이 쓰이는지
             # 헷갈린다.
             h.pop("x", None); h.pop("y", None)
-        ck["extreme_metrics_served"] = served
-        ck["extreme_metrics"] = served
+        # **화면용 지표(`extreme_metrics*`)는 여기서 쓰지 않는다(2026-09-26).**
+        # `metrics_report.py --extreme-gbm --patch-checkpoint` 가 그 키의
+        # 단일 소유자다. 두 도구가 각자 쓰면 **나중에 돌린 쪽이 이기고**,
+        # 표본이 달라 값이 흔들린다(실측: 폭염 F1 0.8345(평가용 절반) vs
+        # 0.8367(공식 라벨 전체) — 실행 순서에 따라 화면 값이 바뀌었다).
+        # 여기서는 **모델의 성질**(보정 방법·판정선·곡선)만 적는다.
         ck["prob_calibration"] = cal
         ck["extreme_source"] = args.out
         torch.save(ck, ck_path)
         print(f"체크포인트에 반영: {ck_path} (extreme_source={args.out})")
+        print("  남은 작업: metrics_report.py <체크포인트> --extreme-gbm "
+              f"{args.out} --patch-checkpoint — 화면용 지표는 그 도구가 쓴다.")
     return 0
 
 

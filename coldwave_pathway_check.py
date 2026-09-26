@@ -281,6 +281,25 @@ def analyse(grid):
     return amp_temp, amp_season, corr, (sev, sev_up)
 
 
+def violations(grid, expect_up: bool, tol: float = 1e-12):
+    """기온이 한 칸 오를 때 확률이 **기대와 반대로** 움직인 인접 쌍의 수.
+
+    왜 상관 말고 이것이 필요한가(2026-09-26) — 순위상관은 동점(tie)이
+    많으면 무의미해진다. 등온 보정(isotonic)은 계단 함수라 확률을 평탄
+    구간으로 접고(CLAUDE.md 12절이 임계값에 대해 기록한 것과 같은 성질),
+    그 평탄 구간이 격자의 대부분을 덮으면 남은 미세한 수치 차이가 순위를
+    지배한다. **실측: `+12h` 극한 GBM 한파가 위반 0/1,440 인데도 최악
+    상관이 +0.109(WARN)로 나왔다** — 보정 전 상관은 −0.942 다.
+    단조 제약이 걸린 모델에서는 이 함수가 곧 정의이므로, 대리 지표가
+    아니라 이것으로 판정한다.
+
+    `tol` 은 부동소수 잡음만 걸러낸다 — 실제 역전은 이 규모가 아니다.
+    """
+    d = np.diff(np.asarray(grid, dtype=float), axis=1)
+    wrong = (d < -tol) if expect_up else (d > tol)
+    return int(np.sum(wrong)), int(d.size)
+
+
 def main():
     args = [a for a in sys.argv[1:]
             if not a.startswith("--head=") and not a.startswith("--extreme-gbm=")
@@ -353,11 +372,14 @@ def main():
         # 탐침마다 판정하고 **최악값**으로 게이트를 정한다 — 승격 게이트는
         # 보수적이어야 하고, 한 기준에서만 드러나는 역전을 놓치면 안 된다.
         ats, ass, corrs, sevs, worst_ts = [], [], [], [], None
+        n_viol = n_pair = 0
         for ts, b, img, txt in prepared:
             g = build_grid(model, ckpt, b, img, txt, head, _gbm)
             at_i, as_i, c_i, sev_i = analyse(g)
             ats.append(at_i); ass.append(as_i); corrs.append(c_i)
             sevs.append(sev_i[1] if expect_up else sev_i[0])
+            v_i, p_i = violations(g, expect_up)
+            n_viol += v_i; n_pair += p_i
         arr = np.array(corrs, dtype=float)
         valid = ~np.isnan(arr)
         if not valid.any():
@@ -411,10 +433,27 @@ def main():
         # promote_checkpoint.py 가 이 줄을 파싱한다 — 형식을 바꾸지 말 것.
         # 역전이면 FAIL, 방향이 뚜렷하지 않으면(혼재·무반응) WARN.
         corr_code = "FAIL" if verdict.startswith("★") else ("PASS" if verdict == "정상" else "WARN")
+        # **단조 제약이 걸린 헤드는 위반 수로 판정한다(2026-09-26).** 상관은
+        # 대리 지표이고, 보정 곡선의 평탄 구간에서 동점에 지배돼 뒤집힌다
+        # (`violations()` docstring 의 +12h 실측). 제약이 없는 헤드(황사)와
+        # 신경망 경로는 종전 그대로 상관으로 판정한다.
+        mono_cst = False
+        if _gbm is not None:
+            import extreme_gbm as _eg2
+            mono_cst = _eg2.MONO_SIGN.get(head, (0, 0))[0] != 0
+        if mono_cst:
+            viol_code = "PASS" if n_viol == 0 else "FAIL"
+            if viol_code != corr_code:
+                print(f"  [판정 근거] 단조 제약 헤드이므로 위반 수로 판정한다 — "
+                      f"위반 {n_viol}/{n_pair}({viol_code}), 상관 {corr:+.4f}"
+                      f"({corr_code})는 참고값이다. 상관은 보정 곡선의 평탄 "
+                      f"구간에서 동점에 지배돼 뒤집힐 수 있다.")
+            corr_code = viol_code
         # 두 판정 중 나쁜 쪽을 채택한다 — 게이트는 보수적이어야 한다.
         rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
         code = max(corr_code, dep_code, key=lambda c: rank[c])
-        print(f"VERDICT monotonicity_{head} {code} corr={corr:.4f} season_dep={ratio:.2f}")
+        print(f"VERDICT monotonicity_{head} {code} corr={corr:.4f} "
+              f"season_dep={ratio:.2f} viol={n_viol}/{n_pair}")
 
     print(f"\n대상 헤드: {head}")
     print(f"계절의존 = 계절 진폭 ÷ 기온 진폭. 클수록 기온보다 계절에 의존한다 "

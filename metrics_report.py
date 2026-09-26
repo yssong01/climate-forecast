@@ -412,6 +412,21 @@ def main():
 
     import torch
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+    if args.patch_checkpoint:
+        # **출처를 빠뜨린 패치를 막는다(2026-09-26).** 체크포인트가 전용
+        # 모델을 가리키는데 그 옵션 없이 패치하면, 화면용 지표만 신경망
+        # 값으로 되돌아가 표·판정선·확률이 서로 다른 모델을 가리킨다 —
+        # 조용히 어긋나고 지표는 멀쩡해 보인다.
+        _miss = []
+        if ckpt.get("precip_source") and not args.precip_gbm:
+            _miss.append(f"--precip-gbm {ckpt['precip_source']}")
+        if ckpt.get("extreme_source") and not args.extreme_gbm:
+            _miss.append(f"--extreme-gbm {ckpt['extreme_source']}")
+        if _miss:
+            raise SystemExit(
+                "이 체크포인트는 전용 모델을 가리킨다 — 다음을 함께 주지 않으면 "
+                "화면용 지표가 신경망 값으로 되돌아간다:\n  " + "\n  ".join(_miss))
+
     d = eval_cache.load(args.ckpt, args.batch)
     if args.temp_checkpoint:
         # 서빙이 기온을 전용 모델에서 내므로 리포트도 그래야 한다 — 안 하면
