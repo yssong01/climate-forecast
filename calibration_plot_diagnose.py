@@ -58,11 +58,9 @@ import sys
 import numpy as np
 import torch
 
-from train import collect_historical, WeatherDataset, make_split, STATION_NAMES, _parse_ts, aux_dataset_kwargs
-from interp_field_collector import InterpolatedFieldCollector
-from tendency_collector import TendencyCollector
-from weather_collector import STATION_COORDS
-from predict import load_model, calibrate_prob, event_threshold
+import eval_cache
+from train import STATION_NAMES, _parse_ts
+from predict import CHECKPOINT, calibrate_prob, event_threshold
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH = 1024
@@ -129,53 +127,33 @@ def main():
                          "2026-09-26 부터 배포는 극한기상을 전용 GBM 이 낸다.")
     args = ap.parse_args()
 
-    model, ckpt = load_model()
-    records = collect_historical()
-    txt = TendencyCollector(records)
-    ds = WeatherDataset(
-        records, sat_collector=InterpolatedFieldCollector(
-            records, STATION_COORDS, n_bands=ckpt.get("re_channels", 4)),
-        txt_collector=txt, lead_hours=ckpt["lead_hours"],
-        **aux_dataset_kwargs(ckpt),
-        mean=np.array(ckpt["mean"], dtype=np.float32),
-        std=np.array(ckpt["std"], dtype=np.float32),
-    )
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=True, ckpt=ckpt)
-    idx = np.array(val_ds.indices)
-    stns = np.array([ds.stns[i] for i in idx])
-    tgt_ts = np.array([ds.tgt_timestamps[i] for i in idx])
-
-    heat_p, cold_p = [], []
-    model.eval()
-    with torch.no_grad():
-        for s in range(0, len(idx), BATCH):
-            sl = idx[s:s + BATCH]
-            model(num_x=ds.X_num[sl].to(DEVICE), img_x=ds.X_img[sl].to(DEVICE).float(),
-                  txt_x=ds.X_txt[sl].to(DEVICE))
-            heat_p.append(torch.sigmoid(model._last_heatwave_logit).cpu().squeeze(-1))
-            cold_p.append(torch.sigmoid(model._last_coldwave_logit).cpu().squeeze(-1))
-    heat_p = torch.cat(heat_p).numpy()
-    cold_p = torch.cat(cold_p).numpy()
-    heat_y = ds.y_heatwave[idx].numpy()
-    cold_y = ds.y_coldwave[idx].numpy()
-    heat_m = ds.heat_mask[idx].numpy().astype(bool)
-    cold_m = ds.cold_mask[idx].numpy().astype(bool)
+    # 검증셋 추론은 `eval_cache` 가 만든 것을 재사용한다(2026-09-27 전환) —
+    # 직접 `WeatherDataset` 을 구성하면 그 한 번이 RAM 약 22GiB 라, 같은
+    # 계열 진단을 두 개만 겹쳐 돌려도 OOM 이 났다.
+    ckpt = torch.load(CHECKPOINT, map_location="cpu", weights_only=True)
+    d = eval_cache.load(CHECKPOINT)
+    stns = np.asarray(d["stn"])
+    tgt_ts = np.asarray(d["tgt_ts"])
+    heat_p = np.asarray(d["heat_prob"]).astype(np.float64)
+    cold_p = np.asarray(d["cold_prob"]).astype(np.float64)
+    heat_y = np.asarray(d["y_heatwave"])
+    cold_y = np.asarray(d["y_coldwave"])
 
     # 공식 라벨 전용 채점(2026-09-23) — 특보 비운영기간을 확정 음성으로 채운
     # 체크포인트는 채점 표본이 크게 늘어난다. 쉬운 음성이 섞이면 정밀도가
     # 부풀어, 화면에서 이 플롯 위에 놓이는 합산표와 다른 질문에 답한 값이
     # 된다(metrics_report.precision_block 과 같은 처리).
-    def _official(mask, attr):
-        vec = getattr(ds, attr, None)
-        if vec is None:
+    def _official(base, off_key):
+        mask = np.asarray(d[base]).astype(bool)
+        if off_key not in d:
             return mask
-        off = vec[idx].numpy().astype(bool)
+        off = np.asarray(d[off_key]).astype(bool)
         if off.sum() and int(off.sum()) != int(mask.sum()):
             return mask & off
         return mask
 
-    heat_m = _official(heat_m, "heat_mask_official")
-    cold_m = _official(cold_m, "cold_mask_official")
+    heat_m = _official("heat_mask", "heat_mask_official")
+    cold_m = _official("cold_mask", "cold_mask_official")
 
     # 보정 후 공간에서, 서빙이 실제로 쓰는 판정선으로 채점한다(2026-09-23).
     # 관측소별 예외가 걸린 조합은 그 관측소만 임계값이 다르므로 판정선도
@@ -194,7 +172,18 @@ def main():
             raise SystemExit(f"극한기상 GBM 이 없다: {args.extreme_gbm}")
         if int(meta["meta_num_features"]) != ckpt["num_features"]:
             raise SystemExit("GBM 의 입력 차원이 체크포인트와 다르다.")
-        xv = ds.X_num[idx.tolist()].numpy().astype(np.float32)
+        # 표준화 입력 행렬은 특징 캐시에서 가져온다. 두 캐시가 같은 검증
+        # 분할에서 나왔는지 **키로 대조한다** — 행 순서가 어긋나면 확률과
+        # 라벨이 밀려 붙는데 지표는 그럴듯하게 나와 눈치챌 수 없다.
+        fz = eval_cache.load_features(CHECKPOINT)
+        xv = fz["x_val"].astype(np.float32)
+        if len(xv) != len(stns):
+            raise SystemExit("추론 캐시와 특징 캐시의 검증 표본 수가 다르다 — "
+                             "eval_cache 를 --force 로 다시 만들 것")
+        _a = np.asarray([int(v) for v in stns], dtype=np.int64)
+        if not np.array_equal(_a, fz["stn_val"].astype(np.int64)):
+            raise SystemExit("추론 캐시와 특징 캐시의 행 순서가 다르다 — "
+                             "eval_cache 를 --force 로 다시 만들 것")
         heat_p = _eg.calibrated_batch(models, meta, "heatwave", xv)
         cold_p = _eg.calibrated_batch(models, meta, "coldwave", xv)
         gbm = (models, meta)

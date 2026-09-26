@@ -282,6 +282,36 @@ def load(ckpt_path: str = CHECKPOINT, batch: int = DEFAULT_BATCH, force: bool = 
     return build(ckpt_path, batch)
 
 
+# 극한기상 헤드 이름 → 캐시 키. 스크립트마다 이 대응을 각자 적어 두면
+# 헤드를 늘릴 때 한 군데만 고치고 나머지를 빠뜨린다(2026-09-27 정리).
+EVENT_KEYS = {
+    "heatwave": ("heat_prob", "y_heatwave", "heat_mask", "heat_mask_official"),
+    "coldwave": ("cold_prob", "y_coldwave", "cold_mask", "cold_mask_official"),
+    "dust":     ("dust_prob", "y_dust", "dust_mask", None),
+}
+
+
+def event_arrays(d: dict, event: str, official: bool = False):
+    """(확률, 라벨, 마스크) — 캐시 dict 에서 한 헤드의 채점 재료를 꺼낸다.
+
+    `official=True` 면 **공식 라벨 전용 마스크**를 쓴다(비운영기간 확정
+    음성 채움을 켠 체크포인트를 배포본과 공정하게 비교할 때). 황사는
+    그 마스크가 없으므로 기본 마스크로 내려간다.
+
+    마스크를 적용한 뒤 돌려주므로 호출부는 바로 채점하면 된다 — 마스크를
+    적용할지 말지를 스크립트마다 따로 판단하다가 서로 다른 표본에서 잰
+    값을 비교하는 일이 실제로 있었다.
+    """
+    if event not in EVENT_KEYS:
+        raise KeyError(f"모르는 헤드: {event} (가능: {list(EVENT_KEYS)})")
+    pk, yk, mk, mok = EVENT_KEYS[event]
+    key = mok if (official and mok and mok in d) else mk
+    m = np.asarray(d[key]).astype(bool)
+    return (np.asarray(d[pk])[m].astype(np.float64),
+            np.asarray(d[yk])[m].astype(int),
+            m)
+
+
 def _ts_to_int(seq) -> np.ndarray:
     """'YYYYMMDDHHmm' 문자열 배열 → int64.
 

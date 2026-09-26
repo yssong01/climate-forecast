@@ -16,21 +16,11 @@ station_anomaly_investigate.py로 원인도 확인했다 — 부산은 오탐일
 import argparse
 
 import numpy as np
-import torch
 
-from train import collect_historical, WeatherDataset, make_split, STATION_NAMES, aux_dataset_kwargs
-from interp_field_collector import InterpolatedFieldCollector
-from tendency_collector import TendencyCollector
-from weather_collector import STATION_COORDS
-from predict import load_model, CHECKPOINT
+import eval_cache
+from train import STATION_NAMES
+from predict import CHECKPOINT
 from threshold_validation import prf, best_thresh, sensitivity, CALIB_SEED
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH = 1024
-
-_LOGIT_ATTR = {"heatwave": "_last_heatwave_logit", "coldwave": "_last_coldwave_logit"}
-_LABEL_ATTR = {"heatwave": "y_heatwave", "coldwave": "y_coldwave"}
-_MASK_ATTR = {"heatwave": "heat_mask", "coldwave": "cold_mask"}
 
 
 def main():
@@ -39,37 +29,21 @@ def main():
     ap.add_argument("--event", default="heatwave", choices=["heatwave", "coldwave"])
     args = ap.parse_args()
 
-    model, ckpt = load_model(CHECKPOINT, DEVICE)
-    model.eval()
-    records = collect_historical()
-    txt = TendencyCollector(records)
-    ds = WeatherDataset(
-        records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
-        txt_collector=txt, lead_hours=ckpt["lead_hours"],
-        **aux_dataset_kwargs(ckpt),
-        mean=np.array(ckpt["mean"], dtype=np.float32),
-        std=np.array(ckpt["std"], dtype=np.float32),
-    )
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False, ckpt=ckpt)
-    val_idx = np.array(val_ds.indices)
-    stns = np.array([ds.stns[i] for i in val_idx])
+    # 검증셋 추론은 `eval_cache` 가 만든 것을 재사용한다(2026-09-27 전환).
+    # 종전에는 이 스크립트가 `WeatherDataset` 을 직접 구성했는데 그 한 번이
+    # RAM 약 22GiB 라, 같은 계열 스크립트 두 개만 겹쳐 돌려도 OOM 이 났다.
+    # 캐시는 체크포인트 지문으로 신선도를 검사하므로 낡은 값을 쓸 위험이 없다.
+    d = eval_cache.load(CHECKPOINT)
+    stns = np.asarray(d["stn"])
+    # 마스크를 적용하기 **전에** 관측소로 먼저 거른다 — 순서를 바꾸면
+    # 마스크 인덱스와 관측소 인덱스가 어긋난다.
+    pk, yk, mk, _ = eval_cache.EVENT_KEYS[args.event]
     sel = stns == args.station
-    idx_stn = val_idx[sel]
+    probs = np.asarray(d[pk])[sel].astype(np.float64)
+    labels = np.asarray(d[yk])[sel].astype(int)
+    mask = np.asarray(d[mk])[sel].astype(bool)
     stn_name = STATION_NAMES.get(args.station, args.station)
-    print(f"관측소: {stn_name}({args.station}) — 검증 표본 {len(idx_stn):,}개\n")
-
-    probs = []
-    with torch.no_grad():
-        for b in range(0, len(idx_stn), BATCH):
-            sl = idx_stn[b:b + BATCH].tolist()
-            model(num_x=ds.X_num[sl].to(DEVICE), img_x=ds.X_img[sl].to(DEVICE).float(),
-                  txt_x=ds.X_txt[sl].to(DEVICE))
-            logit = getattr(model, _LOGIT_ATTR[args.event])
-            probs.append(torch.sigmoid(logit).squeeze(-1).cpu().numpy())
-    probs = np.concatenate(probs)
-
-    mask = getattr(ds, _MASK_ATTR[args.event])[idx_stn].numpy().astype(bool)
-    labels = getattr(ds, _LABEL_ATTR[args.event])[idx_stn].numpy().astype(int)
+    print(f"관측소: {stn_name}({args.station}) — 검증 표본 {int(sel.sum()):,}개\n")
     probs, labels = probs[mask], labels[mask]
 
     rng = np.random.RandomState(CALIB_SEED)

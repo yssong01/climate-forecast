@@ -33,13 +33,8 @@ import sys
 import numpy as np
 import torch
 
-from predict import CHECKPOINT, load_model
-from train import (WeatherDataset, collect_historical, make_split, WET_THRESH,
-                   aux_dataset_kwargs)
-from weather_collector import STATION_COORDS
-from interp_field_collector import InterpolatedFieldCollector
-from tendency_collector import TendencyCollector
-from text_collector import SimulatedTextCollector
+from predict import CHECKPOINT
+import eval_cache
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH = 4096
@@ -92,51 +87,21 @@ def ece_mce(rows, n_total):
 
 def main():
     ckpt_path = sys.argv[1] if len(sys.argv) > 1 else CHECKPOINT
-    model, ckpt = load_model(ckpt_path, DEVICE)
-    model.eval()
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     print(f"체크포인트: {ckpt_path} (num_features={ckpt.get('num_features')}, "
           f"분할={ckpt.get('split_mode', 'random')})")
 
-    records = collect_historical()
-    txt_collector = (TendencyCollector(records) if ckpt.get("im_dim", 384) < 128
-                     else SimulatedTextCollector())
-    ds = WeatherDataset(
-        records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
-        txt_collector=txt_collector, lead_hours=ckpt["lead_hours"],
-        **aux_dataset_kwargs(ckpt),
-        mean=np.array(ckpt["mean"], dtype=np.float32),
-        std=np.array(ckpt["std"], dtype=np.float32),
-    )
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False, ckpt=ckpt)
-    val_idx = np.array(val_ds.indices)
-
-    rain_p, heat_p, cold_p, dust_p = [], [], [], []
-    with torch.no_grad():
-        for b in range(0, len(val_idx), BATCH):
-            idx = val_idx[b:b + BATCH].tolist()
-            model(num_x=ds.X_num[idx].to(DEVICE),
-                  img_x=ds.X_img[idx].to(DEVICE).float(),
-                  txt_x=ds.X_txt[idx].to(DEVICE))
-            rain_p.append(torch.sigmoid(model._last_rain_logit).squeeze(-1).cpu().numpy())
-            heat_p.append(torch.sigmoid(model._last_heatwave_logit).squeeze(-1).cpu().numpy())
-            cold_p.append(torch.sigmoid(model._last_coldwave_logit).squeeze(-1).cpu().numpy())
-            if hasattr(model, "head_dust"):
-                dust_p.append(torch.sigmoid(model._last_dust_logit).squeeze(-1).cpu().numpy())
-
-    precip_a = ds.y[val_idx, 1].numpy()
-    hmask = ds.heat_mask[val_idx].numpy().astype(bool)
-    cmask = ds.cold_mask[val_idx].numpy().astype(bool)
-    heads = [
-        ("강수", np.concatenate(rain_p), (precip_a >= WET_THRESH).astype(int)),
-        ("폭염", np.concatenate(heat_p)[hmask],
-         ds.y_heatwave[val_idx].numpy().astype(int)[hmask]),
-        ("한파", np.concatenate(cold_p)[cmask],
-         ds.y_coldwave[val_idx].numpy().astype(int)[cmask]),
-    ]
-    if dust_p:
-        dmask = ds.dust_mask[val_idx].numpy().astype(bool)
-        heads.append(("황사", np.concatenate(dust_p)[dmask],
-                     ds.y_dust[val_idx].numpy().astype(int)[dmask]))
+    # 검증셋 추론은 `eval_cache` 가 만든 것을 재사용한다(2026-09-27 전환) —
+    # 직접 `WeatherDataset` 을 구성하면 그 한 번이 RAM 약 22GiB 라, 같은
+    # 계열 진단을 두 개만 겹쳐 돌려도 OOM 이 났다.
+    d = eval_cache.load(ckpt_path)
+    wet_thresh = float(d["wet_thresh"])
+    heads = [("강수", np.asarray(d["rain_prob"]).astype(np.float64),
+              (np.asarray(d["precip_true"]) >= wet_thresh).astype(int))]
+    for ko, ev in (("폭염", "heatwave"), ("한파", "coldwave"), ("황사", "dust")):
+        pr, lb, _ = eval_cache.event_arrays(d, ev)
+        if len(pr):
+            heads.append((ko, pr, lb))
 
     results = []
     for name, probs, labels in heads:

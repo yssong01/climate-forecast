@@ -27,17 +27,9 @@ threshold_validation.py — 임계값 재보정이 진짜 개선인지, 검증�
 실행: python threshold_validation.py
 """
 import numpy as np
-import torch
+import eval_cache
+from predict import CHECKPOINT
 
-from train import collect_historical, WeatherDataset, VAL_RATIO, SEED, WET_THRESH, make_split, aux_dataset_kwargs
-from interp_field_collector import InterpolatedFieldCollector
-from tendency_collector import TendencyCollector
-from weather_collector import STATION_COORDS
-from text_collector import SimulatedTextCollector
-from predict import load_model, CHECKPOINT
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH = 1024
 CALIB_SEED = 1234   # SEED(42)와 다른 값 — 학습/검증 분할과 독립적인 재분할
 
 
@@ -67,56 +59,25 @@ def sensitivity(probs, labels, t, delta=0.02):
 
 
 def main():
-    model, ckpt = load_model(CHECKPOINT, DEVICE)
-    model.eval()
-    records = collect_historical()
-    # 2026-08-09: 체크포인트가 Re·Im축 모두 실제 데이터에 의존하므로 학습
-    # 때와 같은 컬렉터를 써야 한다. im_dim 으로 구/신버전을 자동 판별한다.
-    txt_collector = (TendencyCollector(records) if ckpt.get("im_dim", 384) < 128
-                     else SimulatedTextCollector())
-    ds = WeatherDataset(
-        records, sat_collector=InterpolatedFieldCollector(records, STATION_COORDS),
-        txt_collector=txt_collector, lead_hours=ckpt["lead_hours"],
-        **aux_dataset_kwargs(ckpt),
-        mean=np.array(ckpt["mean"], dtype=np.float32),
-        std=np.array(ckpt["std"], dtype=np.float32),
-    )
-    _, val_ds = make_split(ds, ckpt.get("split_mode", "random"), verbose=False, ckpt=ckpt)
-    val_idx = np.array(val_ds.indices)
-
-    rain_p, heat_p, cold_p, dust_p = [], [], [], []
-    with torch.no_grad():
-        for b in range(0, len(val_idx), BATCH):
-            idx = val_idx[b:b + BATCH].tolist()
-            model(num_x=ds.X_num[idx].to(DEVICE),
-                  img_x=ds.X_img[idx].to(DEVICE).float(),
-                  txt_x=ds.X_txt[idx].to(DEVICE))
-            rain_p.append(torch.sigmoid(model._last_rain_logit).squeeze(-1).cpu().numpy())
-            heat_p.append(torch.sigmoid(model._last_heatwave_logit).squeeze(-1).cpu().numpy())
-            cold_p.append(torch.sigmoid(model._last_coldwave_logit).squeeze(-1).cpu().numpy())
-            if hasattr(model, "head_dust"):
-                dust_p.append(torch.sigmoid(model._last_dust_logit).squeeze(-1).cpu().numpy())
+    # 검증셋 추론은 `eval_cache` 가 만든 것을 재사용한다(2026-09-27 전환) —
+    # 이 스크립트가 직접 `WeatherDataset` 을 구성하면 그 한 번이 RAM 약
+    # 22GiB 라, 같은 계열 진단을 두 개만 겹쳐 돌려도 OOM 이 났다.
+    d = eval_cache.load(CHECKPOINT)
+    n_val = len(d["temp_true"])
 
     # 폭염·한파·황사는 전부 공식 라벨이 있는 표본에서만 채점한다 — 마스크=0인
     # 표본의 라벨 0 은 "사건 없음"이 아니라 "판정 불가"다(train.py 참고).
-    precip_a = ds.y[val_idx, 1].numpy()
-    hmask = ds.heat_mask[val_idx].numpy().astype(bool)
-    cmask = ds.cold_mask[val_idx].numpy().astype(bool)
-    heads = [
-        ("강수", np.concatenate(rain_p), (precip_a >= WET_THRESH).astype(int)),
-        ("폭염", np.concatenate(heat_p)[hmask],
-         ds.y_heatwave[val_idx].numpy().astype(int)[hmask]),
-        ("한파", np.concatenate(cold_p)[cmask],
-         ds.y_coldwave[val_idx].numpy().astype(int)[cmask]),
-    ]
-    if dust_p:
-        dmask = ds.dust_mask[val_idx].numpy().astype(bool)
-        heads.append(("황사", np.concatenate(dust_p)[dmask],
-                     ds.y_dust[val_idx].numpy().astype(int)[dmask]))
+    wet_thresh = float(d["wet_thresh"])
+    heads = [("강수", np.asarray(d["rain_prob"]).astype(np.float64),
+              (np.asarray(d["precip_true"]) >= wet_thresh).astype(int))]
+    for ko, ev in (("폭염", "heatwave"), ("한파", "coldwave"), ("황사", "dust")):
+        pr, lb, _ = eval_cache.event_arrays(d, ev)
+        if len(pr):
+            heads.append((ko, pr, lb))
 
     rng = np.random.RandomState(CALIB_SEED)
 
-    print(f"검증 {len(val_idx)}개 (황사는 PM10 실측 가능 관측소만 별도 표본)\n")
+    print(f"검증 {n_val}개 (황사는 PM10 실측 가능 관측소만 별도 표본)\n")
     print("="*86)
     print(" 임계값 일반화 검증 — 보정용에서 고른 t 가 평가용에서도 통하는가?")
     print("="*86)
