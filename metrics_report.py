@@ -113,6 +113,11 @@ def accuracy_block(d, ckpt=None):
     # 주석 참고) 체크포인트의 lead_hours 로 고른다.
     prob_gate = (PRECIP_PROB_GATE_BY_LEAD.get(ckpt.get("lead_hours"), PRECIP_PROB_GATE)
                  if ckpt is not None else PRECIP_PROB_GATE)
+    # 강수를 전용 GBM 이 내는 구성(2026-09-26)에서는 그 모델 파일에 저장된
+    # 판정선을 쓴다 — 신경망용 상수를 그대로 씌우면 서빙과 다른 동작점을
+    # 재게 된다(GBM τ=0.310 vs 신경망 0.85).
+    if "precip_gate" in d:
+        prob_gate = float(d["precip_gate"])
     pp_served = np.where(d["rain_prob"] < prob_gate, 0.0, pp)
     precip_mae_served = float(np.abs(pp_served - pt).mean())
 
@@ -373,6 +378,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt", nargs="?", default=CHECKPOINT)
     ap.add_argument("--batch", type=int, default=eval_cache.DEFAULT_BATCH)
+    ap.add_argument("--precip-gbm", default=None,
+                    help="강수 예측만 이 GBM 에서 가져온다(서빙과 같은 구성). "
+                         "2026-09-26 부터 배포는 강수를 전용 GBM 이 낸다.")
     ap.add_argument("--temp-checkpoint", default=None,
                     help="기온 예측만 이 체크포인트에서 가져온다(서빙과 같은 구성). "
                          "2026-09-25 부터 배포는 기온을 전용 모델이 낸다.")
@@ -403,6 +411,23 @@ def main():
         d = dict(d)
         d["temp_pred"] = dt["temp_pred"]
         print(f"기온 예측 출처: {args.temp_checkpoint} (서빙과 동일)")
+
+    if args.precip_gbm:
+        # 기온과 같은 이유 — 서빙이 강수를 GBM 에서 내므로 리포트도 그래야
+        # 한다. 판정선도 그 모델 파일에 저장된 값을 쓴다.
+        import precip_gbm as _pg
+        amt, occ, gmeta = _pg.load(args.precip_gbm)
+        if amt is None:
+            raise SystemExit(f"강수 GBM 이 없다: {args.precip_gbm}")
+        feat = eval_cache.load_features(args.ckpt)
+        if len(feat["tgt_ts_val"]) != len(d["tgt_ts"]):
+            raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
+        d = dict(d)
+        d["precip_pred"] = np.clip(amt.predict(feat["x_val"]), 0.0, None)
+        d["rain_prob"] = occ.predict_proba1(feat["x_val"])
+        d["precip_gate"] = np.array(float(gmeta["meta_gate_tau"]))
+        print(f"강수 예측 출처: {args.precip_gbm} "
+              f"(판정선 τ={float(gmeta['meta_gate_tau']):.3f})")
 
     acc = accuracy_block(d, ckpt)
     pre = precision_block(d, ckpt)
@@ -435,15 +460,17 @@ def main():
         # 값인지 알 수 없다(이 저장소가 반복해 겪은 드리프트의 입구다).
         json.dump({"checkpoint": args.ckpt,
                    "temp_checkpoint": args.temp_checkpoint,
+                   "precip_gbm": args.precip_gbm,
                    "accuracy": acc, "precision": pre, "calibration": cal},
                   f, ensure_ascii=False, indent=2)
     print(f"저장: {out_json}")
 
     if args.patch_checkpoint:
-        _patch_checkpoint(args.ckpt, acc, pre)
+        _patch_checkpoint(args.ckpt, acc, pre, args.precip_gbm)
 
 
-def _patch_checkpoint(path: str, acc: dict, pre: dict = None) -> None:
+def _patch_checkpoint(path: str, acc: dict, pre: dict = None,
+                      gbm: str = None) -> None:
     """서빙 기준 강수 오차 두 개를 체크포인트에 적어 넣는다(2026-09-06).
 
     왜 필요한가 — '출력값 추이' 탭이 강수 출력값 옆에 붙이던 `±` 는
@@ -464,6 +491,12 @@ def _patch_checkpoint(path: str, acc: dict, pre: dict = None) -> None:
     """
     import torch
     ck = torch.load(path, map_location="cpu", weights_only=True)
+    # 강수를 전용 GBM 이 내면 **원본 MAE 도 그 모델의 값**이어야 한다
+    # (2026-09-26). 종전에는 서빙·구간·F1 만 갱신해서, 화면의 원본 MAE
+    # 하나만 신경망 값으로 남아 다른 칸과 어긋났다.
+    if gbm:
+        ck["val_precip_mae"] = acc["precip_mae"]
+        ck["precip_source"] = gbm
     ck["val_precip_mae_served"] = acc["precip_mae_served"]
     ck["val_precip_mae_wet"] = acc["precip_mae_wet"]
     ck["val_precip_baseline_mae_wet"] = acc["precip_baseline_mae_wet"]

@@ -198,6 +198,26 @@ def main():
     ckpt_path = args[0] if args else CHECKPOINT
 
     data = eval_cache.load(ckpt_path)
+    gbm_path = next((a.split("=", 1)[1] for a in sys.argv[1:]
+                     if a.startswith("--precip-gbm=")), None)
+    if gbm_path:
+        # 강수를 전용 GBM 이 내는 구성(2026-09-26)에서는 **그 모델의 잔차**로
+        # 구간을 잡아야 한다. 신경망 출력으로 잡은 분위수를 GBM 예측에
+        # 씌우면 폭이 엉뚱해진다. 절차는 그대로 두고 입력만 바꾼다 —
+        # 같은 규칙을 두 곳에 적지 않기 위해서다.
+        import precip_gbm
+        import eval_cache as _ec
+        amt, occ, meta = precip_gbm.load(gbm_path)
+        if amt is None:
+            raise SystemExit(f"GBM 모델이 없다: {gbm_path}")
+        feat = _ec.load_features(ckpt_path)
+        if not (len(feat["tgt_ts_val"]) == len(data["tgt_ts"])
+                and (feat["stn_val"] == data["stn"].astype(feat["stn_val"].dtype)).all()):
+            raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
+        data = dict(data)
+        data["precip_pred"] = np.clip(amt.predict(feat["x_val"]), 0.0, None)
+        data["rain_prob"] = occ.predict_proba1(feat["x_val"])
+        print(f"강수 예측 출처: {gbm_path} (서빙과 동일)")
     stn = data["stn"]
     n = len(stn)
     rng = np.random.RandomState(CALIB_SEED)
@@ -242,6 +262,10 @@ def main():
         "calib_seed": CALIB_SEED,
         "alpha": ALPHA,
         "temp": {"strata": "station", **temp_result} if temp_adopt else None,
+        # 강수 구간이 어느 모델의 잔차로 잡혔는지 남긴다 — 표시가 없으면
+        # 강수 출처를 바꿨을 때 다른 모델의 오차 분포로 구간을 그리게 되고,
+        # 화면은 멀쩡해 보인다(predict.py 가 이 값을 대조해 막는다).
+        "precip_source": (gbm_path or "model"),
         "precip": ({"strata": "rain_prob_bucket", "rain_prob_edges": RAIN_PROB_EDGES,
                      **precip_result} if precip_adopt else None),
     }

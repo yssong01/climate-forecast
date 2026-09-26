@@ -101,8 +101,16 @@ def model_fingerprint(checkpoint_path: str) -> str:
         "checkpoints", "numerical_trichef_temp.pt")
     if _temp and os.path.exists(_temp):
         paths.append(_temp)
+    # 강수 전용 GBM 도 **예측을 결정한다** — 빠뜨리면 강수 출처를 바꿔도
+    # 같은 model_id 로 기록돼 서로 다른 모델의 적중률이 뭉친다.
+    # 기본값은 `predict.PRECIP_GBM` 과 같아야 하며 연기 시험이 강제한다.
+    _gbm = os.getenv("PRECIP_GBM_PATH") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "checkpoints", "precip_gbm.npz")
+    gbm_path = _gbm if (_gbm and os.path.exists(_gbm)) else None
     try:
-        key = tuple((p, os.stat(p).st_mtime_ns, os.stat(p).st_size) for p in paths)
+        key = tuple((p, os.stat(p).st_mtime_ns, os.stat(p).st_size)
+                    for p in paths + ([gbm_path] if gbm_path else []))
     except OSError:
         return "missing"
     if key in _FP_CACHE:
@@ -118,6 +126,16 @@ def model_fingerprint(checkpoint_path: str) -> str:
             for field in ("mean", "std"):
                 h.update(repr(ck.get(field)).encode())
             h.update(f"{ck.get('num_features')}:{ck.get('lead_hours')}".encode())
+        if gbm_path:
+            import numpy as _np
+            z = _np.load(gbm_path, allow_pickle=False)
+            # **예측을 결정하는 것만** 해시한다 — 트리 배열과 판정선.
+            # 지표(meta_val_*)를 나중에 갱신해도 신원이 흔들리면 안 된다.
+            for k in sorted(z.files):
+                if k.startswith("meta_") and k != "meta_gate_tau":
+                    continue
+                h.update(k.encode())
+                h.update(_np.ascontiguousarray(z[k]).tobytes())
         fp = "sha256:" + h.hexdigest()[:16]
     except Exception:                                # noqa: BLE001
         # torch 가 없거나 읽기에 실패하면 구분을 포기한다 — 틀린 신원으로

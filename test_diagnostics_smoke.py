@@ -69,7 +69,7 @@ def synthetic_ckpt(num_features, **extra):
 # ── ① 모든 진단 스크립트가 임포트되는가 ──────────────────────────
 DIAGNOSTIC_MODULES = [
     "eval_cache", "metrics_report", "error_breakdown", "threshold_validation",
-    "baseline_suite",
+    "baseline_suite", "precip_gbm",
     "probability_calibration_fit", "probability_calibration_check",
     "calibration_plot_diagnose", "station_threshold_check",
     "station_coverage_check", "seasonal_falsealarm_check",
@@ -338,6 +338,63 @@ def _temp_checkpoint_path():
     return f"절대경로 · predict≡accuracy · 신원 반영"
 
 
+# ── ③-3 강수 전용 GBM ───────────────────────────────────────────
+def _precip_gbm_path():
+    """배포 GBM 이 있고, numpy 추론기가 동작하며, 신원·구간 출처가 맞는가.
+
+    셋을 함께 본다(2026-09-26).
+      ① 경로가 절대경로이고 `predict` 와 `accuracy` 의 기본값이 같은가 —
+         상대경로는 CI 레이아웃에서 못 찾는다(같은 함정을 이미 한 번 겪었다).
+      ② 체크포인트의 강수 예측구간이 **GBM 기준으로 적합됐다는 표시**와
+         실제 강수 출처가 맞는가 — 어긋나면 다른 모델의 오차 분포로 구간을
+         그리게 되고 화면은 멀쩡해 보인다.
+      ③ 입력 차원·리드타임이 어긋나는 조합을 막는가.
+    """
+    import os
+    import torch
+    import predict
+    import precip_gbm as pg
+
+    assert os.path.isabs(predict.PRECIP_GBM), \
+        f"PRECIP_GBM 이 상대경로다: {predict.PRECIP_GBM}"
+    acc_default = os.path.join(
+        os.path.dirname(os.path.abspath(predict.__file__)),
+        "checkpoints", "precip_gbm.npz")
+    assert os.path.abspath(acc_default) == os.path.abspath(predict.PRECIP_GBM), \
+        "predict 와 accuracy 의 GBM 기본 경로가 다르다"
+    assert os.path.exists(predict.PRECIP_GBM), \
+        f"배포 경로에 강수 GBM 이 없다: {predict.PRECIP_GBM}"
+
+    amt, occ, meta = pg.load(predict.PRECIP_GBM)
+    assert amt is not None, "GBM 로드 실패"
+    nf = int(meta["meta_num_features"])
+    x = np.zeros((3, nf), dtype=np.float32)
+    a, o = amt.predict(x), occ.predict_proba1(x)
+    assert a.shape == (3,) and o.shape == (3,), "추론 출력 shape 불일치"
+    assert np.all((o >= 0) & (o <= 1)), "확률이 [0,1] 밖이다"
+
+    ck = torch.load(os.path.join(os.path.dirname(os.path.abspath(predict.__file__)),
+                                 "checkpoints", "numerical_trichef.pt"),
+                    map_location="cpu", weights_only=True)
+    src = (ck.get("conformal_interval") or {}).get("precip_source")
+    assert src and src != "model", (
+        "강수 예측구간이 GBM 기준으로 적합되지 않았다 — "
+        "conformal_interval_fit.py --precip-gbm 을 돌릴 것")
+    assert predict.load_precip_gbm(ck, predict.PRECIP_GBM) is not None
+
+    # 리드타임이 다른 조합은 막아야 한다.
+    ck12 = torch.load(os.path.join(os.path.dirname(os.path.abspath(predict.__file__)),
+                                   "checkpoints", "numerical_trichef_12h.pt"),
+                      map_location="cpu", weights_only=True)
+    try:
+        predict.load_precip_gbm(ck12, predict.PRECIP_GBM)
+        raise AssertionError("리드타임 불일치를 통과시켰다")
+    except RuntimeError:
+        pass
+    return (f"τ={float(meta['meta_gate_tau']):.3f} · "
+            f"F1 {float(meta['meta_val_precip_wet_f1']):.4f} · 구간 출처 확인")
+
+
 # ── ④ 판정선 조회가 모든 체크포인트 형태에서 동작하는가 ──────────
 def _threshold_paths():
     from predict import event_threshold, STATION_EVENT_THRESH_OVERRIDES
@@ -382,6 +439,8 @@ def main():
     check("forward", _forward_all_dims)
     print("\n[T3-2] 기온 전용 보조 체크포인트 경로·신원")
     check("temp_checkpoint", _temp_checkpoint_path)
+    print("\n[T3-3] 강수 전용 GBM 경로·추론·구간 출처")
+    check("precip_gbm", _precip_gbm_path)
     print("\n[T4] 판정선 조회(구버전/신버전 체크포인트)")
     check("event_threshold", _threshold_paths)
     print("\n[T5] 배포 체크포인트 로드·추론")

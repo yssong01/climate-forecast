@@ -232,6 +232,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt", nargs="?", default=CHECKPOINT)
     ap.add_argument("--batch", type=int, default=eval_cache.DEFAULT_BATCH)
+    ap.add_argument("--precip-gbm", default=None,
+                    help="강수 예측만 이 GBM 에서 가져온다(서빙과 동일).")
     ap.add_argument("--temp-checkpoint", default=None,
                     help="기온 예측만 이 체크포인트에서 가져온다(서빙과 동일).")
     ap.add_argument("--served", action="store_true",
@@ -243,6 +245,24 @@ def main():
     prob_gate = PRECIP_PROB_GATE_BY_LEAD.get(ckpt.get("lead_hours"), PRECIP_PROB_GATE)
 
     d = eval_cache.load(args.ckpt, args.batch)
+    if args.precip_gbm:
+        # metrics_report.py 와 같은 이유 — 서빙이 강수를 GBM 에서 내므로
+        # 구간 분해도 그 모델의 오차로 그려야 한다.
+        import precip_gbm as _pg
+        amt, occ, gmeta = _pg.load(args.precip_gbm)
+        if amt is None:
+            raise SystemExit(f"강수 GBM 이 없다: {args.precip_gbm}")
+        feat = eval_cache.load_features(args.ckpt)
+        if len(feat["tgt_ts_val"]) != len(d["tgt_ts"]):
+            raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
+        d = dict(d)
+        d["precip_pred"] = np.clip(amt.predict(feat["x_val"]), 0.0, None)
+        d["rain_prob"] = occ.predict_proba1(feat["x_val"])
+        d["precip_gate"] = np.array(float(gmeta["meta_gate_tau"]))
+        print(f"강수 예측 출처: {args.precip_gbm}")
+        # 판정선도 그 모델 파일의 값을 쓴다 — 신경망용 상수를 씌우면
+        # 서빙과 다른 동작점을 재게 된다.
+        prob_gate = float(gmeta["meta_gate_tau"])
     if args.temp_checkpoint:
         # metrics_report.py 와 같은 이유 — 서빙이 기온을 전용 모델에서 내므로
         # 기온 구간 분해도 그 모델의 오차로 그려야 한다.

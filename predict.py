@@ -64,6 +64,15 @@ CHECKPOINT = os.getenv("CHECKPOINT_PATH", "./checkpoints/numerical_trichef.pt")
 # `record_online_forecasts.DEFAULT_CHECKPOINT` 가 같은 이유로 이미 절대경로를
 # 쓰고 있었는데, 2026-09-25 에 이 상수를 상대경로로 넣어 그 함정을 다시
 # 만들었다(CI 시뮬레이션에서 12개 관측소 전부 FileNotFoundError 로 실패).
+# 강수 전용 GBM(2026-09-26). 빈 문자열이면 종전 동작 — 강수도 주 체크포인트가
+# 낸다. **왜 신경망이 아닌가**는 `precip_gbm.py` 모듈 docstring 참고(같은 Z축
+# 28특징만 받는 표형 GBM 이 발생 F1 0.5933→0.6397 · 강수 구간 MAE
+# 2.1014→2.0467 로 앞서고, 그 격차의 85% 는 우리가 할 수 있는 구조 변경으로
+# 닫히지 않는다). 기온 전용 모델과 같은 이유로 경로를 절대경로로 둔다.
+PRECIP_GBM = os.getenv(
+    "PRECIP_GBM_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "checkpoints", "precip_gbm.npz"))
 TEMP_CHECKPOINT = os.getenv(
     "TEMP_CHECKPOINT_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -357,6 +366,32 @@ def load_temp_model(main_ckpt: dict, path: str = None, device: str = DEVICE):
     return model, ckpt
 
 
+def load_precip_gbm(main_ckpt: dict, path: str = None):
+    """강수 전용 GBM 을 읽고 주 체크포인트와 호환되는지 확인한다.
+
+    경로가 비었거나 파일이 없으면 `None` — 종전 동작(주 모델이 강수도 낸다).
+    같은 표준화 입력 벡터를 공유하므로 **차원이나 리드타임이 어긋나면 오류
+    없이 조용히 다른 값을 낸다.** 그래서 여기서 막는다.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    import precip_gbm as _pg
+    amt, occ, meta = _pg.load(path)
+    if amt is None:
+        return None
+    nf = int(meta["meta_num_features"])
+    if nf != main_ckpt.get("num_features"):
+        raise RuntimeError(
+            f"강수 GBM 의 입력 차원({nf})이 주 체크포인트"
+            f"({main_ckpt.get('num_features')})와 다르다: {path}")
+    lead = meta.get("meta_lead_hours")
+    if lead is not None and int(lead) != int(main_ckpt.get("lead_hours", -1)):
+        raise RuntimeError(
+            f"강수 GBM 의 예보 시계({int(lead)}h)가 주 체크포인트"
+            f"({main_ckpt.get('lead_hours')}h)와 다르다: {path}")
+    return amt, occ, meta
+
+
 def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
     """체크포인트에서 모델 아키텍처와 가중치를 복원한다."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -398,7 +433,8 @@ def predict(stn: str = "108",
             checkpoint_path: str = CHECKPOINT,
             device: str = DEVICE,
             model=None, ckpt: dict = None,
-            temp_model=None, temp_ckpt: dict = None) -> dict:
+            temp_model=None, temp_ckpt: dict = None,
+            precip_gbm=None) -> dict:
     """
     지정 관측소의 현재 관측값으로 +lead_hours 시간 후 기온·강수를 예측.
 
@@ -431,6 +467,19 @@ def predict(stn: str = "108",
     # 환경변수가 비어 있으면 종전 동작 그대로다.
     if temp_model is None and TEMP_CHECKPOINT:
         temp_model, temp_ckpt = load_temp_model(ckpt, TEMP_CHECKPOINT, device)
+    if precip_gbm is None and PRECIP_GBM:
+        precip_gbm = load_precip_gbm(ckpt, PRECIP_GBM)
+    # 강수 예측구간은 체크포인트에 있는데 그것이 **어느 모델의 잔차로**
+    # 잡혔는지 대조한다. 어긋나면 다른 모델의 오차 분포로 구간을 그리게
+    # 되고 화면은 멀쩡해 보인다 — 조용히 틀리느니 멈춘다.
+    _ci_src = (ckpt.get("conformal_interval") or {}).get("precip_source")
+    if _ci_src is not None:
+        _want_gbm = _ci_src != "model"
+        if _want_gbm != (precip_gbm is not None):
+            raise RuntimeError(
+                f"강수 예측구간은 '{_ci_src}' 기준으로 적합됐는데 실제 강수 출처가 "
+                f"{'GBM' if precip_gbm is not None else '주 모델'} 이다 — "
+                f"conformal_interval_fit.py 를 그 출처로 다시 돌릴 것.")
     lead_hours = ckpt["lead_hours"]
 
     # 대상 관측소 + 보간용 이웃 11개 — 전부 **같은 시각** 스냅샷이 필요하다.
@@ -583,7 +632,18 @@ def predict(stn: str = "108",
     # 은 보정하지 않은 원본 값을 그대로 쓴다 — 강수 헤드에는 확률 보정을
     # 적용하지 않는다(README '확률 보정' 절, 회귀 헤드라 곱셈 구조가 보정
     # 전 확률과 맞물려 학습됐기 때문).
-    if extreme["rain"] is not None:
+    if precip_gbm is not None:
+        # 강수를 전용 GBM 이 낸다. 같은 표준화 입력 벡터를 쓰며(차원·정규화
+        # 통계 일치는 load_precip_gbm 이 이미 확인했다), 판정선도 **그 모델
+        # 파일에 저장된 값**을 쓴다 — 상수로 박아 두면 모델을 바꿀 때마다
+        # 사람이 옮겨 적어야 하고 그 고리가 드리프트의 입구다.
+        amt_m, occ_m, gmeta = precip_gbm
+        _xv = num_norm[None, :]
+        rain_prob = float(occ_m.predict_proba1(_xv)[0])
+        precip_pred = max(0.0, float(amt_m.predict(_xv)[0]))
+        if rain_prob < float(gmeta["meta_gate_tau"]):
+            precip_pred = 0.0
+    elif extreme["rain"] is not None:
         rain_prob = extreme["rain"][0].item()
         prob_gate = PRECIP_PROB_GATE_BY_LEAD.get(ckpt.get("lead_hours"), PRECIP_PROB_GATE)
         if rain_prob < prob_gate:

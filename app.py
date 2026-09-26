@@ -43,7 +43,8 @@ from weather_collector import (
     connection_state, network_env_report, redact_secrets,
 )
 from predict import (
-    load_model, load_temp_model, predict, CHECKPOINT, TEMP_CHECKPOINT,
+    load_model, load_temp_model, load_precip_gbm, predict,
+    CHECKPOINT, TEMP_CHECKPOINT, PRECIP_GBM,
     event_threshold,
     PRECIP_PROB_GATE, PRECIP_PROB_GATE_BY_LEAD,
     STATION_EVENT_THRESH_OVERRIDES, NWPUnavailable,
@@ -67,6 +68,10 @@ CHECKPOINT_12H = "./checkpoints/numerical_trichef_12h.pt"
 # 잔차 분포가 리드타임마다 달라 예측구간 분위수를 공유할 수 없다
 # (폭 +6h 3.65 vs +12h 4.16°C).
 TEMP_CHECKPOINT_12H = "./checkpoints/numerical_trichef_temp_12h.pt"
+# +12h 강수 전용 GBM(2026-09-26). +6h 는 predict.PRECIP_GBM 이 기본값으로
+# 갖는다. 리드타임별로 따로 둬야 하는 이유는 기온 모델과 같다 — 판정선과
+# 잔차 분포가 리드타임마다 다르다(τ +6h 0.310 vs +12h 0.260).
+PRECIP_GBM_12H = "./checkpoints/precip_gbm_12h.npz"
 
 # ASOS 타임스탬프는 tz 정보 없는 KST 벽시계 표기다. 컨테이너 기본 시간대는
 # UTC라 datetime.now()를 그대로 쓰면 "최근 72시간" 커트라인이 실제로는 9시간
@@ -183,6 +188,14 @@ def get_model(fingerprint: str):
 
 
 @st.cache_resource(show_spinner=False)
+def get_precip_gbm_at(path: str, fingerprint: str, _main_ckpt):
+    """리드타임별 강수 전용 GBM. 호환 검증은 load_precip_gbm 안에서 한다."""
+    if not path or not os.path.exists(path):
+        return None
+    return load_precip_gbm(_main_ckpt, path)
+
+
+@st.cache_resource(show_spinner=False)
 def get_temp_model_at(path: str, fingerprint: str, _main_ckpt):
     """리드타임별 기온 전용 모델. path 를 캐시 키에 넣어 +6h/+12h 가 서로를
     덮어쓰지 않게 한다(get_model_at 과 같은 이유)."""
@@ -251,13 +264,14 @@ def obs_hour_key() -> str:
 @st.cache_data(ttl=3600, show_spinner="관측 조회 중... (12개 관측소)")
 def cached_predict(stn: str, obs_hour: str, lead_hours: int, ckpt_fp: str,
                    _model, _ckpt, temp_fp: str = "", _temp_model=None,
-                   _temp_ckpt=None) -> dict:
+                   _temp_ckpt=None, gbm_fp: str = "", _precip_gbm=None) -> dict:
     # `temp_fp` 는 캐시 키 전용이다 — 기온 전용 보조 모델이 켜져 있으면
     # 그 모델도 결과를 바꾸므로 키에 반드시 들어가야 한다. `_` 접두 인자는
     # Streamlit 이 해시에서 제외하므로 `_temp_model` 만 넘기는 것은 캐시
     # 키에 아무 기여도 하지 않는다(CLAUDE.md 1절 14항, 같은 사고 3회).
     return predict(stn=stn, model=_model, ckpt=_ckpt,
-                   temp_model=_temp_model, temp_ckpt=_temp_ckpt)
+                   temp_model=_temp_model, temp_ckpt=_temp_ckpt,
+                   precip_gbm=_precip_gbm)
 
 
 @st.cache_resource(show_spinner=False)
@@ -896,6 +910,8 @@ try:
     model, ckpt = get_model(_fp6)
     _fpT = ckpt_fingerprint(TEMP_CHECKPOINT) if TEMP_CHECKPOINT else ""
     temp_model, temp_ckpt = get_temp_model(_fpT, ckpt)
+    _fpG = ckpt_fingerprint(PRECIP_GBM) if PRECIP_GBM else ""
+    precip_gbm = get_precip_gbm_at(PRECIP_GBM, _fpG, ckpt)
     if TEMP_CHECKPOINT and temp_model is None:
         # 조용히 주 모델로 내려가면 기온이 나빠진 것을 아무도 모른다 —
         # 폴백이 숫자를 조용히 바꾸지 않게 한다는 규약(4절)과 같은 취지.
@@ -908,7 +924,8 @@ try:
     # predict() 가 NWPUnavailable 을 올린다(중립값으로 메우지 않는다).
     _nwp_status = sync_nwp_window() if ckpt.get("use_nwp", False) else None
     result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], _fp6,
-                            model, ckpt, _fpT, temp_model, temp_ckpt)
+                            model, ckpt, _fpT, temp_model, temp_ckpt,
+                            _fpG, precip_gbm)
 except NWPUnavailable as e:
     st.error(
         "수치예보 보조 입력을 구성할 수 없어 출력값을 낼 수 없다. "
@@ -1353,9 +1370,11 @@ with tab_trend:
         _fpT12 = ckpt_fingerprint(TEMP_CHECKPOINT_12H)
         tmodel_12h, tckpt_12h = get_temp_model_at(TEMP_CHECKPOINT_12H, _fpT12,
                                                   ckpt_12h)
+        _fpG12 = ckpt_fingerprint(PRECIP_GBM_12H)
+        gbm_12h = get_precip_gbm_at(PRECIP_GBM_12H, _fpG12, ckpt_12h)
         result_12h = cached_predict(
             stn, obs_hour_key(), ckpt_12h["lead_hours"], _fp12, model_12h,
-            ckpt_12h, _fpT12, tmodel_12h, tckpt_12h)
+            ckpt_12h, _fpT12, tmodel_12h, tckpt_12h, _fpG12, gbm_12h)
     except Exception as e:
         # +6h(배포 필수 경로)와 달리 +12h 는 2차 산출값이라 없어도 앱
         # 전체가 멈출 이유는 없다 — 실패하면 그 부분만 빠진 채 표시한다.
@@ -1979,16 +1998,21 @@ with tab_perf:
                 f"무강수 예측 {_naive_precip:.4f}mm — 격차는 {_gap:.1%}다. 즉 이 "
                 f"모델의 강수량 출력은 아무것도 예측하지 않는 방법보다 평균 오차가 "
                 f"(근소하게) 크다. 이 사실을 은폐하지 않고 그대로 표시한다.\n\n"
-                f"**원인은 헤드 간 경쟁이 아니다(2026-09-25 정정).** 종전에는 "
-                f"극한기상 헤드가 3개로 늘며 공유 표현(shared representation)을 두고 "
-                f"경쟁이 생겨 무강수 억제력이 약화된 것으로 설명했다. 그런데 "
-                f"**강수 손실만 남기고 나머지 헤드를 전부 끄고 학습해도 격차가 "
-                f"사라지지 않았다** — 경쟁이 없는 상태에서도 기준선을 넘지 못한다. "
-                f"학습 데이터를 3.6년에서 13.6년으로 확장해도 좁혀지지 않았던 것과 "
-                f"같은 결론이며, 데이터양도 경쟁도 원인이 아니다. 진짜 출처는 아래 "
-                f"구간 분해가 가리키는 **무강수 구간의 바닥**이다. 강수는 MAE보다 "
-                f"'강수 발생 여부의 적중 여부'로 판단하는 "
-                f"것이 실용적이며, 해당 지표는 아래 '출력값 적중률'의 강수 항목을 "
+                f"**원인은 헤드 간 경쟁도, 데이터양도 아니다(2026-09-25 정정).** "
+                f"종전에는 극한기상 헤드가 늘며 공유 표현을 두고 경쟁이 생겨 "
+                f"무강수 억제력이 약화된 것으로 설명했다. 그런데 **강수 손실만 남기고 "
+                f"나머지 헤드를 전부 끄고 학습해도 격차가 사라지지 않았다** — 경쟁이 "
+                f"없는 상태에서도 기준선을 넘지 못한다. 학습 데이터를 3.6년에서 "
+                f"13.6년으로 확장해도 좁혀지지 않았던 것과 같은 결론이다.\n\n"
+                f"**그래서 이 값은 강수를 신경망이 아닌 모델이 내도록 바꾼 뒤의 "
+                f"값이다(2026-09-26).** 같은 입력을 받는 표형 경사부스팅(GBM)이 "
+                f"강수 주 지표 둘 모두에서 앞서는 것이 실측됐고 — 발생 판정 F1 과 "
+                f"강수 구간 조건부 오차 — 그 격차의 85%가 우리 구조로는 닫히지 "
+                f"않았다. 다만 **이 교체로 위의 전체 MAE 는 오히려 나빠졌다**: "
+                f"GBM 이 강수를 더 자주·크게 내기 때문이다. 주 지표를 얻고 이 지표를 "
+                f"내준 거래이며, 그 사실을 가리지 않는다.\n\n"
+                f"강수는 MAE보다 '강수 발생 여부의 적중 여부'로 판단하는 것이 "
+                f"실용적이며, 해당 지표는 아래 '출력값 적중률'의 강수 항목을 "
                 f"참조한다.\n\n"
                 f"구간별로 쪼개면 격차의 출처가 하나로 좁혀진다(2026-09-23 "
                 f"현행 배포본 재측정, 서빙 후처리 적용 기준). **1mm 이상 전 "
@@ -2412,14 +2436,23 @@ with tab_model:
     if temp_ckpt is not None:
         _t_solo = temp_ckpt.get("val_temp_mae")
         _t_multi = ckpt.get("val_temp_mae")
+        _gbm_on = ckpt.get("precip_source") is not None
         st.info(
-            "**이 화면은 모델 두 개의 출력을 함께 보여준다.** 기온과 그 90% 예측구간은 "
-            f"**기온 전용 모델**(검증 MAE {_t_solo:.2f}°C)이, 강수·극한기상 확률은 아래 "
-            "구조의 **다중과제 모델**이 낸다. 두 모델은 구조와 파라미터 수(각 60,729개)가 "
-            "같고 학습 손실만 다르다 — 헤드 여섯 개가 트렁크를 공유하는 비용이 기온에서 "
-            f"특히 커서, 기온만 따로 학습하면 MAE 가 {_t_multi:.2f} → {_t_solo:.2f}°C 로 "
-            "낮아진다(시간 분할 검증 포함). **아래 축 배분과 융합 수식은 다중과제 모델 "
-            "기준이다.**"
+            "**이 화면은 모델 "
+            + ("세" if _gbm_on else "두")
+            + " 개의 출력을 함께 보여준다.** 기온과 그 90% 예측구간은 "
+            f"**기온 전용 모델**(검증 MAE {_t_solo:.2f}°C)이"
+            + (", 강수는 **강수 전용 경사부스팅(GBM)**이" if _gbm_on else "")
+            + ", 극한기상 확률은 아래 구조의 **다중과제 신경망**이 낸다.\n\n"
+            "기온을 따로 학습하는 이유는 헤드 여섯 개가 트렁크를 공유하는 비용이 그 축에서 "
+            f"특히 크기 때문이다(MAE {_t_multi:.2f} → {_t_solo:.2f}°C, 시간 분할 검증 포함). "
+            + ("강수를 신경망이 아닌 모델이 내는 이유는 다르다 — 같은 입력을 받는 표형 GBM 이 "
+               "강수 주 지표 둘 모두에서 앞서는 것이 실측됐고, 그 격차의 85%가 우리가 할 수 "
+               "있는 구조 변경으로는 닫히지 않았다. 강수는 표본의 93%가 0인 영과잉 분포라 "
+               "트리의 임계값 분할이 유리한 것으로 해석한다(미검증).\n\n"
+               if _gbm_on else "")
+            + "**아래 축 배분과 융합 수식은 다중과제 신경망 기준이다** — 극한기상 확률이 "
+            "그 구조에서 나온다."
         )
     gw = result["gate_weights"]
     if gw:
