@@ -69,6 +69,15 @@ CHECKPOINT = os.getenv("CHECKPOINT_PATH", "./checkpoints/numerical_trichef.pt")
 # 28특징만 받는 표형 GBM 이 발생 F1 0.5933→0.6397 · 강수 구간 MAE
 # 2.1014→2.0467 로 앞서고, 그 격차의 85% 는 우리가 할 수 있는 구조 변경으로
 # 닫히지 않는다). 기온 전용 모델과 같은 이유로 경로를 절대경로로 둔다.
+# 극한기상 전용 GBM(2026-09-26). 빈 문자열이면 종전 동작 — 신경망 헤드가 낸다.
+# **왜 신경망이 아닌가**는 `extreme_gbm.py` docstring 참고. 요점은 둘이다:
+# ① 세 헤드 모두 F1 이 크게 오른다(한파 0.4607→0.6077). ② `monotonic_cst` 가
+# **단조성을 정의상 보장한다** — 신경망에서는 seed 에 따라 −0.70~+0.73 으로
+# 갈려 9개 실행 중 2번만 통과했고, 세 번의 처방이 모두 빗나간 문제였다.
+EXTREME_GBM = os.getenv(
+    "EXTREME_GBM_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "checkpoints", "extreme_gbm.npz"))
 PRECIP_GBM = os.getenv(
     "PRECIP_GBM_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -366,6 +375,30 @@ def load_temp_model(main_ckpt: dict, path: str = None, device: str = DEVICE):
     return model, ckpt
 
 
+def load_extreme_gbm(main_ckpt: dict, path: str = None):
+    """극한기상 전용 GBM 을 읽고 주 체크포인트와 호환되는지 확인한다.
+
+    강수 GBM 과 같은 이유로 차원·리드타임을 대조한다 — 같은 표준화 입력
+    벡터를 공유하므로 어긋나면 오류 없이 조용히 다른 값을 낸다.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    import extreme_gbm as _eg
+    models, meta = _eg.load(path)
+    if not models:
+        return None
+    nf = int(meta["meta_num_features"])
+    if nf != main_ckpt.get("num_features"):
+        raise RuntimeError(
+            f"극한기상 GBM 의 입력 차원({nf})이 주 체크포인트와 다르다: {path}")
+    lead = meta.get("meta_lead_hours")
+    if lead is not None and int(lead) != int(main_ckpt.get("lead_hours", -1)):
+        raise RuntimeError(
+            f"극한기상 GBM 의 예보 시계({int(lead)}h)가 주 체크포인트"
+            f"({main_ckpt.get('lead_hours')}h)와 다르다: {path}")
+    return models, meta
+
+
 def load_precip_gbm(main_ckpt: dict, path: str = None):
     """강수 전용 GBM 을 읽고 주 체크포인트와 호환되는지 확인한다.
 
@@ -434,7 +467,7 @@ def predict(stn: str = "108",
             device: str = DEVICE,
             model=None, ckpt: dict = None,
             temp_model=None, temp_ckpt: dict = None,
-            precip_gbm=None) -> dict:
+            precip_gbm=None, extreme_gbm=None) -> dict:
     """
     지정 관측소의 현재 관측값으로 +lead_hours 시간 후 기온·강수를 예측.
 
@@ -469,9 +502,19 @@ def predict(stn: str = "108",
         temp_model, temp_ckpt = load_temp_model(ckpt, TEMP_CHECKPOINT, device)
     if precip_gbm is None and PRECIP_GBM:
         precip_gbm = load_precip_gbm(ckpt, PRECIP_GBM)
+    if extreme_gbm is None and EXTREME_GBM:
+        extreme_gbm = load_extreme_gbm(ckpt, EXTREME_GBM)
     # 강수 예측구간은 체크포인트에 있는데 그것이 **어느 모델의 잔차로**
     # 잡혔는지 대조한다. 어긋나면 다른 모델의 오차 분포로 구간을 그리게
     # 되고 화면은 멀쩡해 보인다 — 조용히 틀리느니 멈춘다.
+    # 극한기상도 같은 대조를 한다 — 체크포인트의 판정선·지표가 GBM 기준으로
+    # 적혔는데 실제 출처가 신경망이면, 보정 곡선이 지워진 원본 확률에 GBM
+    # 판정선을 씌우게 되어 조용히 어긋난다.
+    _ex_src = ckpt.get("extreme_source")
+    if _ex_src is not None and (extreme_gbm is None):
+        raise RuntimeError(
+            f"극한기상 판정선·지표가 '{_ex_src}' 기준으로 적혔는데 실제 출처가 "
+            f"주 모델이다 — extreme_gbm.py --patch-checkpoint 를 그 출처로 다시 돌릴 것.")
     _ci_src = (ckpt.get("conformal_interval") or {}).get("precip_source")
     if _ci_src is not None:
         _want_gbm = _ci_src != "model"
@@ -657,12 +700,22 @@ def predict(stn: str = "108",
 
     # 확률 보정을 여기서 적용한다 — 호출자(app.py·CLI)가 받는 값이 곧 화면에
     # 나가므로, 보정되지 않은 값이 밖으로 새어 나가지 않게 한 곳에서 처리한다.
-    heatwave_prob = (calibrate_prob(extreme["heatwave"][0].item(), "heatwave", ckpt)
-                     if extreme["heatwave"] is not None else None)
-    coldwave_prob = (calibrate_prob(extreme["coldwave"][0].item(), "coldwave", ckpt)
-                     if extreme["coldwave"] is not None else None)
-    dust_prob     = (calibrate_prob(extreme["dust"][0].item(), "dust", ckpt)
-                     if extreme["dust"] is not None else None)
+    if extreme_gbm is not None:
+        # 극한기상 3종을 전용 GBM 이 낸다. 보정 곡선도 **그 모델 파일의**
+        # 것을 쓴다 — 신경망용 곡선을 GBM 확률에 씌우면 눈금이 어긋난다.
+        _em, _emeta = extreme_gbm
+        _xv = num_norm[None, :]
+        import extreme_gbm as _eg
+        heatwave_prob = _eg.calibrated(_em, _emeta, "heatwave", _xv)
+        coldwave_prob = _eg.calibrated(_em, _emeta, "coldwave", _xv)
+        dust_prob     = _eg.calibrated(_em, _emeta, "dust", _xv)
+    else:
+        heatwave_prob = (calibrate_prob(extreme["heatwave"][0].item(), "heatwave", ckpt)
+                         if extreme["heatwave"] is not None else None)
+        coldwave_prob = (calibrate_prob(extreme["coldwave"][0].item(), "coldwave", ckpt)
+                         if extreme["coldwave"] is not None else None)
+        dust_prob     = (calibrate_prob(extreme["dust"][0].item(), "dust", ckpt)
+                         if extreme["dust"] is not None else None)
 
     # 분포무관 예측구간(2026-09-01 연결) — conformal_interval_fit.py 가 이미
     # 적합·검증(실측 커버리지 기온 0.899·강수 0.929)해 체크포인트에 저장해둔

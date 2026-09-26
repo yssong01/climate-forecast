@@ -43,8 +43,8 @@ from weather_collector import (
     connection_state, network_env_report, redact_secrets,
 )
 from predict import (
-    load_model, load_temp_model, load_precip_gbm, predict,
-    CHECKPOINT, TEMP_CHECKPOINT, PRECIP_GBM,
+    load_model, load_temp_model, load_precip_gbm, load_extreme_gbm, predict,
+    CHECKPOINT, TEMP_CHECKPOINT, PRECIP_GBM, EXTREME_GBM,
     event_threshold,
     PRECIP_PROB_GATE, PRECIP_PROB_GATE_BY_LEAD,
     STATION_EVENT_THRESH_OVERRIDES, NWPUnavailable,
@@ -72,6 +72,8 @@ TEMP_CHECKPOINT_12H = "./checkpoints/numerical_trichef_temp_12h.pt"
 # 갖는다. 리드타임별로 따로 둬야 하는 이유는 기온 모델과 같다 — 판정선과
 # 잔차 분포가 리드타임마다 다르다(τ +6h 0.310 vs +12h 0.260).
 PRECIP_GBM_12H = "./checkpoints/precip_gbm_12h.npz"
+# +12h 극한기상 GBM(2026-09-26). 판정선·보정 곡선이 리드타임마다 다르다.
+EXTREME_GBM_12H = "./checkpoints/extreme_gbm_12h.npz"
 
 # ASOS 타임스탬프는 tz 정보 없는 KST 벽시계 표기다. 컨테이너 기본 시간대는
 # UTC라 datetime.now()를 그대로 쓰면 "최근 72시간" 커트라인이 실제로는 9시간
@@ -188,6 +190,14 @@ def get_model(fingerprint: str):
 
 
 @st.cache_resource(show_spinner=False)
+def get_extreme_gbm_at(path: str, fingerprint: str, _main_ckpt):
+    """리드타임별 극한기상 GBM. 호환 검증은 load_extreme_gbm 안에서 한다."""
+    if not path or not os.path.exists(path):
+        return None
+    return load_extreme_gbm(_main_ckpt, path)
+
+
+@st.cache_resource(show_spinner=False)
 def get_precip_gbm_at(path: str, fingerprint: str, _main_ckpt):
     """리드타임별 강수 전용 GBM. 호환 검증은 load_precip_gbm 안에서 한다."""
     if not path or not os.path.exists(path):
@@ -264,14 +274,15 @@ def obs_hour_key() -> str:
 @st.cache_data(ttl=3600, show_spinner="관측 조회 중... (12개 관측소)")
 def cached_predict(stn: str, obs_hour: str, lead_hours: int, ckpt_fp: str,
                    _model, _ckpt, temp_fp: str = "", _temp_model=None,
-                   _temp_ckpt=None, gbm_fp: str = "", _precip_gbm=None) -> dict:
+                   _temp_ckpt=None, gbm_fp: str = "", _precip_gbm=None,
+                   egbm_fp: str = "", _extreme_gbm=None) -> dict:
     # `temp_fp` 는 캐시 키 전용이다 — 기온 전용 보조 모델이 켜져 있으면
     # 그 모델도 결과를 바꾸므로 키에 반드시 들어가야 한다. `_` 접두 인자는
     # Streamlit 이 해시에서 제외하므로 `_temp_model` 만 넘기는 것은 캐시
     # 키에 아무 기여도 하지 않는다(CLAUDE.md 1절 14항, 같은 사고 3회).
     return predict(stn=stn, model=_model, ckpt=_ckpt,
                    temp_model=_temp_model, temp_ckpt=_temp_ckpt,
-                   precip_gbm=_precip_gbm)
+                   precip_gbm=_precip_gbm, extreme_gbm=_extreme_gbm)
 
 
 @st.cache_resource(show_spinner=False)
@@ -912,6 +923,21 @@ try:
     temp_model, temp_ckpt = get_temp_model(_fpT, ckpt)
     _fpG = ckpt_fingerprint(PRECIP_GBM) if PRECIP_GBM else ""
     precip_gbm = get_precip_gbm_at(PRECIP_GBM, _fpG, ckpt)
+    _fpE = ckpt_fingerprint(EXTREME_GBM) if EXTREME_GBM else ""
+    extreme_gbm = get_extreme_gbm_at(EXTREME_GBM, _fpE, ckpt)
+
+    def _thr(event, _stn=None, _ck=None):
+        """서빙 판정선 — 극한기상을 GBM 이 내면 **그 모델 파일의 값**을 쓴다.
+
+        신경망용 판정선(체크포인트의 보정 공간 값)을 GBM 확률에 씌우면
+        눈금이 달라 판정이 어긋난다. 호출부가 열 곳이라 여기 한 곳에서
+        가른다 — 각자 기억하게 두면 하나만 빠뜨려도 조용히 틀린다.
+        """
+        if extreme_gbm is not None:
+            import extreme_gbm as _eg
+            return _eg.threshold(extreme_gbm[1], event)
+        return event_threshold(event, _stn if _stn is not None else stn,
+                               _ck if _ck is not None else ckpt)
     if TEMP_CHECKPOINT and temp_model is None:
         # 조용히 주 모델로 내려가면 기온이 나빠진 것을 아무도 모른다 —
         # 폴백이 숫자를 조용히 바꾸지 않게 한다는 규약(4절)과 같은 취지.
@@ -925,7 +951,7 @@ try:
     _nwp_status = sync_nwp_window() if ckpt.get("use_nwp", False) else None
     result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], _fp6,
                             model, ckpt, _fpT, temp_model, temp_ckpt,
-                            _fpG, precip_gbm)
+                            _fpG, precip_gbm, _fpE, extreme_gbm)
 except NWPUnavailable as e:
     st.error(
         "수치예보 보조 입력을 구성할 수 없어 출력값을 낼 수 없다. "
@@ -1372,9 +1398,12 @@ with tab_trend:
                                                   ckpt_12h)
         _fpG12 = ckpt_fingerprint(PRECIP_GBM_12H)
         gbm_12h = get_precip_gbm_at(PRECIP_GBM_12H, _fpG12, ckpt_12h)
+        _fpE12 = ckpt_fingerprint(EXTREME_GBM_12H)
+        egbm_12h = get_extreme_gbm_at(EXTREME_GBM_12H, _fpE12, ckpt_12h)
         result_12h = cached_predict(
             stn, obs_hour_key(), ckpt_12h["lead_hours"], _fp12, model_12h,
-            ckpt_12h, _fpT12, tmodel_12h, tckpt_12h, _fpG12, gbm_12h)
+            ckpt_12h, _fpT12, tmodel_12h, tckpt_12h, _fpG12, gbm_12h,
+            _fpE12, egbm_12h)
     except Exception as e:
         # +6h(배포 필수 경로)와 달리 +12h 는 2차 산출값이라 없어도 앱
         # 전체가 멈출 이유는 없다 — 실패하면 그 부분만 빠진 채 표시한다.
@@ -1846,10 +1875,10 @@ with tab_extreme:
         )
         if ev.get("heatwave") is not None:
             event_gauge("🔥 폭염 확률", ev["heatwave"],
-                        event_threshold("heatwave", stn, ckpt), "#E2954F")
+                        _thr("heatwave", stn, ckpt), "#E2954F")
         if ev.get("coldwave") is not None:
             event_gauge("🥶 한파 확률", ev["coldwave"],
-                        event_threshold("coldwave", stn, ckpt), "#4C78A8")
+                        _thr("coldwave", stn, ckpt), "#4C78A8")
 
         # 정밀도는 체크포인트에서 읽는다 — 상수로 적어두면 재학습·미세조정 때마다
         # 화면만 옛 값에 머문다(2026-08-17에 실제로 10.7%로 굳어 있었다).
@@ -1858,7 +1887,7 @@ with tab_extreme:
         _em_ev, _em_ev_served = extreme_metrics_of(ckpt)
         _dust_p = (_em_ev.get("dust") or {}).get("precision")
         if _em_ev_served:
-            _dust_basis = f"서빙 판정선 {event_threshold('dust', stn, ckpt):.0%} 기준"
+            _dust_basis = f"서빙 판정선 {_thr('dust', stn, ckpt):.0%} 기준"
         else:
             _dust_basis = "보정 전 원본 확률 0.5 기준"
         _dust_txt = (f"{_dust_p:.1%}({_dust_basis} — 황사로 판정한 것 중 "
@@ -1880,10 +1909,10 @@ with tab_extreme:
                 "|---|---|---|\n"
                 "| 🔥 폭염 | 기상청이 발표한 폭염주의보 기록(해당 날짜·관측소). "
                 "기록이 없는 표본은 학습·평가에서 모두 제외 | "
-                f"{event_threshold('heatwave', stn, ckpt):.0%} |\n"
+                f"{_thr('heatwave', stn, ckpt):.0%} |\n"
                 "| 🥶 한파 | 발표된 한파주의보 기록. 동일 기준으로 기록이 없는 "
                 "표본은 제외 | "
-                f"{event_threshold('coldwave', stn, ckpt):.0%} |\n"
+                f"{_thr('coldwave', stn, ckpt):.0%} |\n"
             )
         st.caption(
             "이전에는 공식 기록이 없는 표본을 순간 기온 임계값(폭염 33°C 이상·"
@@ -2106,8 +2135,8 @@ with tab_perf:
         if _em_is_served:
             st.caption(
                 "이 표는 **'극한 기상' 탭이 실제로 쓰는 판정 임계값**(폭염 "
-                f"{event_threshold('heatwave', stn, ckpt):.0%} · 한파 "
-                f"{event_threshold('coldwave', stn, ckpt):.0%}, 확률 보정 후 공간)"
+                f"{_thr('heatwave', stn, ckpt):.0%} · 한파 "
+                f"{_thr('coldwave', stn, ckpt):.0%}, 확률 보정 후 공간)"
                 "에서 채점한 값이다 — 화면의 판정과 이 표가 서로 다른 값을 "
                 "가리키지 않게 하기 위해서다. 참고로 보정 전 원본 확률 0.5를 "
                 "기준으로 재면 값이 크게 달라진다(현행 배포본의 한파 F1은 "
@@ -2118,7 +2147,7 @@ with tab_perf:
             st.caption(
                 "주의 — 이 표의 값은 보정 전 원본 확률 0.5를 기준으로 계산했으므로, "
                 "'극한 기상' 탭의 판정 임계값(폭염 "
-                f"{event_threshold('heatwave', stn, ckpt):.0%} · 한파 {event_threshold('coldwave', stn, ckpt):.0%})"
+                f"{_thr('heatwave', stn, ckpt):.0%} · 한파 {_thr('coldwave', stn, ckpt):.0%})"
                 "을 적용했을 때의 성능과는 다르다. 임계값을 높이면 오탐(정밀도↑)은 "
                 "감소하고 미탐지(재현율↓)는 증가한다."
             )
@@ -2237,8 +2266,8 @@ with tab_perf:
             "임계값을 곡선으로 옮기는 것만으로는 판정이 보존되지 않는다. 베타 "
             "보정은 매끄러운 순증가 함수라 이 문제가 구조적으로 없다. 어느 "
             "쪽이든 **판정선은 보정 공간에서 다시 고른다** — 현재 배포본은 폭염 "
-            f"{event_threshold('heatwave', stn, ckpt):.3f}, 한파 "
-            f"{event_threshold('coldwave', stn, ckpt):.3f}다."
+            f"{_thr('heatwave', stn, ckpt):.3f}, 한파 "
+            f"{_thr('coldwave', stn, ckpt):.3f}다."
             + (f" 재선정으로 평가용 F1이 {' · '.join(_gains)}로 올랐다."
                if _gains else "")
             + " 재선정도 고르는 표본과 채점하는 표본을 분리한다."
@@ -2316,9 +2345,9 @@ with tab_perf:
         "채점하면 해당 데이터에만 최적화된 값이 우수해 보인다(과적합). "
         "**[2026-09-07 갱신] 현행 배포본은 극한기상 판정선을 원본 확률 공간이 "
         "아니라 확률 보정 후 공간에서 직접 고른다**(폭염 "
-        f"{event_threshold('heatwave', stn, ckpt):.3f} · 한파 "
-        f"{event_threshold('coldwave', stn, ckpt):.3f} · 황사 "
-        f"{event_threshold('dust', stn, ckpt):.3f}). 손실 구성이 바뀌면 확률 "
+        f"{_thr('heatwave', stn, ckpt):.3f} · 한파 "
+        f"{_thr('coldwave', stn, ckpt):.3f} · 황사 "
+        f"{_thr('dust', stn, ckpt):.3f}). 손실 구성이 바뀌면 확률 "
         "눈금 자체가 이동하므로, 원본 공간의 상수를 곡선으로 옮기는 것만으로는 "
         "판정이 보존되지 않기 때문이다. **강수는 여기에 포함되지 않는다** — "
         "강수 게이팅은 보정을 적용하지 않는 헤드라 판정선도 보정 전 원본 확률 "

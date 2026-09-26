@@ -82,6 +82,8 @@ checkpoints/*
 # 무시되지 않도록 함께 적어 둔다.
 !checkpoints/precip_gbm.npz
 !checkpoints/precip_gbm_12h.npz
+!checkpoints/extreme_gbm.npz
+!checkpoints/extreme_gbm_12h.npz
 
 # ChromaDB 로컬 저장소
 chroma_db/

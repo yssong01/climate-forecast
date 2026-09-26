@@ -69,7 +69,7 @@ def synthetic_ckpt(num_features, **extra):
 # ── ① 모든 진단 스크립트가 임포트되는가 ──────────────────────────
 DIAGNOSTIC_MODULES = [
     "eval_cache", "metrics_report", "error_breakdown", "threshold_validation",
-    "baseline_suite", "precip_gbm",
+    "baseline_suite", "precip_gbm", "extreme_gbm",
     "probability_calibration_fit", "probability_calibration_check",
     "calibration_plot_diagnose", "station_threshold_check",
     "station_coverage_check", "seasonal_falsealarm_check",
