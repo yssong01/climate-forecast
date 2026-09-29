@@ -55,6 +55,14 @@ SEED = 42
 LEAD_HOURS = int(os.getenv("LEAD_HOURS", "6"))
 CKPT = ("./checkpoints/numerical_trichef.pt" if LEAD_HOURS == 6
         else "./checkpoints/numerical_trichef_12h.pt")
+# 에어로졸 기준 시각을 예측 시점 T 보다 몇 시간 앞당길 것인가(2026-09-29).
+# 스냅숏 대조(`collect_aerosol_archive.py --drift`)에서 **유효시각이 조회
+# 시각보다 14.2시간 넘게 지난 값은 한 번도 바뀌지 않았고**, 그렇게 굳은 값은
+# 아카이브와 100% 같았다(7,939/7,939). 반면 서빙이 보는 0~6시간 묵은 값은
+# 아카이브와 14.6% 만 같았다. 따라서 T−L(L≥15) 시점 값은 서빙에서도 학습과
+# 같은 값이다 — 수치예보 `previous_day1` 과 같은 성질을 시차로 얻는다.
+# 기본값 0 은 종전 측정(상한)을 그대로 재현한다.
+AERO_LAG_HOURS = int(os.getenv("AERO_LAG_HOURS", "0"))
 
 
 def aerosol_table():
@@ -103,6 +111,8 @@ def attach(stns, ts_ints, _up, _local, up_cache):
     keep, rows = [], []
     for s, t in zip(stns, ts_ints):
         ts = str(int(t)).zfill(12)
+        if AERO_LAG_HOURS:
+            ts = _ts_add(ts, -AERO_LAG_HOURS)
         if ts not in up_cache:
             up_cache[ts] = _up(ts)
         u = up_cache[ts]
@@ -123,7 +133,8 @@ def main():
     import extreme_gbm as EG
 
     print(f"\n{'=' * 84}\n 황사 — 에어로졸 특징이 배포 GBM 을 개선하는가"
-          f" (리드타임 +{LEAD_HOURS}h)\n{'=' * 84}")
+          f" (리드타임 +{LEAD_HOURS}h · 에어로졸 시차 −{AERO_LAG_HOURS}h)"
+          f"\n{'=' * 84}")
 
     f = eval_cache.load_features(CKPT)
     x_tr, x_va = f["x_train"], f["x_val"]
@@ -152,7 +163,7 @@ def main():
         s = m.predict_proba(xva)[:, 1]
         # `honest_f1` 은 F1 만 돌려준다 — 판정선은 보정용 절반에서 따로 얻는다.
         thr = max_f1(s[hv], yva[hv])[1]
-        return tag, honest_f1(s, yva, hv), thr, len(ytr), int(yva.sum())
+        return tag, honest_f1(s, yva, hv), thr, len(ytr), int(yva.sum()), s
 
     tr_a = m_tr & a_tr_m
     va_a = m_va & a_va_m
@@ -187,7 +198,7 @@ def main():
         rows.append(run(tag, xb_tr, y_tr[tr_a], xb_va, y_va[va_a], half[va_a]))
 
     print(f"\n  {'구성':<30}{'F1':>9}{'판정선':>9}{'학습표본':>11}{'평가양성':>10}")
-    for tag, f1, thr, ntr, npos in rows:
+    for tag, f1, thr, ntr, npos, _ in rows:
         print(f"  {tag:<30}{f1:9.4f}{thr:9.3f}{ntr:11,}{npos:10,}")
 
     ref, refp, a, b, b1, b2 = [r[1] for r in rows]
@@ -215,7 +226,7 @@ def main():
 
     xd_tr = _fill(x_tr, a_tr_m, a_tr, idx_tr)
     xd_va = _fill(x_va, a_va_m, a_va, idx_va)
-    tag, f1_d, thr_d, ntr_d, npos_d = run(
+    tag, f1_d, thr_d, ntr_d, npos_d, s_d = run(
         "D    28+에어로졸(결측 NaN)·전체", xd_tr[m_tr], y_tr[m_tr],
         xd_va[m_va], y_va[m_va], half[m_va])
 
@@ -226,8 +237,50 @@ def main():
     print(f"  차이 (D − ref) : {f1_d - ref:+.4f}  "
           + ("← 채택 후보 — 배포 형태에서도 이긴다" if f1_d - ref > 0.01
              else "← 기각 (배포 형태에서는 이득이 남지 않는다)"))
-    print("\n  주의: 이 값은 **상한**이다. 대기질 API 에 리드타임 보존")
-    print("  아카이브가 없어 학습이 서빙보다 유리하다 — 작으면 그대로 기각한다.")
+
+    # 날짜 블록 짝지은 부트스트랩(CLAUDE.md 5절 교훈 2 — 단일 seed 점추정치만으로
+    # 채택하지 않는다). 판정선은 보정용 절반에서 고정하고, 평가용 절반의
+    # **날짜**를 복원추출해 두 모델을 같은 재표본에서 채점한다. 황사는 며칠씩
+    # 이어지는 사건이라 시각 단위로 뽑으면 신뢰구간이 부당하게 좁아진다.
+    from baseline_suite import f1_at
+    yv, hv = y_va[m_va], half[m_va]
+    s_r = rows[0][5]
+    t_r = max_f1(s_r[hv], yv[hv])[1]
+    t_d = max_f1(s_d[hv], yv[hv])[1]
+    ev = ~hv
+    day = (f["tgt_ts_val"][m_va].astype(np.int64) // 10 ** 4)[ev]
+    ye, pr, pd_ = yv[ev], s_r[ev] >= t_r, s_d[ev] >= t_d
+    uniq, inv = np.unique(day, return_inverse=True)
+
+    def _cnt(pred):
+        """날짜별 (tp, fp, fn) — 재표본은 날짜 가중합으로 끝난다."""
+        return np.stack([
+            np.bincount(inv, (pred & (ye > 0)).astype(float), len(uniq)),
+            np.bincount(inv, (pred & (ye == 0)).astype(float), len(uniq)),
+            np.bincount(inv, (~pred & (ye > 0)).astype(float), len(uniq))])
+    c_r, c_d = _cnt(pr), _cnt(pd_)
+    B = 2000
+    w = np.random.default_rng(SEED).multinomial(
+        len(uniq), np.full(len(uniq), 1 / len(uniq)), size=B).astype(float)
+
+    def _f1(c):
+        tp, fp, fn = w @ c[0], w @ c[1], w @ c[2]
+        return 2 * tp / np.maximum(2 * tp + fp + fn, 1e-9)
+    diff = _f1(c_d) - _f1(c_r)
+    lo, hi = np.percentile(diff, [2.5, 97.5])
+    assert abs(f1_at(s_d[ev], ye, t_d) - f1_d) < 1e-9, \
+        "부트스트랩 채점이 honest_f1 과 어긋난다"
+    print(f"  부트스트랩(평가용 날짜 {len(uniq):,}개 블록, B={B}): "
+          f"Δ 95% CI [{lo:+.4f}, {hi:+.4f}]"
+          + ("  ← 0 을 포함하지 않는다" if lo > 0 or hi < 0
+             else "  ← 0 을 포함한다"))
+
+    if AERO_LAG_HOURS >= 15:
+        print(f"\n  시차 {AERO_LAG_HOURS}h — 스냅숏 대조에서 값이 굳는 시점(14.2h)보다"
+              " 길어 서빙이 조회하는 값이 아카이브와 같다. 이 값은 상한이 아니다.")
+    else:
+        print("\n  주의: 이 값은 **상한**이다. 서빙 시점 값이 아카이브와 다르다"
+              "(스냅숏 대조 81.5% 불일치) — AERO_LAG_HOURS≥15 로 다시 잴 것.")
 
 
 if __name__ == "__main__":

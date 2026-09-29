@@ -170,8 +170,29 @@ def snapshot():
     return snaps
 
 
+def _age_h(fetched_at, ts):
+    """조회 시각(UTC) − 유효시각(KST 로 받으므로 −9h 해 UTC 로). 양수면 과거값."""
+    from datetime import datetime, timedelta
+    f = datetime.strptime(fetched_at, "%Y%m%d%H%M")
+    v = datetime.strptime(ts, "%Y%m%d%H%M") - timedelta(hours=9)
+    return (f - v).total_seconds() / 3600
+
+
 def drift_report():
-    """스냅숏끼리 대조해 **같은 유효시각의 값이 바뀌었는지** 본다."""
+    """같은 유효시각의 값을 **조회 시점의 묵은 정도(age)별로** 대조한다.
+
+    **첫 구현은 결론을 날조할 수 있었다(2026-09-29 정정).** 첫 스냅숏과
+    마지막 스냅숏만 비교했는데, 각 스냅숏은 최근 3일치만 담으므로 간격이
+    48시간을 넘는 순간 **두 스냅숏에 겹치는 유효시각이 0개**가 된다. 그런데
+    "바뀐 것 0개"를 그대로 "안 바뀐다 → 채택"으로 읽었다. 판정 조건(간격
+    48시간)을 채우는 바로 그 시점에 비교 표본이 사라지는 구조였다 — 실제로
+    0개 비교로 "측정된 이득을 그대로 기대할 수 있다"를 출력했다.
+
+    지금은 모든 스냅숏을 유효시각별로 모아 ① 연속 조회 사이에 값이 바뀐
+    마지막 age(= 값이 굳는 시점)와 ② 서빙이 보는 값(age 0~6h)이 굳은 값과
+    같은 비율을 잰다. ②가 학습·서빙 격차이고 ①이 격차 없이 쓸 수 있는
+    시차의 하한이다. 비교 쌍이 없으면 결론을 내지 않는다.
+    """
     if not os.path.exists(SNAPSHOT_PATH):
         raise SystemExit(f"스냅숏이 없다: {SNAPSHOT_PATH} — --snapshot 을 먼저 돌릴 것")
     with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
@@ -180,51 +201,62 @@ def drift_report():
     if len(keys) < 2:
         raise SystemExit(f"스냅숏이 {len(keys)}회뿐이라 대조할 수 없다 — "
                          f"시간 간격을 두고 다시 돌릴 것")
-    first, last = snaps[keys[0]], snaps[keys[-1]]
-    n_cmp = n_diff = 0
-    worst = (0.0, None)
-    for name, rows in last.items():
-        old_rows = first.get(name, {})
-        for ts, vals in rows.items():
-            if ts not in old_rows:
-                continue
-            n_cmp += 1
-            a, b = old_rows[ts], vals
-            if a != b:
-                n_diff += 1
-                gap = max(abs(float(x) - float(y))
-                          for x, y in zip(a, b) if x is not None and y is not None)
-                if gap > worst[0]:
-                    worst = (gap, f"{name} {ts}")
-    from datetime import datetime
-    t0 = datetime.strptime(keys[0], "%Y%m%d%H%M")
-    t1 = datetime.strptime(keys[-1], "%Y%m%d%H%M")
-    gap_h = (t1 - t0).total_seconds() / 3600
 
-    print(f"\n스냅숏 대조 — {keys[0]} vs {keys[-1]} (간격 {gap_h:.1f}시간)")
-    print(f"  같은 유효시각 {n_cmp:,}개 중 값이 바뀐 것 {n_diff:,}개 "
-          f"({n_diff / max(n_cmp, 1):.1%})")
-    if n_diff:
-        print(f"  최대 변화 {worst[0]:.2f} ({worst[1]})")
-        print("  → 조회 시점에 따라 값이 달라진다. 학습(아카이브)과 서빙의 "
-              "분포가 어긋나므로 `aerosol_gbm_check.py` 의 이득은 **상한**이다.")
-        print("  (변화가 있다는 결론은 간격과 무관하게 성립한다 — 한 번이라도 "
-              "바뀌었으면 바뀌는 것이다.)")
-        return n_cmp, n_diff
+    # ① 연속 조회 쌍 — 값이 바뀐 경우의 앞 조회 age 최댓값
+    n_pair = n_chg = 0
+    last_change_age = None
+    for a, b in zip(keys, keys[1:]):
+        for name, rows in snaps[b].items():
+            old = snaps[a].get(name, {})
+            for ts, v in rows.items():
+                if ts not in old:
+                    continue
+                n_pair += 1
+                if old[ts] != v:
+                    n_chg += 1
+                    age = _age_h(a, ts)
+                    if last_change_age is None or age > last_change_age:
+                        last_change_age = age
 
-    # **'안 바뀐다'는 결론에는 간격 조건이 붙는다.** CAMS 는 하루 두 번
-    # 발표하므로, 그보다 짧은 간격에서 값이 같은 것은 당연하고 아무것도
-    # 증명하지 않는다. 짧은 간격의 0% 를 "채택해도 된다"로 읽으면 정확히
-    # 이 저장소가 반복해 경고한 오류(측정하지 않은 것을 주장한다)가 된다.
-    MIN_GAP_H = 48
-    if gap_h < MIN_GAP_H:
-        print(f"  → **아직 결론이 아니다.** 간격이 {gap_h:.1f}시간뿐이라 "
-              f"CAMS 발표 주기(하루 2회)보다 짧거나 비슷하다. "
-              f"{MIN_GAP_H}시간 이상 벌어진 뒤 다시 볼 것.")
+    # ② 서빙값(age 0~6h, 가장 이른 조회) vs 굳은 값(가장 늦은 조회, age≥24h)
+    series = {}
+    for k in keys:
+        for name, rows in snaps[k].items():
+            for ts, v in rows.items():
+                series.setdefault((name, ts), []).append((_age_h(k, ts), v))
+    n_sv = n_sv_same = 0
+    max_late_age = 0.0
+    for s in series.values():
+        s.sort(key=lambda x: x[0])
+        serve = [x for x in s if 0 <= x[0] < 6]
+        if not serve or s[-1][0] < 24:
+            continue
+        n_sv += 1
+        n_sv_same += serve[0][1] == s[-1][1]
+        max_late_age = max(max_late_age, s[-1][0])
+
+    print(f"\n스냅숏 대조 — {keys[0]} ~ {keys[-1]} ({len(keys)}회)")
+    print(f"  연속 조회 쌍 {n_pair:,}개 중 값이 바뀐 것 {n_chg:,}개")
+    if last_change_age is not None:
+        print(f"  값이 바뀐 가장 묵은 조회: age {last_change_age:.1f}시간 "
+              f"→ 그보다 묵은 값은 굳어 있다")
+    print(f"  서빙값(age 0~6h) = 굳은 값(age≥24h, 최대 {max_late_age:.1f}h): "
+          f"{n_sv_same:,}/{n_sv:,}")
+
+    if n_sv == 0:
+        print("  → **결론을 낼 수 없다.** 서빙값과 굳은 값을 함께 가진 유효시각이 "
+              "없다 — 스냅숏이 더 쌓인 뒤 다시 볼 것.")
+        return n_sv, n_sv - n_sv_same
+    if n_sv_same < n_sv:
+        print(f"  → 서빙 시점 값이 학습(아카이브) 값과 {1 - n_sv_same / n_sv:.1%} 에서 "
+              "다르다. 시차 0 의 이득은 **상한**이다. 굳은 시점보다 긴 시차"
+              "(`AERO_LAG_HOURS`)로 다시 잴 것.")
+    elif max_late_age < 48:
+        # CAMS 는 하루 두 번 발표한다 — 짧은 관찰 창의 '같음'은 증명력이 없다.
+        print("  → **아직 결론이 아니다.** 굳은 값의 age 가 48시간에 못 미친다.")
     else:
-        print("  → 조회 시점과 무관하게 같은 값이다. 학습·서빙 분포가 일치하므로 "
-              "측정된 이득을 그대로 기대할 수 있다.")
-    return n_cmp, n_diff
+        print("  → 조회 시점과 무관하게 같은 값이다.")
+    return n_sv, n_sv - n_sv_same
 
 
 def _save(path, obj):
