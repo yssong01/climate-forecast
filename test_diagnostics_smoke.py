@@ -84,6 +84,8 @@ DIAGNOSTIC_MODULES = [
     # CI(refresh-data.yml)가 15분마다 호출한다 — 임포트가 깨지면 적중률
     # 기록이 통째로 멈춘다(2026-09-23 추가).
     "record_online_forecasts",
+    # 같은 워크플로의 관측 창 갱신 — 임포트가 깨지면 창이 멈춘다(2026-10-21 추가).
+    "refresh_deploy_data",
     # 2026-09-27 신설 — 남아 있던 세 항목을 닫은 측정 도구들.
     "aerosol_gbm_check", "precip_floor_check",
     # 2026-10-21 신설 — 관측소별 강수 F1 을 검증셋·온라인에서 같은 정의로 잰다.
@@ -542,6 +544,74 @@ def _wind_dir_units():
     return f"파서 27→270° · sin/cos(-1,0) · 멱등 · 폴백 이행 · {note}"
 
 
+def _api_budget_guards():
+    """API 호출이 결측·장애 때 폭주하지 않는가(2026-10-21).
+
+    실측 2026-08-28 하루 2,466건(평시 약 300건). 결측 관측소의 공백 전체를
+    매 실행 재요청했고, 일일 상한은 프로세스 계수라 실행마다 초기화됐다.
+    앱은 수치예보가 없을 때도 API 15회를 다 쓴 뒤에야 예외를 올렸다.
+    """
+    from datetime import datetime, timedelta
+    import weather_collector as wc
+    import refresh_deploy_data as rd
+    import predict as pr
+
+    # ① 계획 — 정상(공백 1시간)·결측(10시간)·창에 없음
+    ceiling = datetime(2026, 10, 21, 21, 0)
+    ts = lambda dt: dt.strftime("%Y%m%d%H00")
+    existing = {("108", ts(ceiling - timedelta(hours=1))): {},
+                ("112", ts(ceiling - timedelta(hours=10))): {}}
+    targets, backfill = rd._plan_targets(existing, ["108", "112", "119"],
+                                         ceiling, {})
+    assert sorted(targets) == sorted([("108", ts(ceiling)), ("112", ts(ceiling)),
+                                      ("119", ts(ceiling))]), targets
+    assert len(backfill["112"]) == 9 and len(backfill["119"]) == rd.SEED_HOURS - 1
+    assert "108" not in backfill and rd.FETCH_RETRIES == 1
+
+    # ② 일일 상한 — 저장소 누계로 계수를 시작하면 상한이 하루 단위로 걸린다
+    saved = dict(wc._call_stats)
+    try:
+        today = datetime.now(wc.KST).strftime("%Y%m%d")
+        wc.preload_call_count(today, wc.DAILY_CALL_BUDGET)
+        assert not wc._reserve_call(), "누계가 상한이면 더 부르면 안 된다"
+        wc.preload_call_count("19990101", 0)            # 다른 날짜는 무시
+        assert wc.api_call_stats()["count"] == wc.DAILY_CALL_BUDGET
+    finally:
+        wc._call_stats.clear()
+        wc._call_stats.update(saved)
+
+    # ③ 앱 — 수치예보가 없으면 대상 관측소 1회만 조회하고 멈춘다
+    calls = []
+
+    def _fake_fetch(self, *a, **k):
+        calls.append(self.stn)
+        return {"timestamp": "202610212100", "temperature": 10.0,
+                "precipitation": 0.0, "humidity": 50.0, "wind_speed": 1.0,
+                "wind_dir": 270.0, "wind_dir_unit": "deg", "pressure": 1015.0,
+                "precip_type": 0, "stn": self.stn, "status": "SUCCESS_LIVE"}
+
+    class _NoNWP:
+        def encode(self, *a, **k):
+            return None
+
+    orig_fetch, orig_nwp = pr.RobustWeatherCollector.fetch, pr._nwp_collector
+    pr.RobustWeatherCollector.fetch = _fake_fetch
+    pr._nwp_collector = lambda: _NoNWP()
+    try:
+        m, c = pr.load_model("./checkpoints/numerical_trichef.pt", "cpu")
+        assert c.get("use_nwp"), "배포 체크포인트가 수치예보를 쓰지 않는다 — 시험 전제 확인"
+        try:
+            pr.predict(stn="108", model=m, ckpt=c)
+            raise AssertionError("수치예보가 없는데 예외가 나지 않았다")
+        except pr.NWPUnavailable:
+            pass
+        assert calls == ["108"], f"수치예보 확인 전에 {len(calls)}회 조회했다: {calls}"
+    finally:
+        pr.RobustWeatherCollector.fetch = orig_fetch
+        pr._nwp_collector = orig_nwp
+    return "탐침 계획(정상 1·결측 1+9·신규 1+23) · 재시도 1 · 일일 상한 · 수치예보 선확인(조회 1회)"
+
+
 # ── ④ 판정선 조회가 모든 체크포인트 형태에서 동작하는가 ──────────
 def _threshold_paths():
     from predict import event_threshold, STATION_EVENT_THRESH_OVERRIDES
@@ -592,6 +662,8 @@ def main():
     check("accuracy_wet", _accuracy_wet_stats)
     print("\n[T3-5] 서빙 입력의 풍향 단위(API 10도 단위 → 도)")
     check("wind_dir_units", _wind_dir_units)
+    print("\n[T3-6] API 호출 폭주 방지(탐침·일일 상한·수치예보 선확인)")
+    check("api_budget", _api_budget_guards)
     print("\n[T4] 판정선 조회(구버전/신버전 체크포인트)")
     check("event_threshold", _threshold_paths)
     print("\n[T5] 배포 체크포인트 로드·추론")

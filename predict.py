@@ -551,19 +551,34 @@ def predict(stn: str = "108",
     # 대상 관측소 자신의 레코드는 폴백이어도 그대로 쓴다 — Z축 입력이 아예
     # 없으면 예보를 만들 수 없고, 그 상태는 data_status 로 호출부에 전달돼
     # 화면 상단 배지에 경고로 표시된다.
-    record = None
-    fetched = []
+    record = RobustWeatherCollector(stn=stn).fetch()
+
+    # 수치예보 확인을 이웃·시차 조회(API 14회)보다 **먼저** 한다(2026-10-21).
+    # 수치예보가 없으면 어차피 예보를 낼 수 없는데, 종전에는 API 15회를 다 쓴
+    # 뒤에야 예외를 올렸다. 예외는 Streamlit 캐시에 남지 않으므로 수치예보가
+    # 멈춘 동안 재실행마다(위젯 조작·자동 새로고침) 15회씩 새어, 하루 예산을
+    # 열몇 세션-시간 만에 소진할 수 있었다. 지금은 대상 관측소 1회만 쓴다.
+    nwp_vec = None
+    if ckpt.get("use_nwp", False):
+        # 결측이면 예보를 낼 수 없다 — 중립값으로 메우면 "예보가 없다"가
+        # "강수 0mm 예보"로 둔갑한다(CLAUDE.md 1절 5항). 호출자가 이 사정을
+        # 화면에 드러낼 수 있도록 명시적 예외로 올린다. 학습과 **같은 함수**
+        # (nwp_collector.encode)를 쓰므로 특징 정의가 두 경로에서 어긋날 수 없다.
+        nwp_vec = _nwp_collector().encode(
+            record, lead_hours, ckpt.get("nwp_feature_set", "full14"))
+        if nwp_vec is None:
+            raise NWPUnavailable(
+                f"{record.get('stn')} {record.get('timestamp')} 의 +{lead_hours}h "
+                f"수치예보가 없다 — cache/nwp_recent.json 갱신 상태를 확인할 것.")
+
+    fetched = [record]
     for other_stn in STATIONS.values():
+        if other_stn == stn:
+            continue
         try:
-            r = RobustWeatherCollector(stn=other_stn).fetch()
+            fetched.append(RobustWeatherCollector(stn=other_stn).fetch())
         except Exception:
             continue
-        if other_stn == stn:
-            record = r
-        fetched.append(r)
-    if record is None:
-        record = RobustWeatherCollector(stn=stn).fetch()
-        fetched.append(record)
 
     # 보간장에 넣을 이웃을 고른다. 두 조건을 함께 건다(2026-08-19 개편).
     #
@@ -645,20 +660,9 @@ def predict(stn: str = "108",
         table = ckpt.get("climatology_table") or {}
         num_vec = np.concatenate(
             [num_vec, [climatology_anomaly(record, table)]]).astype(np.float32)
-    if ckpt.get("use_nwp", False):
-        # 수치예보 예보값 14차원 — 학습 때와 같은 순서로 맨 뒤에 붙인다.
-        # 학습과 **같은 함수**(nwp_collector.encode)를 쓰므로 특징 정의가
-        # 두 경로에서 어긋날 수 없다.
-        #
-        # 결측이면 예보를 낼 수 없다 — 중립값으로 메우면 "예보가 없다"가
-        # "강수 0mm 예보"로 둔갑한다(CLAUDE.md 1절 5항). 호출자가 이 사정을
-        # 화면에 드러낼 수 있도록 명시적 예외로 올린다.
-        nwp_vec = _nwp_collector().encode(
-            record, lead_hours, ckpt.get("nwp_feature_set", "full14"))
-        if nwp_vec is None:
-            raise NWPUnavailable(
-                f"{record.get('stn')} {record.get('timestamp')} 의 +{lead_hours}h "
-                f"수치예보가 없다 — cache/nwp_recent.json 갱신 상태를 확인할 것.")
+    if nwp_vec is not None:
+        # 수치예보 예보값 14차원 — 학습 때와 같은 순서로 맨 뒤에 붙인다
+        # (위 대상 관측소 조회 직후에 이미 만들고 결측을 확인했다).
         num_vec = np.concatenate([num_vec, nwp_vec]).astype(np.float32)
     num_vec  = num_vec[:nf]
     num_norm = (num_vec - mean) / std

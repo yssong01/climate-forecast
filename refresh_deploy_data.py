@@ -29,11 +29,14 @@ CI 에서는 "기존 데이터 없음"으로 전부 건너뛴다. 이 스크립�
 
 ## API 호출량
 
-관측소 12곳 × (마지막 수집 이후 경과 시간)이므로, **호출량은 실행 주기와
-무관하게 하루 약 288건으로 일정하다** — 자주 돌리면 회당 건수가 그만큼
-줄어들기 때문이다. 이 키가 차단됐던 지점(누적 약 9,800건, CLAUDE.md 4절)의
-3% 수준이고, collect_incremental.py 가 안전하다고 적어둔 일일 상한과 같은
-규모다. MAX_GAP_HOURS 로 장기 미실행 시의 폭주를 막는다.
+관측소 12곳 × (마지막 수집 이후 경과 시간)이므로, **모든 관측이 제때
+발표되면** 호출량은 실행 주기와 무관하게 하루 약 288건이다 — 자주 돌리면
+회당 건수가 그만큼 줄어들기 때문이다. 실측 평시는 약 270~330건이다.
+
+**결측이 생기면 이 계산이 성립하지 않았다(2026-10-21 정정).** 발표되지 않은
+시각은 다음 실행이 다시 요청하므로, 관측소 하나가 결측이면 그 공백 전체를
+매 실행 재요청했다 — 실측 2026-08-28 하루 2,466건. 지금은 탐침·재시도 1회·
+진짜 일일 상한으로 막는다(아래 FETCH_RETRIES 주석).
 
 (2026-08-29 정정: 종전에는 "6시간 주기로 돌리면 회당 약 72건"이라고 적혀
 있었으나, 실제 주기는 2026-08-20부터 Cloudflare Cron 15분 / GitHub Actions
@@ -56,6 +59,7 @@ import accuracy
 from collect_year import atomic_save, load_existing
 from weather_collector import (
     KST, STATIONS, RobustWeatherCollector, api_call_stats, migrate_api_wind_dir,
+    preload_call_count,
 )
 
 WINDOW_FILE = "./cache/recent_window.json"
@@ -63,6 +67,22 @@ WINDOW_DAYS = 10          # build_recent_window.py 와 동일 — 72시간 + 여
 MAX_GAP_HOURS = 72        # 장기 미실행 시 한 번에 채울 상한 (관측소당)
 SEED_HOURS = 24           # 창에 아예 없는 관측소를 새로 채울 때의 초기 분량
 CONCURRENCY = 6
+
+# 호출 폭주 방지(2026-10-21) — 실측 2026-08-28 하루 2,466건(평시 약 300건).
+#
+# 종전에는 관측소 하나가 결측(빈 200 응답·-9 값)이면 매 실행이 마지막 관측
+# 이후의 공백 **전체**(최대 72시간)를 재시도 2회로 다시 요청했다. 결측이
+# 사흘이면 72 × 2 × 96회 ≈ 하루 13,800건으로, 이 키가 차단된 규모(약
+# 9,800건)를 넘는다. 게다가 `KMA_DAILY_CALL_BUDGET` 은 프로세스 메모리의
+# 계수라 실행마다 0으로 돌아가 하루 상한 노릇을 못 했다.
+#
+# 그래서 ① 저장소의 일일 사용량으로 계수를 시작해 상한을 하루 단위로 걸고
+# (`preload_call_count`), ② 재시도를 1회로 줄이고(다음 실행이 15분 뒤 어차피
+# 다시 시도한다), ③ 공백이 `PROBE_AFTER_HOURS` 를 넘은 관측소는 **최신
+# 1시간만 탐침**하고 그게 성공한 실행에서만 나머지 공백을 채운다. 결측
+# 관측소 하나의 비용이 실행당 144건에서 1건이 된다.
+FETCH_RETRIES = 1
+PROBE_AFTER_HOURS = 3     # 정상 실행의 공백은 1~2시간이다
 
 # 최신성 감시 임계값 — 이 갱신이 끝난 뒤에도 가장 뒤처진 관측소가 기준
 # 시각보다 이만큼 이상 묵었으면 실행을 실패로 표시한다(2026-08-16 실측:
@@ -84,12 +104,10 @@ MAX_STALE_HOURS = int(os.getenv("MAX_STALE_HOURS", "3"))
 USAGE_LOG_FILE = "./cache/api_usage_daily.json"
 
 
-def _record_usage(source: str, count_this_run: int) -> None:
-    """오늘(KST) 이 소스가 사용한 것으로 확인된 호출 수를 저장소에 누적한다."""
-    import tempfile
-
+def _usage_today() -> dict:
+    """저장소에 기록된 오늘(KST) 사용량. 없거나 날짜가 다르면 오늘 자 빈 기록."""
     today = datetime.now(KST).strftime("%Y%m%d")
-    data = {"date": today, "sources": {}}
+    data = {"date": today, "sources": {}, "total": 0}
     if os.path.exists(USAGE_LOG_FILE):
         try:
             with open(USAGE_LOG_FILE, "r", encoding="utf-8") as f:
@@ -98,6 +116,15 @@ def _record_usage(source: str, count_this_run: int) -> None:
                 data = existing
         except Exception:
             pass   # 손상된 파일이면 오늘 자로 새로 시작한다
+    return data
+
+
+def _record_usage(source: str, count_this_run: int) -> None:
+    """오늘(KST) 이 소스가 사용한 것으로 확인된 호출 수를 저장소에 누적한다."""
+    import tempfile
+
+    data = _usage_today()
+    today = data["date"]
     data["sources"][source] = data["sources"].get(source, 0) + count_this_run
     data["total"] = sum(data["sources"].values())
 
@@ -140,10 +167,15 @@ def _latest_per_station(records: dict) -> dict:
 
 
 def _plan_targets(existing: dict, stations: list, ceiling: datetime,
-                  station_names: dict) -> list:
-    """채워야 할 (관측소, 시각) 목록. 관측소별 상한을 적용한다."""
+                  station_names: dict) -> tuple[list, dict]:
+    """채워야 할 (관측소, 시각) 목록과, 탐침이 성공하면 이어서 채울 시각들.
+
+    반환: (targets, backfill). 공백이 `PROBE_AFTER_HOURS` 를 넘거나 창에 아예
+    없는 관측소는 targets 에 **최신 1시간만** 넣고 나머지를 backfill[stn] 에
+    둔다(위 FETCH_RETRIES 주석 참고).
+    """
     latest = _latest_per_station(existing)
-    targets = []
+    targets, backfill = [], {}
     for stn in stations:
         name = station_names.get(stn, stn)
         if stn in latest:
@@ -165,12 +197,37 @@ def _plan_targets(existing: dict, stations: list, ceiling: datetime,
             gap_start = ceiling - timedelta(hours=gap_hours - 1)
             print(f"  [{name}] 창에 데이터 없음 — 최근 {SEED_HOURS}시간 초기 수집")
 
+        hours = [(gap_start + timedelta(hours=i)).strftime("%Y%m%d%H00")
+                 for i in range(gap_hours)]
+        if stn not in latest or gap_hours > PROBE_AFTER_HOURS:
+            targets.append((stn, hours[-1]))
+            backfill[stn] = hours[:-1]
+            print(f"  [{name}] 공백 {gap_hours}시간 — 최신 1시간만 탐침, 성공하면 "
+                  f"나머지 {len(hours) - 1}시간을 채운다")
+            continue
         print(f"  [{name}] 신규 {gap_hours}개 "
               f"({gap_start.strftime('%m-%d %H:%M')} ~ {ceiling.strftime('%m-%d %H:%M')})")
-        for i in range(gap_hours):
-            dt = gap_start + timedelta(hours=i)
-            targets.append((stn, dt.strftime("%Y%m%d%H00")))
-    return targets
+        targets.extend((stn, h) for h in hours)
+    return targets, backfill
+
+
+def _fetch(collectors: dict, targets: list) -> tuple[dict, int]:
+    """(관측소, 시각) 목록을 병렬 조회한다. 반환: ({(stn, tm): 레코드}, 실패 수).
+
+    SUCCESS_LIVE 가 아닌 응답은 버린다 — 폴백값(과거값 복제 또는 합성
+    기본값)을 이력에 섞으면 결측이 실측으로 위장된다(CLAUDE.md 4절).
+    """
+    got, fail = {}, 0
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = {pool.submit(collectors[stn].fetch_at, tm, FETCH_RETRIES): (stn, tm)
+                   for stn, tm in targets}
+        for fut in as_completed(futures):
+            data = fut.result()
+            if data.get("status") == "SUCCESS_LIVE":
+                got[futures[fut]] = data
+            else:
+                fail += 1
+    return got, fail
 
 
 def _trim(records: dict, cutoff: datetime) -> dict:
@@ -208,8 +265,16 @@ def main():
     print(f"기존 창: {len(existing):,}개 레코드 ({args.window})"
           + (f" · 풍향 단위 이행 {n_migrated:,}건" if n_migrated else "") + "\n")
 
-    targets = _plan_targets(existing, args.stations, ceiling, station_names)
-    print(f"\n총 {len(targets)}건 요청 예정")
+    targets, backfill = _plan_targets(existing, args.stations, ceiling, station_names)
+    print(f"\n총 {len(targets)}건 요청 예정"
+          + (f"(탐침 {len(backfill)}곳 — 성공 시 최대 "
+             f"{sum(map(len, backfill.values()))}건 추가)" if backfill else ""))
+
+    # 일일 상한 — 저장소에 누적된 오늘 사용량으로 계수를 시작한다.
+    usage = _usage_today()
+    preloaded = int(usage.get("total", 0))
+    preload_call_count(usage["date"], preloaded)
+    print(f"오늘 사용량: {preloaded}건 (일일 상한 {api_call_stats()['budget']}건)")
 
     if args.dry_run:
         print("(--dry-run — API 호출 없이 종료)")
@@ -217,25 +282,31 @@ def main():
 
     ok = fail = 0
     records = dict(existing)
-    if targets:
-        collectors = {stn: RobustWeatherCollector(stn=stn)
-                      for stn in {s for s, _ in targets}}
-
-        def fetch_one(stn, tm):
-            return stn, tm, collectors[stn].fetch_at(tm)
-
-        with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-            futures = [pool.submit(fetch_one, stn, tm) for stn, tm in targets]
-            for fut in as_completed(futures):
-                stn, tm, data = fut.result()
-                # SUCCESS_LIVE 가 아닌 응답은 버린다 — 폴백값(과거값 복제 또는
-                # 합성 기본값)을 이력에 섞으면 결측이 실측으로 위장된다
-                # (CLAUDE.md 4절).
-                if data.get("status") == "SUCCESS_LIVE":
-                    records[(stn, tm)] = data
-                    ok += 1
-                else:
-                    fail += 1
+    try:
+        if targets:
+            collectors = {stn: RobustWeatherCollector(stn=stn)
+                          for stn in {s for s, _ in targets}}
+            got, fail = _fetch(collectors, targets)
+            # 탐침이 성공한 관측소만 나머지 공백을 채운다(최신 쪽부터). 탐침
+            # 관측소는 1단계 요청이 최신 1시간 하나뿐이라, 그 관측소의 성공이
+            # 하나라도 있으면 탐침이 성공한 것이다.
+            rest = [(stn, tm) for stn, hrs in backfill.items()
+                    if any(s == stn for s, _ in got) for tm in reversed(hrs)]
+            if rest:
+                print(f"탐침 성공 {len({s for s, _ in rest})}곳 — 공백 {len(rest)}건을 채운다")
+                got2, fail2 = _fetch(collectors, rest)
+                got.update(got2)
+                fail += fail2
+            records.update(got)
+            ok = len(got)
+    finally:
+        # 실행이 도중에 죽어도 쓴 만큼은 남긴다 — 빠지면 다음 실행의 일일
+        # 상한이 그만큼 느슨해진다.
+        calls = api_call_stats()
+        run_calls = calls["count"] - (preloaded if calls["date"] == usage["date"] else 0)
+        print(f"API 호출: 이번 실행 {run_calls}건 · 오늘 누계 {calls['count']}건 "
+              f"(일일 상한 {calls['budget']}건, 상한 초과로 건너뜀 {calls['blocked']}건)")
+        _record_usage("refresh_workflow", max(0, run_calls))
 
     cutoff = datetime.now(KST).replace(tzinfo=None) - timedelta(days=WINDOW_DAYS)
     before = len(records)
@@ -255,11 +326,6 @@ def main():
     if stats["cum_n"]:
         print(f"  누적 적중률 — 기온 {stats['cum_temp']:.1%} · "
               f"강수 {stats['cum_precip']:.1%}")
-
-    calls = api_call_stats()
-    print(f"API 호출: {calls['count']}건 (예산 {calls['budget']}건, "
-          f"차단 {calls['blocked']}건)")
-    _record_usage("refresh_workflow", calls["count"])
 
     # ── 최신성 게이트 — 조용한 실패를 CI 빨간불로 바꾼다 ─────────────────
     # 지금까지는 성공/실패 개수를 출력만 하고 종료 코드는 항상 0이었다.

@@ -50,6 +50,8 @@ ASOS_URL = "https://apihub.kma.go.kr/api/typ01/url/kma_sfctm2.php"
 # 카운터는 프로세스 메모리에만 있다 — 재시작하면 0으로 돌아가고, 여러
 # 프로세스가 같은 키를 쓰면 합산되지 않는다. 정확한 회계가 아니라 폭주
 # 방지용 안전장치다. (정확한 누적치가 필요하면 발급처 콘솔이 원본이다.)
+# CI(refresh_deploy_data.py)는 실행마다 새 프로세스라 이대로면 실행당
+# 상한이 되므로, 저장소의 일일 사용량으로 계수를 시작한다(preload_call_count).
 DAILY_CALL_BUDGET = int(os.getenv("KMA_DAILY_CALL_BUDGET", "3000"))
 
 def offline_only() -> bool:
@@ -81,6 +83,21 @@ def _reserve_call() -> bool:
             return False
         _call_stats["count"] += 1
         return True
+
+
+def preload_call_count(date: str, count: int) -> None:
+    """오늘 이미 쓴 호출 수로 이 프로세스의 계수를 시작한다(2026-10-21).
+
+    계수는 프로세스 메모리에만 있어, 15분마다 새 프로세스로 도는 CI 에서는
+    `DAILY_CALL_BUDGET` 이 **하루 상한이 아니라 실행당 상한**이었다. 저장소에
+    누적된 일일 사용량(`cache/api_usage_daily.json`)을 시작 시 넣어 주면 같은
+    상한이 하루 단위로 작동한다. 날짜가 오늘(KST)이 아니면 무시한다.
+    """
+    today = datetime.now(KST).strftime("%Y%m%d")
+    if str(date) != today:
+        return
+    with _budget_lock:
+        _call_stats.update(date=today, count=max(0, int(count)), blocked=0)
 
 
 def api_call_stats() -> dict:
