@@ -489,6 +489,59 @@ def _accuracy_wet_stats():
     return "기저율·정밀도·재현율·F1 · 분모 0 경계 · 화면 포맷 보호"
 
 
+def _wind_dir_units():
+    """서빙 입력의 풍향이 학습과 같은 도 단위인가(2026-10-21 사고).
+
+    API허브 WD 는 10도 단위인데 파서가 그대로 저장해, 실시간 입력의 풍향
+    특징이 학습 분포 밖에 있었다(검증셋 재현: 폭염 F1 0.837→0.641). 연기
+    시험이 서빙 입력의 **단위**를 본 적이 없어서 수개월 동안 드러나지 않았다.
+    파서·이행 규칙·저장소 창 폴백 세 경로를 모두 확인한다.
+    """
+    import json
+    import weather_collector as wc
+    from train import record_to_vec
+
+    # ① 파서 — WD 27(10도 단위) → 270°
+    text = ("#START7777\n"
+            "# YYYYMMDDHHMM STN WD WS GST_WD GST_WS GST_TM PA PS PT PR TA TD HM PV RN\n"
+            "202610210900 108 27 2.3 -9 -9 -9 1010.0 1015.2 -9 -9 15.4 8.0 65 -9 0.0\n"
+            "#7777END\n")
+    rec = wc.RobustWeatherCollector(api_key="", stn="108")._parse_asos(
+        text, "202610210900")
+    assert rec["wind_dir"] == 270.0 and rec["wind_dir_unit"] == wc.WIND_DIR_UNIT, rec
+    vec = record_to_vec(rec)
+    assert abs(vec[4] + 1.0) < 1e-9 and abs(vec[5]) < 1e-9, \
+        f"서풍(270°)의 sin/cos 가 (-1, 0)이 아니다: {vec[4:6]}"
+
+    # ② 이행 규칙 — 표식 없는 10도 단위만 바꾸고, 멱등이다
+    old = {"wind_dir": 27.0, "stn": "108", "timestamp": "202610210900",
+           "status": "SUCCESS_LIVE"}
+    m = wc.migrate_api_wind_dir(old)
+    assert m["wind_dir"] == 270.0 and old["wind_dir"] == 27.0, "원본을 바꾸면 안 된다"
+    assert wc.migrate_api_wind_dir(m) == m, "두 번 적용하면 열 배가 된다"
+    assert wc.migrate_api_wind_dir(dict(old, wind_dir=270.0))["wind_dir"] == 270.0
+
+    # ③ 저장소 창 폴백 — 이행 전 창이 주입돼도 도 단위로 나간다
+    wc.set_offline_fallback([old])
+    try:
+        assert wc._offline_record("108", "202610210900")["wind_dir"] == 270.0
+    finally:
+        wc.set_offline_fallback([])
+
+    # ④ 로컬 저장소 창(main 의 최후 폴백)을 이행 규칙에 통과시키면 도 단위
+    #    범위(최댓값 36 초과·360 이하)에 드는가 — 실제 자료로 규칙을 확인한다
+    note = "로컬 창 없음"
+    path = "./cache/recent_window.json"
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            win = json.load(fh)
+        vals = [wc.migrate_api_wind_dir(r)["wind_dir"] for r in win]
+        assert max(vals) > 36.0 and max(vals) <= 360.0, \
+            f"창 풍향 최댓값 {max(vals)} — 10도 단위가 남아 있다"
+        note = f"로컬 창 {len(win):,}건 최댓값 {max(vals):.0f}°"
+    return f"파서 27→270° · sin/cos(-1,0) · 멱등 · 폴백 이행 · {note}"
+
+
 # ── ④ 판정선 조회가 모든 체크포인트 형태에서 동작하는가 ──────────
 def _threshold_paths():
     from predict import event_threshold, STATION_EVENT_THRESH_OVERRIDES
@@ -537,6 +590,8 @@ def main():
     check("precip_gbm", _precip_gbm_path)
     print("\n[T3-4] 온라인 적중률 — 강수는 기저율과 함께 읽는가")
     check("accuracy_wet", _accuracy_wet_stats)
+    print("\n[T3-5] 서빙 입력의 풍향 단위(API 10도 단위 → 도)")
+    check("wind_dir_units", _wind_dir_units)
     print("\n[T4] 판정선 조회(구버전/신버전 체크포인트)")
     check("event_threshold", _threshold_paths)
     print("\n[T5] 배포 체크포인트 로드·추론")

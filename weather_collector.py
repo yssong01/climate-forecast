@@ -264,6 +264,8 @@ def set_offline_fallback(records) -> int:
         ts = str(r.get("timestamp", ""))[:12]
         if not stn or not ts:
             continue
+        # 저장소 창은 API 경로 레코드다 — 이행 전 창이 들어와도 도 단위로 맞춘다.
+        r = migrate_api_wind_dir(r)
         by_key[(stn, ts)] = r
         if stn not in latest or ts > str(latest[stn].get("timestamp", "")):
             latest[stn] = r
@@ -313,6 +315,41 @@ REAL_STATUSES = ("SUCCESS_LIVE", "FALLBACK_WINDOW", "FALLBACK_CACHED")
 def is_real_observation(status) -> bool:
     """이 레코드가 실제 관측에서 온 값인가(날조 기본값이 아닌가)."""
     return str(status) in REAL_STATUSES
+
+
+# ── 풍향 단위(2026-10-21 사고) ──────────────────────────────────────
+# API허브 ASOS 의 WD 는 **10도 단위**다(0·2·5·7·…·36 — 16방위 각도 ÷10).
+# 학습 캐시(포털 CSV)는 **도 단위**(20·50·…·360)이고 train.record_to_vec 은
+# 둘 다 np.deg2rad 로 sin/cos 를 만든다. 이 파서가 변환 없이 저장해 실시간
+# 입력의 풍향 특징(4·5)이 학습 분포 밖에 있었다 — 검증셋에서 그 조건을
+# 재현하면 폭염 F1 0.837→0.641 이다(NEXT.md 2절 P0-1).
+#
+# 그래서 파서가 도 단위로 바꾸고 `wind_dir_unit` 표식을 단다. 표식은
+# **이미 저장된 API 경로 레코드**(저장소 창·디스크 캐시)를 이행하기 위한
+# 것이다 — 값 20 은 도 단위(북북동)와 10도 단위(200°) 양쪽에 존재해 값으로는
+# 가를 수 없다.
+WIND_DIR_UNIT = "deg"
+_API_WD_MAX = 36.0          # 10도 단위의 최댓값(360°)
+
+
+def migrate_api_wind_dir(record: dict) -> dict:
+    """API 경로로 저장된 레코드의 풍향을 도 단위로 맞춘다(멱등).
+
+    **API 경로 레코드에만 쓴다** — 저장소 창(`recent_window.json`)과 이
+    컬렉터의 디스크 캐시. 학습 캐시는 포털(도 단위)과 API(10도 단위) 행이
+    표식 없이 섞여 있어 이 규칙을 적용하면 포털 행이 열 배가 된다.
+
+    표식이 있으면 그대로 돌려준다. 표식이 없고 값이 10도 단위의 범위를
+    넘으면(> 36) 이미 도 단위이므로 표식만 단다.
+    """
+    if record.get("wind_dir_unit") == WIND_DIR_UNIT:
+        return record
+    out = dict(record)
+    wd = out.get("wind_dir")
+    if wd is not None and float(wd) <= _API_WD_MAX:
+        out["wind_dir"] = float(wd) * 10.0
+    out["wind_dir_unit"] = WIND_DIR_UNIT
+    return out
 
 
 def _atomic_write_json(path: str, payload) -> None:
@@ -417,7 +454,7 @@ class RobustWeatherCollector:
                 continue
             if str(data.get("stn")) != self.stn:
                 continue
-            self._memory_cache = data
+            self._memory_cache = migrate_api_wind_dir(data)
             return
 
     def _save_disk_cache(self, data: dict):
@@ -581,7 +618,8 @@ class RobustWeatherCollector:
         응답 구조 (help=1):
           #START7777
           # YYYYMMDDHHMM STN WD WS ... TA TD HM ... RN ...
-          202608062200  108  270  2.3  ...  25.4  ...  65  ...  0.0  ...
+          202608062200  108   27  2.3  ...  25.4  ...  65  ...  0.0  ...
+        WD 는 10도 단위다(27 = 270°). 아래에서 도 단위로 바꾼다.
           #7777END
         """
         lines = [ln.strip() for ln in text.splitlines()]
@@ -657,7 +695,9 @@ class RobustWeatherCollector:
             "precipitation": max(0.0, sf("RN", 0.0)),
             "humidity":      humid,
             "wind_speed":    wind,
-            "wind_dir":      sf("WD",   0.0),
+            # WD 는 10도 단위다 — 도 단위로 바꿔 학습 캐시와 맞춘다(위 WIND_DIR_UNIT 주석).
+            "wind_dir":      sf("WD",   0.0) * 10.0,
+            "wind_dir_unit": WIND_DIR_UNIT,
             "pressure":      pres,
             "precip_type":   0,   # ASOS WW 코드는 추후 매핑
             "stn":           self.stn,
@@ -716,6 +756,7 @@ class RobustWeatherCollector:
         return {
             "timestamp": tm, "temperature": 20.0, "precipitation": 0.0,
             "humidity": 50.0, "wind_speed": 1.5, "wind_dir": 0.0,
+            "wind_dir_unit": WIND_DIR_UNIT,
             "pressure": 1013.0, "precip_type": 0,
             "stn": self.stn, "status": "FALLBACK_DEFAULT",
         }

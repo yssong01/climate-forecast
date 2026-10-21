@@ -19,6 +19,7 @@ import os
 from datetime import datetime, timedelta
 
 from collect_year import atomic_save
+from weather_collector import WIND_DIR_UNIT
 
 SRC_FILES = ["./cache/historical_data_1y.json", "./cache/historical_data.json"]
 OUT_FILE  = "./cache/recent_window.json"
@@ -52,7 +53,20 @@ def main():
             if dt >= cutoff:
                 merged[(r.get("stn"), r["timestamp"])] = r
 
-    out = list(merged.values())
+    # 풍향 단위(2026-10-21) — 학습 캐시는 포털(도 단위)과 API(10도 단위) 행이
+    # 표식 없이 섞여 있어 이 창에 넣을 때 단위를 정할 수 없다. 표식 없는 행이
+    # 10도 단위 전용 값(2·5·7·…)을 갖고 있으면 학습 캐시 정정(NEXT.md 2절
+    # P2-4)이 안 된 것이므로 멈춘다. 그대로 쓰면 저장소 창의 이행 규칙
+    # (`migrate_api_wind_dir`)이 포털 행을 열 배로 만들거나 API 행을 놓친다.
+    api_only = {2.0, 5.0, 7.0, 9.0, 11.0, 14.0, 16.0, 18.0, 23.0, 25.0,
+                27.0, 29.0, 32.0, 34.0, 36.0}
+    mixed = [r for r in merged.values()
+             if r.get("wind_dir_unit") is None and r.get("wind_dir") in api_only]
+    if mixed:
+        raise SystemExit(
+            f"표식 없는 10도 단위 풍향 {len(mixed):,}건 — 학습 캐시의 풍향 단위를 "
+            "먼저 정정해야 한다(NEXT.md 2절 P2-4).")
+    out = [dict(r, wind_dir_unit=WIND_DIR_UNIT) for r in merged.values()]
     # 고유 tmp + os.replace 로 원자적으로 쓴다(CLAUDE.md 1절 6항) — 같은
     # 파일을 refresh_deploy_data.py 는 이미 atomic_save 로 쓰는데 이 경로만
     # 직접 덮어쓰고 있었다. 도중에 죽으면 잘린 JSON 이 남아 배포판의

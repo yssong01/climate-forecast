@@ -55,7 +55,7 @@ from datetime import datetime, timedelta
 import accuracy
 from collect_year import atomic_save, load_existing
 from weather_collector import (
-    KST, STATIONS, RobustWeatherCollector, api_call_stats,
+    KST, STATIONS, RobustWeatherCollector, api_call_stats, migrate_api_wind_dir,
 )
 
 WINDOW_FILE = "./cache/recent_window.json"
@@ -201,7 +201,12 @@ def main():
     print("=" * 66)
 
     existing = load_existing(args.window)   # SUCCESS_LIVE 만 남긴다
-    print(f"기존 창: {len(existing):,}개 레코드 ({args.window})\n")
+    # 이 창은 API 경로 레코드만 담는다 — 풍향이 10도 단위로 저장돼 있던
+    # 이행 전 레코드를 도 단위로 바꿔 다시 저장한다(멱등, 2026-10-21).
+    n_migrated = sum(1 for r in existing.values() if r.get("wind_dir_unit") is None)
+    existing = {k: migrate_api_wind_dir(r) for k, r in existing.items()}
+    print(f"기존 창: {len(existing):,}개 레코드 ({args.window})"
+          + (f" · 풍향 단위 이행 {n_migrated:,}건" if n_migrated else "") + "\n")
 
     targets = _plan_targets(existing, args.stations, ceiling, station_names)
     print(f"\n총 {len(targets)}건 요청 예정")

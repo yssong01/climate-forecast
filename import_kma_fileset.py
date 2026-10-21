@@ -11,7 +11,11 @@ CSV 실측 형식 (2026-08-07, 관측소 101 2023년 샘플로 확인):
   헤더     : 지점,일시,기온(°C),강수량(mm),풍속(m/s),풍향(16방위),습도(%),...
   일시     : "YYYY-MM-DD HH:MM" (매시 정각)
   강수량   : 빈 문자열 = 무강수(0.0) — 결측이 아니라 관측값 자체가 0
-  풍향     : 이미 도(degree) 단위 — apihub WD 필드와 동일해 추가 변환 불필요
+  풍향     : 도(degree) 단위(20·50·…·360). **apihub WD 는 10도 단위(2·5·…·36)라
+             단위가 다르다** — 종전 주석은 "동일해 추가 변환 불필요"라고 적었고
+             그 탓에 서빙 입력의 풍향이 학습과 열 배 어긋났다(2026-10-21,
+             weather_collector.WIND_DIR_UNIT 주석). 여기서 만드는 레코드에는
+             단위 표식(wind_dir_unit)을 단다.
 
 apihub 필드와의 대응 (weather_collector._parse_asos 와 동일 의미로 맞춤):
   지점→stn, 기온→temperature, 강수량→precipitation, 풍속→wind_speed,
@@ -32,7 +36,7 @@ import glob
 import sys
 from datetime import datetime
 
-from weather_collector import STATIONS
+from weather_collector import STATIONS, WIND_DIR_UNIT
 from collect_year import load_existing, atomic_save, OUT_FILE, LEGACY_CACHE
 
 VALID_STNS = set(STATIONS.values())
@@ -110,6 +114,7 @@ def parse_file(path: str) -> list:
             "humidity":      humid,
             "wind_speed":    wind,
             "wind_dir":      _sf(row.get("풍향(16방위)"), 0.0),
+            "wind_dir_unit": WIND_DIR_UNIT,   # 포털 CSV 는 도 단위
             "pressure":      pres,
             "precip_type":   0,   # apihub 경로도 항상 0 — WW 코드 매핑 전 상태와 동일
             "stn":           stn,
