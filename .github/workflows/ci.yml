@@ -39,6 +39,22 @@ jobs:
       - name: Install diagnostic-only dependencies
         run: pip install matplotlib scipy scikit-learn
 
+      # 미정의 이름 정적 검사(2026-10-21 신설). `promote_checkpoint.py` 가
+      # 정의된 적 없는 `gate_records` 를 참조해 `--promote` 가 **언제나**
+      # 배포 경로를 날 후보로 덮어쓴 직후 죽었는데, 그 줄은 승격 때만 실행돼
+      # 어떤 시험도 닿지 않았다. 저장소 전체에서 이 검사에 걸린 것은 그 한
+      # 건뿐이었다 — 실행되지 않는 경로의 오타는 실행 시험으로는 못 잡는다.
+      # 미사용 임포트 등 다른 경고는 보지 않는다(이름 오류만 실패로 본다).
+      - name: 미정의 이름 정적 검사
+        run: |
+          pip install pyflakes==3.2.0
+          out=$(python -m pyflakes $(git ls-files '*.py') | grep -E "undefined name|undefined local" || true)
+          if [ -n "$out" ]; then
+            echo "$out"
+            echo "::error::정의되지 않은 이름을 참조한다 — 그 줄이 실행되는 순간 NameError 로 죽는다"
+            exit 1
+          fi
+
       - name: Run Phase 3-4 numerical stability tests
         run: python test_phase34.py
 

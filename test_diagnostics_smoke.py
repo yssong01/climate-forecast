@@ -612,6 +612,35 @@ def _api_budget_guards():
     return "탐침 계획(정상 1·결측 1+9·신규 1+23) · 재시도 1 · 일일 상한 · 수치예보 선확인(조회 1회)"
 
 
+def _promotion_guards():
+    """승격 절차의 두 안전장치가 동작하는가(2026-10-21).
+
+    ① 죽은 게이트를 통과로 세지 않는다 — 판정 누락 판별.
+    ② 입력 계약 — 배포 짝(주 체크포인트·기온 모델)은 일치, 리드타임이 다른
+       짝은 불일치로 잡는가. 키가 없을 때의 기본값을 코드와 같게 해석하지
+       않으면 같은 입력인데도 불일치로 판정된다(시험 중 실제로 그랬다).
+    """
+    import promote_checkpoint as pc
+    found = {"seasonal_false_alarm": ("PASS", ""),
+             "station_coverage_heatwave": ("PASS", "")}
+    assert pc.missing_verdicts(found, ["seasonal_false_alarm", "station_coverage_*"]) == []
+    assert pc.missing_verdicts(found, ["monotonicity_coldwave"]) == ["monotonicity_coldwave"]
+    assert pc.missing_verdicts({}, ["station_coverage_*"]) == ["station_coverage_*"]
+
+    load = lambda p: torch.load(p, map_location="cpu", weights_only=True)
+    pairs = [(pc.PRODUCTION_TARGETS[6], pc.PRODUCTION_TARGETS["temp6"]),
+             (pc.PRODUCTION_TARGETS[12], pc.PRODUCTION_TARGETS["temp12"])]
+    for main_p, temp_p in pairs:
+        if os.path.exists(main_p) and os.path.exists(temp_p):
+            d = pc.input_contract_diff(load(main_p), load(temp_p))
+            assert d == [], f"배포 짝이 입력 계약 불일치로 판정됐다: {main_p} {d}"
+    if all(os.path.exists(pc.PRODUCTION_TARGETS[k]) for k in (6, 12)):
+        d = pc.input_contract_diff(load(pc.PRODUCTION_TARGETS[6]),
+                                   load(pc.PRODUCTION_TARGETS[12]))
+        assert "lead_hours" in d, d
+    return "판정 누락 판별 · 배포 짝 계약 일치 · 리드타임 다른 짝 불일치"
+
+
 # ── ④ 판정선 조회가 모든 체크포인트 형태에서 동작하는가 ──────────
 def _threshold_paths():
     from predict import event_threshold, STATION_EVENT_THRESH_OVERRIDES
@@ -664,6 +693,8 @@ def main():
     check("wind_dir_units", _wind_dir_units)
     print("\n[T3-6] API 호출 폭주 방지(탐침·일일 상한·수치예보 선확인)")
     check("api_budget", _api_budget_guards)
+    print("\n[T3-7] 승격 절차 — 죽은 게이트·입력 계약")
+    check("promotion", _promotion_guards)
     print("\n[T4] 판정선 조회(구버전/신버전 체크포인트)")
     check("event_threshold", _threshold_paths)
     print("\n[T5] 배포 체크포인트 로드·추론")
