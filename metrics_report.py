@@ -138,12 +138,28 @@ def accuracy_block(d, ckpt=None):
     r_w = tp_w / (tp_w + fn_w) if tp_w + fn_w else 0.0
     f1_w = 2 * p_w * r_w / (p_w + r_w) if p_w + r_w else 0.0
     mae_wet = float(np.abs(pp_served[wet_true] - pt[wet_true]).mean())
+    # 판정선과 무관한 확률 품질·과대예보 정도(2026-10-22, NEXT.md 4-1). 발생 F1 은 τ 한 점의
+    # 값이고 F1 최적 τ 는 의도적으로 과대예보한다('F1 최적 판정선 = 최적 F1 / 2' — 현행 τ 가
+    # 그 근처). 그래서 ① Brier 기술점수(검증셋 강수 빈도를 기준 예보로)와 ② 빈도편의(예측
+    # 강수 건수 / 실제 강수 건수, 1 이면 편의 없음)를 함께 낸다. ③ 습윤 시간의 약 30% 가
+    # 0.5mm 미만이라 F1@0.1mm 는 미량 강수에 끌리므로 ≥1mm 기준 F1 도 병기한다.
+    rp = np.asarray(d["rain_prob"], dtype=np.float64)
+    occ_true = pt >= float(d.get("wet_thresh", HIT_PRECIP_THRESH))
+    base = float(occ_true.mean())
+    bs = float(np.mean((rp - occ_true) ** 2))
+    bss = 1.0 - bs / max(base * (1 - base), 1e-12)
+    freq_bias = float(wet_pred.sum() / max(wet_true.sum(), 1))
+    p1, t1 = pp_served >= 1.0, pt >= 1.0
+    tp1 = int((p1 & t1).sum())
+    f1_1mm = 2 * tp1 / max(2 * tp1 + int((p1 & ~t1).sum()) + int((~p1 & t1).sum()), 1)
     base_wet = float(np.abs(pt[wet_true]).mean())
     mae_dry = float(np.abs(pp_served[~wet_true] - pt[~wet_true]).mean())
 
     return {
         "precip_wet_precision": p_w, "precip_wet_recall": r_w,
         "precip_wet_f1": f1_w,
+        "precip_bss": bss, "precip_brier": bs, "precip_freq_bias": freq_bias,
+        "precip_f1_1mm": f1_1mm,
         "precip_mae_wet": mae_wet, "precip_baseline_mae_wet": base_wet,
         "precip_mae_dry": mae_dry,
         "n_wet": int(wet_true.sum()),
@@ -177,6 +193,42 @@ def subset(d, mask):
     n = len(mask)
     return {k: (v[mask] if isinstance(v, np.ndarray) and v.ndim >= 1 and len(v) == n
                 else v) for k, v in d.items()}
+
+
+_LABELS = None
+
+
+def _daily_labels():
+    """관측소·날짜별 공식 특보 라벨(train.WEATHER_ISSUE_LABELS). 한 번만 읽는다."""
+    global _LABELS
+    if _LABELS is None:
+        from train import WEATHER_ISSUE_LABELS
+        try:
+            with open(WEATHER_ISSUE_LABELS, encoding="utf-8") as f:
+                _LABELS = json.load(f)
+        except OSError:
+            _LABELS = {}
+    return _LABELS
+
+
+def _label_on(stns, ts, key, days_back):
+    """각 행의 (관측소, 그 시각 날짜 − days_back) 특보 라벨. 기록이 없는 날(운영기간 밖)은 0."""
+    from datetime import date, timedelta
+    lab = _daily_labels()
+    out = np.zeros(len(stns), dtype=np.int8)
+    for i, (s_, t_) in enumerate(zip(stns, ts)):
+        t_ = str(t_)
+        dd = date(int(t_[:4]), int(t_[4:6]), int(t_[6:8])) - timedelta(days=days_back)
+        out[i] = int((lab.get(str(s_), {}).get(dd.isoformat()) or {}).get(key, 0))
+    return out
+
+
+def _prf(pred, true):
+    tp = int((pred & true).sum()); fp = int((pred & ~true).sum()); fn = int((~pred & true).sum())
+    p = tp / (tp + fp) if tp + fp else 0.0
+    r = tp / (tp + fn) if tp + fn else 0.0
+    return {"precision": p, "recall": r, "f1": 2 * p * r / (p + r) if p + r else 0.0,
+            "n_pos": int(true.sum())}
 
 
 def precision_block(d, ckpt):
@@ -224,10 +276,31 @@ def precision_block(d, ckpt):
         # 임계값이 적용된 표본 수를 함께 남겨 예외의 존재를 드러낸다.
         t_repr = float(max(set(t_served_vec.tolist()),
                            key=lambda v: int((t_served_vec == v).sum())))
+        # 지속 기준선과 착수·지속 분해(2026-10-22, NEXT.md 4-1). 특보 라벨은 며칠씩 이어져
+        # (양성일의 89%(폭염)·71%(한파)가 전날도 양성), **예보 시점에 이미 아는 어제 특보를
+        # 그대로 내는 것**만으로 폭염 F1 이 배포 모델과 같은 수준이다(조사 실측). 그래서
+        # ① 그 지속 기준선을 같은 표본에서 재고, ② 서빙 판정을 '목표일 전날 특보 없음(착수)'·
+        # '있음(지속)' 행으로 나눠 잰다 — 개선이 착수를 맞힌 것인지 지속을 다시 말한 것인지
+        # 가르기 위해서다. 라벨 기록이 없는 날은 특보가 없던 날이다(운영기간 밖).
+        lab_key = {"heatwave": "heatwave_advisory", "coldwave": "coldwave_advisory",
+                   "dust": "dust_observed"}[key]
+        src_m = np.asarray(d["src_ts"])[mask]
+        tgt_m = np.asarray(d["tgt_ts"])[mask]
+        known = _label_on(stns, src_m, lab_key, 1) > 0          # 예보 시점 날짜의 어제
+        prev_tgt = _label_on(stns, tgt_m, lab_key, 1)            # 목표일 전날
+        served_pred = prob_cal >= t_served_vec
+        y_true = label > 0
+        breakdown = {
+            "persistence_baseline": _prf(known, y_true),
+            "onset": _prf(served_pred[prev_tgt == 0], y_true[prev_tgt == 0]),
+            "persist": _prf(served_pred[prev_tgt == 1], y_true[prev_tgt == 1]),
+            "onset_baseline": _prf(known[prev_tgt == 0], y_true[prev_tgt == 0]),
+        }
         out[key] = {
             "ko": ko,
             "n": int(mask.sum()),
             "n_pos": int(label.sum()),
+            "breakdown": breakdown,
             "raw": {"threshold": float(t_raw), **prf(prob, label, t_raw)},
             "served": {"threshold": t_repr,
                        "n_station_overrides": int((t_served_vec != t_repr).sum()),
@@ -289,6 +362,8 @@ def print_report(acc, pre, cal):
           f"{(acc['precip_mae_wet'] / acc['precip_baseline_mae_wet'] - 1) * 100:+.1f}%")
     print(f"    무강수 구간 MAE       모델 {acc['precip_mae_dry']:.4f}mm  vs  "
           f"기준선 0.0000mm  ← 전체 격차의 대부분이 여기서 나온다")
+    print(f"    판정선과 무관한 지표  Brier 기술점수 {acc['precip_bss']:.3f}(기준: 검증셋 강수 빈도) · "
+          f"빈도편의 {acc['precip_freq_bias']:.2f}(1 이면 편의 없음) · F1@1mm {acc['precip_f1_1mm']:.3f}")
 
     print(f"\n{'=' * 78}\n ② 정밀도(precision) — 분류\n{'=' * 78}")
     print(f"  {'사건':<6}{'기준':<8}{'임계값':>8}{'정밀도':>9}{'재현율':>9}{'F1':>9}"
@@ -306,6 +381,16 @@ def print_report(acc, pre, cal):
     if any(m["served"].get("n_station_overrides") for m in pre.values()):
         print("  * 관측소별 판정선 예외가 적용된 표본 수"
               "(predict.STATION_EVENT_THRESH_OVERRIDES)")
+
+    print("\n  지속 기준선(예보 시점에 아는 어제 특보를 그대로)·착수·지속 분해 — 서빙 판정")
+    for key, m in pre.items():
+        b = m.get("breakdown")
+        if not b:
+            continue
+        print(f"  {m['ko']:<6} 모델 F1 {m['served']['f1']:.3f} vs 지속 기준선 "
+              f"{b['persistence_baseline']['f1']:.3f} · 착수 F1 {b['onset']['f1']:.3f}"
+              f"(양성 {b['onset']['n_pos']:,}, 기준선 {b['onset_baseline']['f1']:.3f}) · 지속 F1 "
+              f"{b['persist']['f1']:.3f}(양성 {b['persist']['n_pos']:,})")
 
     print(f"\n{'=' * 78}\n ③ 신뢰도(calibration) — 확률 자체\n{'=' * 78}")
     print(f"  {'사건':<6}{'표본':>10}{'양성률':>9}{'ECE 전':>9}{'ECE 후':>9}"
@@ -592,6 +677,9 @@ def _patch_checkpoint(path: str, acc: dict, pre: dict = None,
     # "게이팅 적용 후 0.588"), 체크포인트에 없어 대조할 방법조차 없었다 —
     # 모델을 교체해도 사람이 기억해 고치지 않으면 옛 값이 그대로 남는다.
     ck["val_precip_wet_f1"] = acc["precip_wet_f1"]
+    ck["val_precip_bss"] = acc["precip_bss"]
+    ck["val_precip_freq_bias"] = acc["precip_freq_bias"]
+    ck["val_precip_f1_1mm"] = acc["precip_f1_1mm"]
     ck["val_precip_wet_precision"] = acc["precip_wet_precision"]
     ck["val_precip_wet_recall"] = acc["precip_wet_recall"]
     if pre:
@@ -600,6 +688,8 @@ def _patch_checkpoint(path: str, acc: dict, pre: dict = None,
         # 가리킨다 — 확률 눈금이 이동한 모델에서는 그 차이가 커진다(수치예보
         # 모델에서 한파 F1 0.209 vs 0.552). 화면이 서빙과 같은 값을 보이도록
         # 별도 키로 남긴다.
+        ck["extreme_metrics_breakdown"] = {k: v["breakdown"] for k, v in pre.items()
+                                           if v.get("breakdown")}
         ck["extreme_metrics_served"] = {
             k: {"threshold": v["served"]["threshold"],
                 "precision": v["served"]["precision"],
@@ -632,6 +722,9 @@ def _patch_checkpoint(path: str, acc: dict, pre: dict = None,
             "precip_wet_f1": acc_e["precip_wet_f1"],
             "precip_mae_wet": acc_e["precip_mae_wet"],
             "precip_mae_served": acc_e["precip_mae_served"],
+            "precip_bss": acc_e["precip_bss"], "precip_freq_bias": acc_e["precip_freq_bias"],
+            "extreme_breakdown": {k: v["breakdown"] for k, v in (pre_e or {}).items()
+                                  if v.get("breakdown")},
             "extreme": {k: {"precision": v["served"]["precision"],
                             "recall": v["served"]["recall"],
                             "f1": v["served"]["f1"], "n_pos": v["n_pos"]}

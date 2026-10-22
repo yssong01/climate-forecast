@@ -2191,6 +2191,12 @@ with tab_perf:
                       f"{ckpt['val_eval_half']['precip_wet_f1']:.3f}). "
                       if (ckpt.get("val_eval_half") or {}).get("precip_wet_f1") is not None
                       else ". ")
+                   + (f"판정선과 무관한 확률 품질은 Brier 기술점수 {ckpt['val_precip_bss']:.3f}"
+                      f"(검증셋 강수 빈도 대비), 판정선에서의 빈도편의는 {ckpt['val_precip_freq_bias']:.2f}"
+                      f"(1 보다 크면 실제보다 자주 '비'라고 한다 — F1 을 최대로 하는 판정선은 원래 "
+                      f"과대예보 쪽에 놓인다)이고, 미량 강수를 뺀 1mm 이상 기준 F1 은 "
+                      f"{ckpt['val_precip_f1_1mm']:.3f}이다. "
+                      if ckpt.get("val_precip_bss") is not None else "")
                    if ckpt.get("val_precip_wet_f1") is not None
                    else "체크포인트에 기록되지 않았다"
                         "(`metrics_report.py --patch-checkpoint` 로 기록한다). ")
@@ -2267,6 +2273,33 @@ with tab_perf:
                 f"{_m['f1']:.3f} |{_half} {_m['n_pos']:,}건 |"
             )
         st.markdown("\n".join(_rows))
+        # 지속 기준선·착수·지속 분해(2026-10-22). 특보는 며칠씩 이어지므로 "예보 시점에 아는
+        # 어제 특보를 그대로 내는" 것만으로 높은 F1 이 나온다 — 그 기준선을 나란히 보이지 않으면
+        # 모델 F1 이 무엇을 맞힌 것인지 읽을 수 없다. 값은 metrics_report.py 가 기록한다.
+        _bd = ckpt.get("extreme_metrics_breakdown") or {}
+        if _bd:
+            _brow = ["| 사건 | 모델 F1 | 지속 기준선 F1 | 착수 F1(기준선) | 지속 F1 |", "|---|---|---|---|---|"]
+            for _k in ("heatwave", "coldwave"):
+                _b, _m = _bd.get(_k), _em.get(_k)
+                if not (_b and _m):
+                    continue
+                _brow.append(
+                    f"| {_label_ko[_k]} | {_m['f1']:.3f} | {_b['persistence_baseline']['f1']:.3f} | "
+                    f"{_b['onset']['f1']:.3f} ({_b['onset_baseline']['f1']:.3f}) · 양성 "
+                    f"{_b['onset']['n_pos']:,}건 | {_b['persist']['f1']:.3f} |")
+            st.markdown("\n".join(_brow))
+            _hb = _bd.get("heatwave") or {}
+            _hm = _em.get("heatwave") or {}
+            _below = (_hb and _hm and _hb["persistence_baseline"]["f1"] > _hm["f1"])
+            st.caption(
+                "**지속 기준선**은 예보 시점에 이미 알려진 '어제 특보'를 그대로 내는 단순 예측이다. "
+                "특보는 며칠씩 이어지므로 이것만으로도 F1 이 높다. **착수**는 목표일 전날 특보가 없던 "
+                "표본(새로 발효되는지 맞히는 문제), **지속**은 전날도 특보였던 표본이다. "
+                + ("**폭염은 모델 F1 이 지속 기준선보다 낮다** — 모델의 가치는 기준선이 거의 못 맞히는 "
+                   "착수(괄호 안이 기준선)에 있고, 이어지는 특보는 기준선이 더 잘 맞힌다. "
+                   if _below else "")
+                + "모델은 특보 기록을 입력으로 쓰지 않는다(관측과 수치예보만)."
+            )
         if _evh:
             st.caption(
                 "'F1' 은 검증셋 전체, 'F1(평가용 절반)' 은 그중 판정선·확률 보정·"
