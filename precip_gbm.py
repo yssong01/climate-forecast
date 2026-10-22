@@ -162,11 +162,11 @@ def check_input_contract(meta, ref, path, label="GBM"):
                 f"다른 표준화 공간에 걸려 값이 조용히 어긋난다: {path}")
 
 
-def add_meta(path, extra):
-    """npz 에 메타 항목을 더해 원자적으로 다시 쓴다(고유 tmp + os.replace)."""
+def add_meta(path, extra, drop=()):
+    """npz 에 메타 항목을 더하거나(`extra`) 지워(`drop`) 원자적으로 다시 쓴다."""
     import tempfile
     with np.load(path, allow_pickle=False) as z:
-        d = {k: z[k] for k in z.files}
+        d = {k: z[k] for k in z.files if k not in drop}
     d.update(extra)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".npz")
     os.close(fd)
@@ -177,6 +177,30 @@ def add_meta(path, extra):
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
+
+
+def resolve_out(out, f, default):
+    """내보내기 경로 — 지정하지 않으면 **특징을 만든 체크포인트의 리드타임**으로 고른다.
+
+    종전 기본값은 리드타임과 무관하게 +6h 배포 경로라, `--checkpoint` 로 +12h
+    특징을 만들고 `--out` 을 빠뜨리면 +12h 모델이 +6h 배포 파일을 덮어썼다
+    (2026-10-21 점검). 로더가 리드타임 불일치로 멈추긴 하지만 그때는 이미
+    배포 파일이 사라진 뒤다.
+    """
+    if out:
+        return out
+    lead = int(f["lead_hours"])
+    return default if lead == 6 else default.replace(".npz", f"_{lead}h.npz")
+
+
+def backup_existing(path):
+    """덮어쓰기 전에 기존 내보내기를 남긴다(1절 3항 — 재학습 전 백업)."""
+    if os.path.exists(path):
+        import shutil
+        import time
+        dst = path.replace(".npz", time.strftime("_before_%Y%m%d_%H%M%S.npz"))
+        shutil.copy2(path, dst)
+        print(f"백업: {dst}")
 
 
 def stamp_norm(path, f, got, want, what):
@@ -248,7 +272,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--report", action="store_true",
                     help="내보낸 모델을 검증셋에서 채점만 한다")
-    ap.add_argument("--out", default=EXPORT_PATH)
+    ap.add_argument("--out", default=None,
+                    help="생략하면 --checkpoint 의 리드타임에 맞는 배포 경로")
     ap.add_argument("--checkpoint", default=None,
                     help="특징을 만들 기준 체크포인트(리드타임을 결정한다). "
                          "생략하면 predict.CHECKPOINT(+6h).")
@@ -262,6 +287,7 @@ def main():
 
     f = (eval_cache.load_features(args.checkpoint) if args.checkpoint
          else eval_cache.load_features())
+    args.out = resolve_out(args.out, f, EXPORT_PATH)
     x_tr, x_va = f["x_train"], f["x_val"]
     p_tr, p_va = f["precip_true_train"], f["precip_true_val"]
     wet = float(f["wet_thresh"])
@@ -353,6 +379,7 @@ def main():
             d[f"meta_{k}"] = f[k]
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    backup_existing(args.out)
     import tempfile
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(args.out), suffix=".npz")
     os.close(fd)

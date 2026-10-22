@@ -225,7 +225,12 @@ CI 구성 재현(10-21 21시)에서 기온이 관측소별 최대 0.5°C 바뀌�
    500행의 모순, README:2169-2171 승격 자동화 서술, `train.py:122,1270`의 없는 `ablation.py`,
    `refresh-data.yml:8,226`·`refresh_deploy_data.py:17-21`의 옛 서술, 7절
    `aerosol_gbm_check.py` 유지 사유(종결로 소멸).
-3. **체크포인트 기록 정리**: `extreme_gbm --patch-checkpoint`가 `prob_calibration`에 신경망
+3. **(2026-10-22 수정) 체크포인트 기록 정리** — 극한기상 보정 헤드에 남은 신경망 계수(a·b·c)와
+   `threshold_calibrated` 를 지우고 `source` 를 적었다(+6h 폭염 a=1.375 는 GBM 의 0.945 와 다른 신경망
+   값이었다). `extreme_gbm --patch-checkpoint` 가 앞으로도 지우고 원자적으로 쓴다. `precip_gbm.npz` 의
+   출처 불명 `meta_conformal_*` 5개 삭제(쓰는 코드 없음 — 예측구간의 원본은 체크포인트). 두 GBM
+   내보내기 기본 경로를 특징 체크포인트의 리드타임으로 고르고, 덮어쓰기 전 백업. `model_id` 불변.
+   종전 진단(기록): `extreme_gbm --patch-checkpoint`가 `prob_calibration`에 신경망
    계수(a·b·c)를 남긴 채 섞는다, `precip_gbm.npz`의 출처 불명 `meta_conformal_*`,
    GBM 내보내기 기본 경로가 리드타임과 무관하게 +6h 배포 경로이고 백업·원자적 쓰기가 없다.
 4. **학습 캐시 풍향 정정**(P0-1의 3) — 다음 재학습 전.

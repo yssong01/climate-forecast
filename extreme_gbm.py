@@ -141,7 +141,8 @@ def _mono_cst(head, nf, temp_cols):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=EXPORT_PATH)
+    ap.add_argument("--out", default=None,
+                    help="생략하면 --checkpoint 의 리드타임에 맞는 배포 경로")
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--patch-checkpoint", action="store_true",
                     help="화면이 이미 읽는 스키마(extreme_metrics_served·"
@@ -158,6 +159,8 @@ def main():
 
     f = (eval_cache.load_features(args.checkpoint) if args.checkpoint
          else eval_cache.load_features())
+    from precip_gbm import resolve_out, backup_existing
+    args.out = resolve_out(args.out, f, EXPORT_PATH)
     x_tr, x_va = f["x_train"], f["x_val"]
     nf = x_va.shape[1]
     half = ((f["tgt_ts_val"].astype(np.int64) // 10 ** 4) % 2 == 0)
@@ -320,6 +323,7 @@ def main():
             out[f"meta_{k}"] = f[k]
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    backup_existing(args.out)
     import tempfile
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(args.out), suffix=".npz")
     os.close(fd)
@@ -358,9 +362,13 @@ def main():
                 "f1_decision": float(m("f1_cal")),
             }
             # 곡선 자체는 GBM 파일에 있고 서빙이 그쪽을 읽는다. 체크포인트의
-            # x/y 는 신경망용이라 지운다 — 남겨 두면 어느 곡선이 쓰이는지
-            # 헷갈린다.
-            h.pop("x", None); h.pop("y", None)
+            # 곡선·계수·보정 공간 판정선은 신경망용이라 지운다 — 남겨 두면 어느
+            # 곡선이 쓰이는지 헷갈린다. 종전에는 x/y 만 지워 베타 계수(a·b·c)와
+            # `threshold_calibrated` 가 신경망 값인 채 GBM 의 method 옆에 남았다
+            # (2026-10-22 확인: +6h 폭염 a=1.375 vs GBM 0.945).
+            for _k in ("x", "y", "a", "b", "c", "threshold_calibrated"):
+                h.pop(_k, None)
+            h["source"] = args.out
         # **화면용 지표(`extreme_metrics*`)는 여기서 쓰지 않는다(2026-09-26).**
         # `metrics_report.py --extreme-gbm --patch-checkpoint` 가 그 키의
         # 단일 소유자다. 두 도구가 각자 쓰면 **나중에 돌린 쪽이 이기고**,
@@ -369,7 +377,16 @@ def main():
         # 여기서는 **모델의 성질**(보정 방법·판정선·곡선)만 적는다.
         ck["prob_calibration"] = cal
         ck["extreme_source"] = args.out
-        torch.save(ck, ck_path)
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(ck_path) or ".", suffix=".pt")
+        os.close(fd)
+        try:
+            torch.save(ck, tmp)
+            os.replace(tmp, ck_path)       # 원자적 — 배포 체크포인트가 잘리지 않는다
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
         print(f"체크포인트에 반영: {ck_path} (extreme_source={args.out})")
         print("  남은 작업: metrics_report.py <체크포인트> --extreme-gbm "
               f"{args.out} --patch-checkpoint — 화면용 지표는 그 도구가 쓴다.")
