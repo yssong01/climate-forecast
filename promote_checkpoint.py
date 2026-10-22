@@ -45,6 +45,12 @@ promote_checkpoint.py — 후보 체크포인트를 배포로 승격하는 절�
 **여전히 사람이 해야 하는 일**은 마지막에 목록으로 출력한다 — README 수치와
 화면 서술은 판단이 필요해 자동화하지 않는다.
 
+**동반 후보(2026-10-22).** 정규화 통계가 바뀌는 재학습(자료 정정·추가)은 그
+통계를 공유하는 기온 모델·두 GBM 을 새 통계로 다시 만들어 함께 넘긴다 —
+`--temp-cand=` · `--precip-gbm-cand=` · `--extreme-gbm-cand=`. 게이트 0 은 함께
+들어갈 파일끼리 대조하고, 게이트는 후보 극한 GBM 으로 재며, 스테이징에서 전부
+후속 처리한 뒤 동반 파일·주 체크포인트 순으로 교체한다(각각 `_before_` 백업).
+
 실행:
   python promote_checkpoint.py ./checkpoints/<후보>.pt            # 점검만
   python promote_checkpoint.py ./checkpoints/<후보>.pt --promote  # 통과 시 승격
@@ -197,6 +203,12 @@ def gbm_contract(path, ck):
     check_input_contract(meta, ck, path)
 
 
+def _npz_meta(path, key):
+    import numpy as np
+    with np.load(path, allow_pickle=False) as z:
+        return float(z[key]) if key in z.files else None
+
+
 def ckpt_metrics(c):
     em = c.get("extreme_metrics") or {}
     return {
@@ -289,6 +301,36 @@ def main():
         print(f"\n배포 구성: 전용 GBM — 극한기상 {_ex_gbm or '없음'} · 강수 {_pr_gbm or '없음'}"
               + (f" · 기온 {_temp_dep}" if _temp_dep else ""))
 
+    # ── 동반 후보(2026-10-22) — 입력 계약이 바뀌는 재학습 ──────────────
+    # 주 체크포인트를 재학습하면 정규화 통계가 바뀌어, 그 표준화 입력을 공유하는
+    # 기온 모델·두 GBM 도 **새 통계로 다시 만든 것과 함께** 들어가야 한다. 종전에는
+    # 게이트 0 이 그런 후보를 막기만 했다(교체할 방법이 없었다). 동반 후보를 주면
+    # 게이트 0 은 **함께 들어갈 파일들끼리** 대조하고, 게이트 1·2 는 후보 극한기상
+    # GBM 으로 재며, 스테이징에서 전부 후속 처리한 뒤 한꺼번에 교체한다.
+    def _opt(name):
+        return next((a.split("=", 1)[1] for a in sys.argv[1:]
+                     if a.startswith(f"--{name}=")), None)
+    comp = {"temp": _opt("temp-cand"), "precip": _opt("precip-gbm-cand"),
+            "extreme": _opt("extreme-gbm-cand")}
+    _final = {"temp": _temp_dep, "precip": _pr_gbm, "extreme": _ex_gbm}
+    for _k, _p in comp.items():
+        if not _p:
+            continue
+        if _temp_only or not _gbm_mode:
+            print("동반 후보는 전용 GBM 구성의 주 체크포인트 승격에서만 쓴다.")
+            sys.exit(2)
+        if not os.path.exists(_p):
+            print(f"동반 후보 파일이 없다: {_p}")
+            sys.exit(2)
+        if not _final[_k]:
+            print(f"동반 후보({_k})가 교체할 배포 파일이 이 구성에 없다.")
+            sys.exit(2)
+    _temp_use = comp["temp"] or _temp_dep
+    _pr_use = comp["precip"] or _pr_gbm
+    _ex_use = comp["extreme"] or _ex_gbm
+    if any(comp.values()):
+        print("동반 후보: " + " · ".join(f"{k} {p} → {_final[k]}" for k, p in comp.items() if p))
+
     # ── 게이트 0 — 입력 계약 ─────────────────────────────────────
     print(f"\n{'='*78}\n▶ 게이트 0 — 입력 계약(같은 표준화 입력을 공유하는 모델)\n{'='*78}")
     if _temp_only:
@@ -296,13 +338,14 @@ def main():
         _diff = input_contract_diff(load_ckpt(_main), cand_ck)
         _who = f"주 체크포인트 {_main}"
     else:
-        _shared = [p for p in (_temp_dep, _ex_gbm, _pr_gbm) if p]
-        _diff = (input_contract_diff(deployed, cand_ck)
-                 if (_shared and deployed is not None) else [])
-        # GBM 은 **자기 파일에 적힌 학습 시 통계**와 직접 대조한다(2026-10-22).
-        # 배포본을 거쳐 비교하면 배포본 자신이 이미 GBM 과 어긋나 있을 때
-        # 후보도 같은 통계라는 이유로 통과한다.
-        for _p, _lab in ((_pr_gbm, "강수 GBM"), (_ex_gbm, "극한기상 GBM")):
+        # **함께 쓰일 파일과 직접** 대조한다(2026-10-22) — 기온 모델은 그 체크포인트,
+        # GBM 은 자기 파일에 적힌 학습 시 통계. 배포본을 거쳐 비교하면 배포본 자신이
+        # 이미 어긋나 있을 때 후보도 같은 통계라는 이유로 통과하고, 동반 후보로
+        # 함께 교체할 때는 나가는 배포본이 기준이 될 수 없다.
+        _shared = [p for p in (_temp_use, _ex_use, _pr_use) if p]
+        _diff = ([f"기온 모델 {k}" for k in input_contract_diff(load_ckpt(_temp_use), cand_ck)]
+                 if _temp_use else [])
+        for _p, _lab in ((_pr_use, "강수 GBM"), (_ex_use, "극한기상 GBM")):
             if _p:
                 try:
                     gbm_contract(_p, cand_ck)
@@ -312,8 +355,9 @@ def main():
     if _diff:
         failures.append(
             f"입력 계약 불일치({', '.join(_diff)}) — {_who} 와 표준화 입력이 달라진다. "
-            f"그 모델들을 이 통계로 다시 만들어야 하며, 이 절차는 그 재구축을 하지 않는다 "
-            f"(GBM 은 조용히 어긋나고, 기온 모델은 서빙 시작 시 멈춘다)")
+            f"그 모델들을 이 통계로 다시 만들어 동반 후보(--temp-cand·--precip-gbm-cand·"
+            f"--extreme-gbm-cand)로 함께 넘겨야 한다(GBM 은 조용히 어긋나고, 기온 모델은 "
+            f"서빙 시작 시 멈춘다)")
         gate_records["input_contract"] = {"verdict": "FAIL", "detail": ",".join(_diff)}
         print(f"  ★FAIL★ {', '.join(_diff)} 가 다르다 — 나머지 게이트를 돌리지 않는다.")
     else:
@@ -325,7 +369,7 @@ def main():
     # (2026-09-26). 신경망 헤드는 배포에서 쓰이지 않으므로, 그것을
     # 검사하는 게이트는 배포와 무관한 것을 재고 통과시킨다 — 절차가
     # 아무것도 지키지 못하는 상태가 된다.
-    _gopt = ([f"--extreme-gbm={_ex_gbm}"] if _ex_gbm else [])
+    _gopt = ([f"--extreme-gbm={_ex_use}"] if _ex_use else [])
     if failures:
         pass                                    # 입력 계약이 깨지면 더 재지 않는다
     elif _temp_only:
@@ -335,8 +379,9 @@ def main():
               "  건드리지 않으므로 계절 오탐·단조성·관측소 사각지대 판정은 정의상\n"
               "  불변이다. 회귀 성능 게이트는 그대로 적용한다.")
     else:
-        if _ex_gbm:
-            print(f"\n극한기상 게이트 대상: {_ex_gbm} (서빙과 동일)")
+        if _ex_use:
+            print(f"\n극한기상 게이트 대상: {_ex_use} "
+                  + ("(동반 후보 — 승격되면 서빙이 쓴다)" if comp["extreme"] else "(서빙과 동일)"))
         run_gate(["seasonal_falsealarm_check.py", cand] + _gopt,
                  "게이트 1 — 계절 오탐", ["seasonal_false_alarm"])
         for head in ("coldwave", "heatwave"):
@@ -405,8 +450,34 @@ def main():
                 ("heat_f1", "폭염 F1", False), ("cold_f1", "한파 F1", False))
         if _temp_only:
             rows = rows[:1]     # 기온 전용 후보가 서빙에 내는 것은 기온뿐이다
+        # 동반 후보가 있는 출력은 그 모델끼리 저장된 값을 비교한다 — 같은 검증
+        # 표본에서 각자 학습 시점에 잰 값이다(기온: 검증셋 MAE, GBM: 평가용 절반).
+        _cmp = {}
+        if comp["temp"]:
+            _cmp["temp"] = (load_ckpt(_temp_dep).get("val_temp_mae"),
+                            load_ckpt(comp["temp"]).get("val_temp_mae"), "기온 모델 검증 MAE")
+        if comp["precip"]:
+            _cmp["precip"] = (_npz_meta(_pr_gbm, "meta_val_precip_wet_f1"),
+                              _npz_meta(comp["precip"], "meta_val_precip_wet_f1"),
+                              "강수 GBM 발생 F1(평가용 절반)")
+        if comp["extreme"]:
+            for _k, _h in (("heat_f1", "heatwave"), ("cold_f1", "coldwave")):
+                _cmp[_k] = (_npz_meta(_ex_gbm, f"meta_{_h}_f1_cal"),
+                            _npz_meta(comp["extreme"], f"meta_{_h}_f1_cal"),
+                            f"극한 GBM {_h} F1(평가용 절반)")
         print(f"  {'지표':<12}{'현행':>12}{'후보':>12}   판정")
         for key, label, lower_better in rows:
+            if key in _cmp:
+                a, b, what = _cmp[key]
+                worse = ((b > a * (1 + REGRESSION_TOL)) if key == "temp"
+                         else (b < a * (1 - REGRESSION_TOL)))
+                if worse:
+                    warnings.append(f"{what} 악화: {a:.4f} → {b:.4f}")
+                # 라벨은 실제로 비교한 지표로 적는다 — 동반 후보 행은 MAE 자리에
+                # F1 이 들어가기도 한다(강수 GBM 은 발생 F1 로 비교한다).
+                print(f"  {what:<28}{a:>10.4f}{b:>10.4f}   {'★악화★' if worse else 'OK'}"
+                      f"  (동반 후보)")
+                continue
             if key in served_by:
                 print(f"  {label:<12}{'—':>12}{'—':>12}   서빙은 {served_by[key]} 가 낸다"
                       f"(입력 계약 동일 → 출력 불변)")
@@ -455,6 +526,8 @@ def main():
     # (위 PRODUCTION_CHECKPOINT 주석 참고).
     os.environ.pop("CHECKPOINT_PATH", None)
 
+    comp_staging = {}
+
     def chain(cmd, title):
         out, code = run(cmd, title)
         if code != 0:
@@ -470,9 +543,10 @@ def main():
             st["extreme_source"] = _ex_gbm
             # 판정선·보정 방법·곡선 메타는 GBM 의 것이다(extreme_gbm
             # --patch-checkpoint 가 적었다). 후보 자신의 값은 신경망 헤드용이다.
-            if deployed.get("prob_calibration") is not None:
+            # 극한 GBM 동반 후보가 있으면 아래에서 그 파일로 다시 적는다.
+            if deployed.get("prob_calibration") is not None and not comp["extreme"]:
                 st["prob_calibration"] = deployed["prob_calibration"]
-            carried += ["extreme_source", "prob_calibration"]
+            carried += ["extreme_source"] + ([] if comp["extreme"] else ["prob_calibration"])
         if _pr_gbm:
             st["precip_source"] = _pr_gbm
             carried.append("precip_source")
@@ -492,16 +566,46 @@ def main():
         elif _gbm_mode:
             print("\n(확률 보정 재적합은 하지 않는다 — prob_calibration 을 신경망 값으로\n"
                   " 통째로 바꿔 GBM 판정선을 지운다. GBM 의 보정은 모델 파일에 있다.)")
+            # 동반 후보를 배포 경로 옆 스테이징 이름으로 복사한다 — 교체는 같은
+            # 디렉터리 안의 os.replace 로 한다.
+            for _k, _p in comp.items():
+                if _p:
+                    _ext = os.path.splitext(_final[_k])[1]
+                    comp_staging[_k] = _final[_k].replace(_ext, f"_staging_{stamp}{_ext}")
+                    shutil.copy2(_p, comp_staging[_k])
+            if comp["extreme"]:
+                chain(["extreme_gbm.py", "--patch-only", comp_staging["extreme"],
+                       "--checkpoint", staging, "--out", _ex_gbm],
+                      "극한기상 GBM 성질 기록(동반 후보)")
+            _temp_for_mr = _temp_dep
+            if comp["temp"]:
+                chain(["conformal_interval_fit.py", comp_staging["temp"], "--apply"],
+                      "기온 모델 예측구간 재적합(동반 후보)")
+                chain(["metrics_report.py", comp_staging["temp"], "--patch-checkpoint",
+                       "--no-plot"], "기온 모델 지표 기록(동반 후보)")
+                _temp_for_mr = comp_staging["temp"]
+            _pr_stage = comp_staging.get("precip") or _pr_gbm
+            _ex_stage = comp_staging.get("extreme") or _ex_gbm
             chain(["conformal_interval_fit.py", staging, "--apply"]
-                  + ([f"--precip-gbm={_pr_gbm}"] if _pr_gbm else []), "예측구간 재적합")
+                  + ([f"--precip-gbm={_pr_stage}"] if _pr_stage else []), "예측구간 재적합")
             _mr = ["metrics_report.py", staging, "--patch-checkpoint", "--no-plot"]
-            if _pr_gbm:
-                _mr += ["--precip-gbm", _pr_gbm]
-            if _ex_gbm:
-                _mr += ["--extreme-gbm", _ex_gbm]
-            if _temp_dep:
-                _mr += ["--temp-checkpoint", _temp_dep]
+            if _pr_stage:
+                _mr += ["--precip-gbm", _pr_stage]
+            if _ex_stage:
+                _mr += ["--extreme-gbm", _ex_stage]
+            if _temp_for_mr:
+                _mr += ["--temp-checkpoint", _temp_for_mr]
             chain(_mr, "화면용 지표 기록(서빙 구성)")
+            # 후속 단계가 **읽은 경로**(스테이징 이름)를 출처로 적었다 — 배포 경로로
+            # 바꿔 적는다. 서빙이 이 기록과 실제 로드 경로를 대조하므로(predict.
+            # _check_source) 그대로 두면 교체 직후 화면이 멈춘다.
+            if comp["precip"]:
+                st = load_ckpt(staging)
+                st["precip_source"] = _pr_gbm
+                if st.get("conformal_interval"):
+                    st["conformal_interval"]["precip_source"] = _pr_gbm
+                save_ckpt_atomic(st, staging)
+                print(f"출처 경로 정정: {comp_staging['precip']} → {_pr_gbm}")
         else:
             chain(["probability_calibration_fit.py", staging, "--apply"], "확률 보정 재적합")
             # 정합적 예측구간도 반드시 다시 적합한다(2026-09-07 추가). 빠뜨리면
@@ -513,13 +617,23 @@ def main():
                 _mr += ["--temp-checkpoint", _temp_dep]
             chain(_mr, "화면용 지표 기록(서빙 MAE·극한기상 서빙 판정선 기준)")
     except BaseException as e:                       # noqa: BLE001
-        if os.path.exists(staging):
-            os.remove(staging)
+        for _p in [staging] + list(comp_staging.values()):
+            if os.path.exists(_p):
+                os.remove(_p)
         print(f"\n★후속 처리 실패★ {type(e).__name__}: {e}")
         print(f"배포 경로는 그대로다({CHECKPOINT}). 스테이징 파일은 지웠다.")
         sys.exit(1)
 
     # ── 교체 ──────────────────────────────────────────────────────
+    # 동반 후보부터 바꾸고 주 체크포인트를 마지막에 바꾼다. 어느 순서든 교체
+    # 사이의 짧은 순간에는 짝이 어긋나지만, 서빙은 그때 조용히 틀리지 않고
+    # 계약 대조(load_* · _check_source)로 멈췄다가 다음 재실행에서 맞춰진다.
+    for _k, _sp in comp_staging.items():
+        _ext = os.path.splitext(_final[_k])[1]
+        _bk = _final[_k].replace(_ext, f"_before_{stamp}{_ext}")
+        shutil.copy2(_final[_k], _bk)
+        os.replace(_sp, _final[_k])
+        print(f"동반 교체: {_final[_k]} (백업 {_bk})")
     if os.path.exists(CHECKPOINT):
         backup = CHECKPOINT.replace(".pt", f"_before_{stamp}.pt")
         shutil.copy2(CHECKPOINT, backup)
@@ -529,12 +643,13 @@ def main():
     # 후속 단계가 스테이징 파일 이름으로 남긴 부산물을 지운다 — 예측구간
     # 재적합의 자체 백업(`*_before_conformal.pt`)과 비배포 경로용 지표 JSON.
     # 교체가 끝났으므로 원본은 위 현행 백업이 보존한다.
-    _stem = os.path.splitext(os.path.basename(staging))[0]
     import glob
-    for _p in (glob.glob(os.path.join(os.path.dirname(staging) or ".", f"{_stem}_before_*.pt"))
-               + glob.glob(f"./cache/metrics_report_{_stem}.json")):
-        os.remove(_p)
-        print(f"  부산물 정리: {_p}")
+    for _sp in [staging] + ([comp_staging["temp"]] if "temp" in comp_staging else []):
+        _stem = os.path.splitext(os.path.basename(_sp))[0]
+        for _p in (glob.glob(os.path.join(os.path.dirname(_sp) or ".", f"{_stem}_before_*.pt"))
+                   + glob.glob(f"./cache/metrics_report_{_stem}.json")):
+            os.remove(_p)
+            print(f"  부산물 정리: {_p}")
 
     # ── 그림 — 교체 뒤, +6h 배포본 기준으로만 ──────────────────────
     # 화면에 쓰이는 그림(docs/images/*.png)은 **+6h 배포본 기준의 공용

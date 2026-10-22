@@ -139,6 +139,65 @@ def _mono_cst(head, nf, temp_cols):
     return cst
 
 
+
+def patch_checkpoint(ck_path, meta, record_as):
+    """체크포인트에 이 모델의 **성질**(보정 방법·판정선·보정 품질)과 출처를 적는다.
+
+    **화면 코드를 고치지 않는다.** 화면은 이미 `prob_calibration.heads[*]` 를
+    읽으므로, 그 스키마에 이 모델의 값을 그대로 적으면 표·캡션·판정선이 자동으로
+    따라온다. 출처는 `extreme_source` 로 남긴다(강수의 `precip_source` 와 같은
+    취지) — 표시가 없으면 어느 모델의 수치인지 알 수 없다. `meta` 는 내보내기
+    직후의 dict 이든 `load()` 가 돌려준 메타이든 같다(`meta_<head>_*` 키).
+    `record_as` 는 **배포될 경로**다 — 승격 스테이징에서는 읽은 파일(후보)과
+    적을 경로(배포)가 다르다(promote_checkpoint `--extreme-gbm-cand`).
+
+    **화면용 지표(`extreme_metrics*`)는 여기서 쓰지 않는다(2026-09-26).**
+    `metrics_report.py --extreme-gbm --patch-checkpoint` 가 그 키의 단일 소유자다.
+    두 도구가 각자 쓰면 나중에 돌린 쪽이 이기고, 표본이 달라 값이 흔들린다
+    (실측: 폭염 F1 0.8345(평가용 절반) vs 0.8367(공식 라벨 전체)).
+    """
+    import tempfile
+    import torch
+    ck = torch.load(ck_path, map_location="cpu", weights_only=True)
+    cal = ck.get("prob_calibration") or {"heads": {}}
+    cal.setdefault("heads", {})
+    for head in HEADS:
+        m = lambda k: meta[f"meta_{head}_{k}"]
+        h = cal["heads"].setdefault(head, {})
+        h["method"] = str(m("cal_method"))
+        h["threshold_decision"] = float(m("tau_cal"))
+        h["threshold_raw"] = float(m("tau"))
+        h["threshold_repicked"] = True
+        h["eval_metrics"] = {
+            "n_eval": int(m("n")),
+            "ece_before": float(m("ece")), "ece_after": float(m("ece_cal")),
+            "mce_after": float(m("mce_cal")),
+            "f1_raw": float(m("f1")), "f1_calibrated": float(m("f1")),
+            "f1_decision": float(m("f1_cal")),
+        }
+        # 곡선 자체는 GBM 파일에 있고 서빙이 그쪽을 읽는다. 체크포인트의
+        # 곡선·계수·보정 공간 판정선은 신경망용이라 지운다 — 남겨 두면 어느
+        # 곡선이 쓰이는지 헷갈린다. 종전에는 x/y 만 지워 베타 계수(a·b·c)와
+        # `threshold_calibrated` 가 신경망 값인 채 GBM 의 method 옆에 남았다
+        # (2026-10-22 확인: +6h 폭염 a=1.375 vs GBM 0.945).
+        for _k in ("x", "y", "a", "b", "c", "threshold_calibrated"):
+            h.pop(_k, None)
+        h["source"] = record_as
+    ck["prob_calibration"] = cal
+    ck["extreme_source"] = record_as
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(ck_path) or ".", suffix=".pt")
+    os.close(fd)
+    try:
+        torch.save(ck, tmp)
+        os.replace(tmp, ck_path)       # 원자적 — 배포 체크포인트가 잘리지 않는다
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    print(f"체크포인트에 반영: {ck_path} (extreme_source={record_as})")
+    print("  남은 작업: metrics_report.py <체크포인트> --extreme-gbm "
+          f"{record_as} --patch-checkpoint — 화면용 지표는 그 도구가 쓴다.")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=None,
@@ -147,10 +206,26 @@ def main():
     ap.add_argument("--patch-checkpoint", action="store_true",
                     help="화면이 이미 읽는 스키마(extreme_metrics_served·"
                          "prob_calibration.heads)에 이 모델의 값을 적어 넣는다.")
+    ap.add_argument("--patch-only", default=None, metavar="NPZ",
+                    help="학습하지 않고, 이미 내보낸 NPZ 의 성질을 --checkpoint 에 적는다. "
+                         "출처로는 --out(배포 경로)을 기록한다 — 승격 스테이징용")
     ap.add_argument("--stamp-norm", action="store_true",
                     help="기존 내보내기(--out)에 학습 시 정규화 통계를 소급 기록한다 — "
                          "저장된 헤드별 평가 F1 이 전부 재현될 때만")
     args = ap.parse_args()
+
+    if args.patch_only:
+        if not (args.checkpoint and args.out):
+            raise SystemExit("--patch-only 에는 --checkpoint(적을 대상)와 --out(기록할 배포 경로)이 필요하다")
+        models, meta = load(args.patch_only)
+        if not models:
+            raise SystemExit(f"극한기상 GBM 이 없다: {args.patch_only}")
+        import torch
+        from precip_gbm import check_input_contract
+        check_input_contract(meta, torch.load(args.checkpoint, map_location="cpu",
+                                              weights_only=True), args.patch_only, "극한기상 GBM")
+        patch_checkpoint(args.checkpoint, meta, args.out)
+        return 0
 
     import eval_cache
     from baseline_suite import honest_f1, max_f1, f1_at
@@ -332,64 +407,8 @@ def main():
     print(f"\n저장: {args.out} ({os.path.getsize(args.out)/1e6:.1f}MB)")
 
     if args.patch_checkpoint:
-        # **화면 코드를 고치지 않는다.** 화면은 이미 `extreme_metrics_served`
-        # 와 `prob_calibration.heads[*]` 를 읽으므로, 그 스키마에 이 모델의
-        # 값을 그대로 적으면 표·캡션·판정선이 자동으로 따라온다. 출처는
-        # `extreme_source` 로 남긴다(강수의 `precip_source` 와 같은 취지) —
-        # 표시가 없으면 어느 모델의 수치인지 알 수 없다.
-        import torch
-        ck_path = args.checkpoint or "./checkpoints/numerical_trichef.pt"
-        ck = torch.load(ck_path, map_location="cpu", weights_only=True)
-        served, cal = {}, (ck.get("prob_calibration") or {"heads": {}})
-        cal.setdefault("heads", {})
-        for head in HEADS:
-            m = lambda k: out[f"meta_{head}_{k}"]
-            served[head] = {
-                "threshold": float(m("tau_cal")), "precision": float(m("precision")),
-                "recall": float(m("recall")), "f1": float(m("f1_cal")),
-                "n_pos": int(m("n_pos")), "n": int(m("n")),
-            }
-            h = cal["heads"].setdefault(head, {})
-            h["method"] = str(m("cal_method"))
-            h["threshold_decision"] = float(m("tau_cal"))
-            h["threshold_raw"] = float(m("tau"))
-            h["threshold_repicked"] = True
-            h["eval_metrics"] = {
-                "n_eval": int(m("n")),
-                "ece_before": float(m("ece")), "ece_after": float(m("ece_cal")),
-                "mce_after": float(m("mce_cal")),
-                "f1_raw": float(m("f1")), "f1_calibrated": float(m("f1")),
-                "f1_decision": float(m("f1_cal")),
-            }
-            # 곡선 자체는 GBM 파일에 있고 서빙이 그쪽을 읽는다. 체크포인트의
-            # 곡선·계수·보정 공간 판정선은 신경망용이라 지운다 — 남겨 두면 어느
-            # 곡선이 쓰이는지 헷갈린다. 종전에는 x/y 만 지워 베타 계수(a·b·c)와
-            # `threshold_calibrated` 가 신경망 값인 채 GBM 의 method 옆에 남았다
-            # (2026-10-22 확인: +6h 폭염 a=1.375 vs GBM 0.945).
-            for _k in ("x", "y", "a", "b", "c", "threshold_calibrated"):
-                h.pop(_k, None)
-            h["source"] = args.out
-        # **화면용 지표(`extreme_metrics*`)는 여기서 쓰지 않는다(2026-09-26).**
-        # `metrics_report.py --extreme-gbm --patch-checkpoint` 가 그 키의
-        # 단일 소유자다. 두 도구가 각자 쓰면 **나중에 돌린 쪽이 이기고**,
-        # 표본이 달라 값이 흔들린다(실측: 폭염 F1 0.8345(평가용 절반) vs
-        # 0.8367(공식 라벨 전체) — 실행 순서에 따라 화면 값이 바뀌었다).
-        # 여기서는 **모델의 성질**(보정 방법·판정선·곡선)만 적는다.
-        ck["prob_calibration"] = cal
-        ck["extreme_source"] = args.out
-        import tempfile
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(ck_path) or ".", suffix=".pt")
-        os.close(fd)
-        try:
-            torch.save(ck, tmp)
-            os.replace(tmp, ck_path)       # 원자적 — 배포 체크포인트가 잘리지 않는다
-        except BaseException:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            raise
-        print(f"체크포인트에 반영: {ck_path} (extreme_source={args.out})")
-        print("  남은 작업: metrics_report.py <체크포인트> --extreme-gbm "
-              f"{args.out} --patch-checkpoint — 화면용 지표는 그 도구가 쓴다.")
+        patch_checkpoint(args.checkpoint or "./checkpoints/numerical_trichef.pt",
+                         out, args.out)
     return 0
 
 
