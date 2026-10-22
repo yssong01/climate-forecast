@@ -256,14 +256,29 @@ CI 구성 재현(10-21 21시)에서 기온이 관측소별 최대 0.5°C 바뀌�
    12곳·실패 0), `[T3-8]` GBM 정규화·출처 결속. 종전 목록(기록): `refresh_deploy_data` 임포트, `record_online_forecasts` 소형 종단 시험,
    `_freshness_gate`·`_plan_targets`·`trim` 단위 시험, GBM 연기 시험(극한 GBM 두 파일·
    보정 3종·+12h 짝·정규화 결속).
-3. **동시성·성능**: 공유 모델의 `_last_*` 상태 경쟁(`predict.py:672-716`), `NumpyGBM.raw`의
+3. **(2026-10-22 수정) 동시성·성능** — ① 공유 모델의 forward 와 상태 읽기(`_last_*`·게이트)를
+   `_FORWARD_LOCK` 한 잠금 안에서. ② `NumpyGBM` 추론: 행이 적으면 모든 트리를 동시에 내려가고(서빙
+   1건 44→2.0ms), 많으면 종전 트리별 경로(20만 행 7초 — 트리 동시는 18초라 더 느렸다). 두 경로 모두
+   더하는 순서가 같아 **비트 단위로 동일**(10개 모델 × 검증셋 20만 행 확인, 연기 시험 대조). ③ CI 기록이
+   보조 모델을 한 번만 읽는다. ④ 보정 곡선 적용을 `calibration_math.py`(numpy 만)로 옮겨 서빙이
+   학습 파이프라인을 임포트하지 않는다. ⑤ `eval_cache` 를 체크포인트별 파일로(`cache_path_for`), 읽은
+   내용으로 서명을 대조해 확인-읽기 사이 경쟁을 없애고, 라벨 파일을 서명에 넣었다. `phase_gate_probe`
+   가 서명 없이 공유 파일을 직접 읽던 것도 고쳤다. 옛 공유 캐시는 `삭제예정/dead_cache/`.
+   종전 목록(기록): 공유 모델의 `_last_*` 상태 경쟁(`predict.py:672-716`), `NumpyGBM.raw`의
    트리별 파이썬 루프, CI가 `predict()`마다 GBM·기온 모델을 다시 읽는 것, `extreme_gbm`이
    서빙 중 진단 모듈(`probability_calibration_fit`)을 임포트하는 것(공유 모듈로 이동),
    `eval_cache` 단일 파일 경쟁과 라벨 파일이 서명에서 빠진 것.
-4. **운영 정리**: Actions 버전 상향·`runs-on` 고정(Node 20 폐기·Ubuntu 26 전환 공지),
+4. **(2026-10-22 수정) 운영 정리** — checkout·setup-python v7(Node 24), `runs-on: ubuntu-24.04` 고정,
+   `collect_year` 의 시그널 처리기를 직접 실행할 때만 설치(임포트한 프로세스의 Ctrl+C·종료 신호를
+   삼켰다), `record_online_forecasts` 예외 출력에 `redact_secrets`·"이미 기록" 건수 분리(정시 외 실행의
+   신규 0건이 정상임을 드러냄), `data` 브랜치 `aerosol_snapshots.json` 제거(git 이력·로컬 사본 보존).
+   종전 목록(기록): Actions 버전 상향·`runs-on` 고정(Node 20 폐기·Ubuntu 26 전환 공지),
    `collect_year.py` 임포트 시 시그널 처리기 설치, `record_online_forecasts`의 거짓 경보
    (정시 외 실행은 항상 0건)와 `{e}` 직접 출력, `data` 브랜치의 `aerosol_snapshots.json`.
-5. **사용자 확인 필요**: Cloudflare 트리거가 10-12~10-17 동안 15분마다 **두 번** 실행했고
+5. **(2026-10-22 확인) Cloudflare 트리거** — 사용자 대시보드 확인 후 실행 이력 대조: 10-18~21 하루 정확히
+   96회, 2분 안의 중복 쌍 0, 시작 분 :01/:16/:31/:46 각 24회(`*/15` 발화 후 약 1분 지연으로 보인다).
+   10-12~17 의 이중 실행은 사라졌다. GitHub `schedule` 안전망은 하루 5~7회뿐이라 문서에 적었다.
+   종전 기록: Cloudflare 트리거가 10-12~10-17 동안 15분마다 **두 번** 실행했고
    (취소 315회) 지금은 :01/:16/:31/:46에 온다 — `wrangler.toml`의 `*/15`와 다르다. 대시보드에
    두 번째 워커나 크론이 있는지 확인. GitHub `schedule` 안전망은 실측 4~5시간 간격이라
    문서의 "55분"보다 훨씬 성기다.

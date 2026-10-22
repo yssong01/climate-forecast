@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -30,6 +31,9 @@ from island_collector import encode_live as island_encode_live
 from nwp_collector import load_for_serving as _load_nwp_for_serving
 from pipeline_model import TriCHEFPipeline
 from train import record_to_vec, STATION_NAMES
+
+# 공유 모델의 forward + 상태 읽기를 묶는 잠금(predict() 안 주석 참고).
+_FORWARD_LOCK = threading.Lock()
 
 # 환경변수로 뺀다(2026-08-18 수정, train.py의 CHECKPOINT_PATH 패턴과 통일).
 #
@@ -719,8 +723,14 @@ def predict(stn: str = "108",
                          dtype=torch.float32).unsqueeze(0).to(device)
     x_txt = torch.tensor(txt_vec, dtype=torch.float32).unsqueeze(0).to(device)
 
-    with torch.no_grad():
+    # forward 와 그 직후의 상태 읽기(`_last_*` 로짓·게이트)를 **한 잠금 안에서**
+    # 한다(2026-10-22). 모델은 Streamlit 세션이 공유하는 캐시 객체라, 다른 세션의
+    # forward 가 그 사이에 끼면 이 세션의 극한기상 확률·축 배분이 남의 입력으로
+    # 계산된 값이 된다. 모델이 작아 잠금 비용은 무시할 만하다.
+    with _FORWARD_LOCK, torch.no_grad():
         pred = model(num_x=x_num, img_x=x_img, txt_x=x_txt)
+        extreme = model.extreme_event_probs()
+        gate = model.axis_weights()   # dynamic_gate=False 면 {"alpha":..,"phi":..}
 
     temp_pred   = pred[0, 0].item()
     precip_pred = max(0.0, pred[0, 1].item())
@@ -734,9 +744,8 @@ def predict(stn: str = "108",
                                    txt_x=x_txt)[0, 0].item()
         temp_source_ckpt = temp_ckpt
 
-    # Phase 3-8/3-9 극한기상 확률 — 구버전 체크포인트(헤드 추가 전)는
-    # extreme_event_probs() 가 전부 None 을 반환하므로 결과에서 빠진다.
-    extreme = model.extreme_event_probs()
+    # Phase 3-8/3-9 극한기상 확률(`extreme`) — 위 잠금 안에서 읽었다. 구버전
+    # 체크포인트(헤드 추가 전)는 전부 None 이라 결과에서 빠진다.
 
     # 강수 후처리 게이팅 — rain_prob 이 있으면(head_rain 도입 이후 체크포인트)
     # 그 확률 공간에서 자르고, 없으면(구버전) 매그니튜드로 폴백한다. rain_prob
@@ -765,8 +774,6 @@ def predict(stn: str = "108",
         rain_prob = None
         if precip_pred < PRECIP_CLIP_THRESH:
             precip_pred = 0.0
-
-    gate = model.axis_weights()   # dynamic_gate=False 면 {"alpha":..,"phi":..}
 
     # 확률 보정을 여기서 적용한다 — 호출자(app.py·CLI)가 받는 값이 곧 화면에
     # 나가므로, 보정되지 않은 값이 밖으로 새어 나가지 않게 한 곳에서 처리한다.

@@ -103,9 +103,9 @@ def fit_isotonic(probs, labels, n_knots=N_KNOTS):
     return xs, ys_iso
 
 
-def apply_calibration(probs, xs, ys):
-    """조회표를 선형보간으로 적용. 양 끝은 끝값으로 고정된다(np.interp 기본)."""
-    return np.interp(probs, xs, ys)
+# 적용 함수는 서빙과 공유하는 calibration_math 에 있다(2026-10-22) — 이 모듈은
+# 학습 파이프라인을 임포트하므로 서빙이 직접 부르면 안 된다. 이름은 그대로 내보낸다.
+from calibration_math import apply_calibration, apply_beta  # noqa: E402,F401
 
 
 def fit_beta(probs, labels, eps=1e-6, max_iter=100):
@@ -137,10 +137,6 @@ def fit_beta(probs, labels, eps=1e-6, max_iter=100):
     return float(beta[0]), float(beta[1]), float(beta[2])
 
 
-def apply_beta(probs, a, b, c, eps=1e-6):
-    p = np.clip(probs, eps, 1 - eps)
-    z = a * np.log(p) - b * np.log(1 - p) + c
-    return 1.0 / (1.0 + np.exp(-z))
 
 
 def ece(probs, labels, n_bins=10):

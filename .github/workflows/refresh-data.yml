@@ -44,7 +44,9 @@ name: Refresh deploy data
 #
 # ── 15분 주기는 누가 실제로 지키는가(2026-08-20) ──────────────────────
 #
-# 아래 `schedule:` 은 55분 간격의 안전망일 뿐이다. 실제 15분 주기는
+# 아래 `schedule:` 은 55분 간격의 안전망일 뿐이다 — 그마저 실측으로는 하루
+# 5~7회만 실행된다(2026-10-18~21, 설정대로면 24회). 15분 주기는 전적으로
+# Cloudflare 트리거가 지킨다(같은 기간 하루 정확히 96회·중복 0·:01/:16/:31/:46). 실제 15분 주기는
 # 저장소 루트의 cloudflare-worker/ 가 Cron Trigger 로 이 워크플로의
 # workflow_dispatch 를 호출해서 만든다 — GitHub Actions 자체의
 # `schedule` 이벤트는 15분처럼 짧은 주기를 지키지 못하는 것으로
@@ -86,7 +88,10 @@ concurrency:
 
 jobs:
   refresh:
-    runs-on: ubuntu-latest
+    # 러너 이미지를 고정한다(2026-10-22). `ubuntu-latest` 는 예고 후 다음 LTS 로
+    # 바뀌고, 그때 시스템 파이썬·도구가 함께 바뀐다. 액션도 Node 24 기반
+    # (checkout·setup-python v7)으로 올렸다 — Node 20 액션은 폐기 예정이다.
+    runs-on: ubuntu-24.04
     # 잡 전체 상한(2026-10-22). 평시 2~3분이다. 수치예보 요청이 300초씩
     # 매달리던 때 실행마다 10분을 넘겼는데, 상한이 없어 그런 실행이 다음
     # 15분 주기와 겹쳐 concurrency 대기열에 쌓였다.
@@ -98,19 +103,19 @@ jobs:
       # 코드(스크립트)는 main 에서 가져온다 — 이 브랜치가 최신 로직의
       # 원본이다. data 브랜치에는 코드를 두지 않는다(중복 방지).
       - name: Checkout code (main)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
           path: code
 
       # 데이터는 data 브랜치에서 가져온다 — 이게 갱신 대상이자 커밋 대상이다.
       - name: Checkout data branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: data
           path: data
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: "pip"

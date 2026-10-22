@@ -91,7 +91,61 @@ class NumpyGBM:
         self.value = d[f"{prefix}_value"]
         self.missing_left = d[f"{prefix}_missing_left"]
 
+        # 모든 트리를 한꺼번에 내려가기 위한 절대 인덱스(2026-10-22). 트리마다
+        # 파이썬 루프를 도는 방식은 서빙 1건에 44ms(모델 5개)였다 — 행이 적으면
+        # 루프 부담이 지배한다. 행이 많으면 반대로 그 방식(행 방향 벡터화)이
+        # 빠르다(20만 행: 트리 동시 18.4초 vs 트리별 7.1초). 그래서 크기로 고른다.
+        starts = np.asarray(self.offset[:-1], dtype=np.int64)
+        tree_of = np.repeat(np.arange(len(starts)), np.diff(self.offset))
+        self._roots = starts
+        self._left_abs = self.left.astype(np.int64) + starts[tree_of]
+        self._right_abs = self.right.astype(np.int64) + starts[tree_of]
+        self._miss_bool = self.missing_left.astype(bool)
+
+    # 이 원소 수(행 × 트리) 이하면 트리를 동시에 내려간다(위 __init__ 주석).
+    TREE_PARALLEL_MAX = 200_000
+
     def raw(self, x: np.ndarray) -> np.ndarray:
+        """원시 합(baseline + 트리 값). 두 경로 모두 **더하는 순서가 트리 0, 1,
+        2, … 로 같다** — 순서가 바뀌면 부동소수 결과가 달라져 저장된 지표의 재현
+        대조(`stamp_norm`)가 흔들린다. 두 경로가 비트 단위로 같은지는 연기 시험이
+        대조한다(검증셋 20만 행 × 모델 10개에서 확인)."""
+        x = np.asarray(x, dtype=np.float64)
+        if x.ndim == 1:
+            x = x[None, :]
+        if len(x) * len(self._roots) > self.TREE_PARALLEL_MAX:
+            return self.raw_per_tree(x)
+        return self.raw_tree_parallel(x)
+
+    def raw_tree_parallel(self, x: np.ndarray) -> np.ndarray:
+        """모든 트리를 동시에 내려간다 — 행이 적을 때(서빙) 빠르다."""
+        x = np.asarray(x, dtype=np.float64)
+        if x.ndim == 1:
+            x = x[None, :]
+        n, n_tree = len(x), len(self._roots)
+        out = np.full(n, self.baseline, dtype=np.float64)
+        step = max(1, 2_000_000 // max(n_tree, 1))      # 행×트리 원소 수 상한
+        for a in range(0, n, step):
+            xc = x[a:a + step]
+            m = len(xc)
+            rows = np.arange(m)[:, None]
+            node = np.broadcast_to(self._roots, (m, n_tree)).copy()
+            leaf = self.is_leaf[node]
+            while not leaf.all():
+                v = xc[rows, self.feature[node]]
+                go_left = np.where(np.isnan(v), self._miss_bool[node],
+                                   v <= self.threshold[node])
+                nxt = np.where(go_left, self._left_abs[node], self._right_abs[node])
+                node = np.where(leaf, node, nxt)
+                leaf = self.is_leaf[node]
+            vals = self.value[node]
+            acc = out[a:a + m]
+            for t in range(n_tree):
+                acc += vals[:, t]
+        return out
+
+    def raw_per_tree(self, x: np.ndarray) -> np.ndarray:
+        """트리마다 모든 행을 내려간다 — 행이 많을 때(진단·채점) 빠르다."""
         x = np.asarray(x, dtype=np.float64)
         if x.ndim == 1:
             x = x[None, :]

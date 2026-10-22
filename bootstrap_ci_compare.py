@@ -25,9 +25,8 @@ train.py의 make_split이 날짜 단위로 그룹 분할하는 것과 같은 이
 
 **추론 재사용.** eval_cache.build()를 두 체크포인트에 각각 호출한다
 (CLAUDE.md 3절 — 새 진단 스크립트가 데이터셋을 직접 다시 만들지 않는다는
-규약). 두 번 호출하는 동안 공유 캐시 파일(./cache/eval_cache.npz)이
-마지막 호출 결과로 남지만, 이후 다른 스크립트가 배포 체크포인트로
-eval_cache.load()를 부르면 서명 불일치로 자동 재계산되므로 안전하다.
+규약). 2026-10-22 부터 캐시는 체크포인트마다 따로 저장되므로(`eval_cache.
+cache_path_for`) 두 호출이 서로의 캐시를 지우지 않는다.
 
 실행 (GPU 컨테이너, 순차 — CLAUDE.md 3절 "동시에 돌리지 말 것"):
   python bootstrap_ci_compare.py <체크포인트A:대조> <체크포인트B:처리> [--n-boot 2000]

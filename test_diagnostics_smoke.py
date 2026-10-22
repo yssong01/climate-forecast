@@ -87,7 +87,7 @@ DIAGNOSTIC_MODULES = [
     # 같은 워크플로의 관측 창 갱신 — 임포트가 깨지면 창이 멈춘다(2026-10-21 추가).
     "refresh_deploy_data",
     # 2026-09-27 신설 — 남아 있던 세 항목을 닫은 측정 도구들.
-    "aerosol_gbm_check", "precip_floor_check", "migrate_training_wind_dir",
+    "aerosol_gbm_check", "precip_floor_check", "migrate_training_wind_dir", "calibration_math",
     # 2026-10-21 신설 — 관측소별 강수 F1 을 검증셋·온라인에서 같은 정의로 잰다.
     "station_precip_check",
     # 승격 절차의 수동 작업 4번이 이 스크립트를 부른다(2026-09-23 추가).
@@ -744,6 +744,11 @@ def _pipeline_units():
             methods.add(str(meta[f"meta_{head}_cal_method"]))
             p = eg.calibrated_batch(models, meta, head, x)
             assert np.all(np.isfinite(p)) and np.all((p >= 0) & (p <= 1)), (name, head)
+        # 두 추론 경로(트리 동시·트리별)가 비트 단위로 같아야 한다 — 크기에 따라
+        # 경로가 바뀌므로, 다르면 서빙과 채점이 다른 값을 낸다.
+        xr = np.random.default_rng(0).normal(size=(64, nf))
+        for head, mdl in models.items():
+            assert np.array_equal(mdl.raw_tree_parallel(xr), mdl.raw_per_tree(xr)), (name, head)
         heat = eg.calibrated_batch(models, meta, "heatwave", x)
         assert np.all(np.diff(heat) >= -1e-12), f"{name} 폭염이 기온에 단조가 아니다: {heat}"
     return f"최신성 게이트 · trim · 극한 GBM 2개(보정 {sorted(methods)})"

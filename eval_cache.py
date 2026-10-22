@@ -32,7 +32,7 @@ import torch
 from predict import CHECKPOINT, load_model
 from train import (WeatherDataset, collect_historical, make_split, WET_THRESH,
                    aux_dataset_kwargs,
-                   DATA_CACHE)
+                   DATA_CACHE, WEATHER_ISSUE_LABELS)
 from weather_collector import STATION_COORDS
 from interp_field_collector import InterpolatedFieldCollector
 from island_collector import ISLAND_PARQUET
@@ -48,6 +48,22 @@ CACHE_PATH = "./cache/eval_cache.npz"
 # 그렇다고 `baseline_suite.py` 가 데이터셋을 따로 구성하면 3절 규약(22GiB
 # 중복 구성 금지)을 어기는 여섯 번째 스크립트가 된다. 그래서 여기에 둔다.
 FEATURE_CACHE_PATH = "./cache/eval_features.npz"
+
+
+def cache_path_for(base: str, ckpt_path: str) -> str:
+    """체크포인트마다 따로 두는 캐시 파일 경로(2026-10-22).
+
+    종전에는 모든 체크포인트가 위 두 파일을 공유했다. +6h 와 +12h 를 번갈아
+    진단하면 매번 서로의 캐시를 지우고 다시 만들었고(1회 2분·RAM 22GiB),
+    두 프로세스가 동시에 돌면 한쪽이 "신선함" 을 확인한 직후 다른 쪽이 파일을
+    바꿔 **다른 체크포인트의 검증셋**을 읽을 수 있었다. 이름에 체크포인트의
+    줄기와 절대경로 해시를 넣는다(같은 이름의 다른 디렉터리 파일과 섞이지 않게).
+    """
+    import hashlib
+    stem = os.path.splitext(os.path.basename(ckpt_path))[0]
+    tag = hashlib.sha1(os.path.abspath(ckpt_path).encode()).hexdigest()[:8]
+    root, ext = os.path.splitext(base)
+    return f"{root}__{stem}_{tag}{ext}"
 
 # 배치 기본값 — 추론만 하므로 학습보다 크게 잡을 수 있다. 실측(2026-08-16)
 # 에서 학습 중 VRAM 사용률이 12% 에 그쳤으므로 8192 로도 여유가 있다.
@@ -104,6 +120,16 @@ def cache_signature(ckpt_path: str, ckpt: dict) -> dict:
         except OSError:
             sig["nwp_mtime"] = 0.0
             sig["nwp_size"] = 0
+    # 극한기상 공식 라벨 파일도 서명에 넣는다(2026-10-22). WeatherDataset 이
+    # 늘 읽는데 빠져 있어, 라벨을 다시 가져와도(import_weather_issues.py)
+    # 낡은 캐시가 그대로 재사용됐다.
+    try:
+        lst = os.stat(WEATHER_ISSUE_LABELS)
+        sig["labels_mtime"] = float(lst.st_mtime)
+        sig["labels_size"] = int(lst.st_size)
+    except OSError:
+        sig["labels_mtime"] = 0.0
+        sig["labels_size"] = 0
     if ckpt.get("use_island", False):
         try:
             ist = os.stat(ISLAND_PARQUET)
@@ -159,15 +185,26 @@ def _assert_split_matches_checkpoint(ds, val_idx, ckpt) -> None:
                 f"②면 학습 당시 데이터 파일로 되돌릴 것.")
 
 
-def is_fresh(path: str, sig: dict) -> bool:
+def _load_if_fresh(path: str, sig: dict):
+    """서명이 맞으면 내용을 dict 로, 아니면 None. **한 번 읽은 것을 대조한다** —
+    확인과 읽기를 따로 하면 그 사이에 파일이 바뀔 수 있다(cache_path_for 참고)."""
     if not os.path.exists(path):
-        return False
+        return None
     try:
-        z = np.load(path, allow_pickle=True)
+        with np.load(path, allow_pickle=True) as z:
+            data = {k: z[k] for k in z.files}
     except Exception:
-        return False
+        return None
+    return data if _sig_matches(data, sig) else None
+
+
+def is_fresh(path: str, sig: dict) -> bool:
+    return _load_if_fresh(path, sig) is not None
+
+
+def _sig_matches(z: dict, sig: dict) -> bool:
     for k, v in sig.items():
-        if k not in z.files:
+        if k not in z:
             return False
         got = z[k].item() if z[k].shape == () else z[k]
         if isinstance(v, float):
@@ -260,15 +297,16 @@ def build(ckpt_path: str, batch: int):
     )
     data.update({k: np.array(v) for k, v in cache_signature(ckpt_path, ckpt).items()})
 
-    os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+    out_path = cache_path_for(CACHE_PATH, ckpt_path)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     # 공유 파일 저장은 고유 tmp + os.replace 로 원자적으로(CLAUDE.md 6절).
     import tempfile
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CACHE_PATH), suffix=".npz")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out_path), suffix=".npz")
     os.close(fd)
     np.savez_compressed(tmp, **data)
-    os.replace(tmp, CACHE_PATH)
-    size_mb = os.path.getsize(CACHE_PATH) / 1e6
-    print(f"\n저장: {CACHE_PATH} ({size_mb:.1f}MB, {time.time() - t0:.0f}초)")
+    os.replace(tmp, out_path)
+    size_mb = os.path.getsize(out_path) / 1e6
+    print(f"\n저장: {out_path} ({size_mb:.1f}MB, {time.time() - t0:.0f}초)")
     return data
 
 
@@ -276,9 +314,10 @@ def load(ckpt_path: str = CHECKPOINT, batch: int = DEFAULT_BATCH, force: bool = 
     """캐시를 읽어 dict 로 돌려준다. 없거나 낡았으면 만든다."""
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     sig = cache_signature(ckpt_path, ckpt)
-    if not force and is_fresh(CACHE_PATH, sig):
-        z = np.load(CACHE_PATH, allow_pickle=True)
-        return {k: z[k] for k in z.files}
+    if not force:
+        data = _load_if_fresh(cache_path_for(CACHE_PATH, ckpt_path), sig)
+        if data is not None:
+            return data
     return build(ckpt_path, batch)
 
 
@@ -384,15 +423,16 @@ def build_features(ckpt_path: str = CHECKPOINT):
     data["use_nwp"] = np.array(bool(ckpt.get("use_nwp", False)))
     data.update({k: np.array(v) for k, v in cache_signature(ckpt_path, ckpt).items()})
 
-    os.makedirs(os.path.dirname(FEATURE_CACHE_PATH), exist_ok=True)
+    out_path = cache_path_for(FEATURE_CACHE_PATH, ckpt_path)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     import tempfile
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(FEATURE_CACHE_PATH),
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out_path),
                                suffix=".npz")
     os.close(fd)
     np.savez_compressed(tmp, **data)
-    os.replace(tmp, FEATURE_CACHE_PATH)
-    print(f"저장: {FEATURE_CACHE_PATH} "
-          f"({os.path.getsize(FEATURE_CACHE_PATH)/1e6:.0f}MB, "
+    os.replace(tmp, out_path)
+    print(f"저장: {out_path} "
+          f"({os.path.getsize(out_path)/1e6:.0f}MB, "
           f"{time.time()-t0:.0f}초)")
     return data
 
@@ -401,9 +441,10 @@ def load_features(ckpt_path: str = CHECKPOINT, force: bool = False):
     """입력 행렬 캐시를 읽어 dict 로 돌려준다. 없거나 낡았으면 만든다."""
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     sig = cache_signature(ckpt_path, ckpt)
-    if not force and is_fresh(FEATURE_CACHE_PATH, sig):
-        z = np.load(FEATURE_CACHE_PATH, allow_pickle=True)
-        return {k: z[k] for k in z.files}
+    if not force:
+        data = _load_if_fresh(cache_path_for(FEATURE_CACHE_PATH, ckpt_path), sig)
+        if data is not None:
+            return data
     return build_features(ckpt_path)
 
 
@@ -416,8 +457,8 @@ def main():
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
     sig = cache_signature(args.ckpt, ckpt)
-    if not args.force and is_fresh(CACHE_PATH, sig):
-        print(f"캐시가 최신이다 — 다시 계산하지 않는다: {CACHE_PATH}")
+    if not args.force and is_fresh(cache_path_for(CACHE_PATH, args.ckpt), sig):
+        print(f"캐시가 최신이다 — 다시 계산하지 않는다: {cache_path_for(CACHE_PATH, args.ckpt)}")
         print("(강제로 다시 만들려면 --force)")
         return
     build(args.ckpt, args.batch)

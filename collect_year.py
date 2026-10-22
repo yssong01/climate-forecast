@@ -86,8 +86,14 @@ def _handle_sigterm(signum, frame):
     _stop.set()
 
 
-signal.signal(signal.SIGTERM, _handle_sigterm)
-signal.signal(signal.SIGINT, _handle_sigterm)
+# 처리기는 **이 스크립트를 직접 실행할 때만** 건다(main 첫 줄, 2026-10-22).
+# 종전에는 모듈 최상단에서 걸어, 유틸(`load_existing`·`atomic_save`)만 쓰려고
+# 임포트한 프로세스(refresh_deploy_data·collect_incremental 등)까지 SIGINT·
+# SIGTERM 을 플래그로 바꿔 삼켰다 — 그 플래그를 보는 곳은 이 파일의 수집
+# 루프뿐이라 Ctrl+C 가 듣지 않고, CI 의 시간 초과 종료 신호도 무시됐다.
+def _install_signal_handlers():
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
 
 
 def load_existing(path: str) -> dict:
@@ -134,6 +140,7 @@ def build_targets(days: int, stations: list) -> list:
 
 
 def main():
+    _install_signal_handlers()
     ap = argparse.ArgumentParser(description="ASOS 1년치 병렬 수집")
     ap.add_argument("--days", type=int, default=365)
     ap.add_argument("--concurrency", type=int, default=12)

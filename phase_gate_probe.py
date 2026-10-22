@@ -48,7 +48,6 @@ import numpy as np
 from tendency_collector import TENDENCY_VARS, _SCALE
 
 DATA_CACHE = "./cache/historical_data_1y.json"
-EVAL_CACHE = "./cache/eval_cache.npz"
 
 EVENTS = {
     "heatwave": ("heat_prob", "y_heatwave", "heat_mask"),
@@ -139,7 +138,10 @@ def main():
         records = json.load(f)
     idx = build_index(records)
 
-    d = np.load(EVAL_CACHE, allow_pickle=True)
+    # 서명 대조를 거쳐 읽는다(2026-10-22) — 파일을 직접 열면 다른 체크포인트나
+    # 낡은 자료의 캐시를 그대로 쓴다. 캐시는 이제 체크포인트마다 따로 있다.
+    import eval_cache
+    d = eval_cache.load()
     prob_key, y_key, mask_key = EVENTS[args.event]
     mask = d[mask_key].astype(bool)
     probs, labels = d[prob_key][mask], d[y_key][mask].astype(int)

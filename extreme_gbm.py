@@ -98,7 +98,7 @@ def calibrated(models, meta, head, x):
         return None
     p = float(models[head].predict_proba1(x)[0])
     method = str(meta.get(f"meta_{head}_cal_method", "none"))
-    import probability_calibration_fit as _pc
+    import calibration_math as _pc      # numpy 만 — 학습 모듈을 불러오지 않는다
     if method == "beta":
         a, b, c = [float(v) for v in meta[f"{head}_cal_beta"]]
         return float(_pc.apply_beta(np.array([p]), a, b, c)[0])
@@ -112,7 +112,7 @@ def calibrated_batch(models, meta, head, x):
     """`calibrated()` 의 배치판 — 진단 스크립트가 검증셋 전체에 쓴다."""
     p = models[head].predict_proba1(x)
     method = str(meta.get(f"meta_{head}_cal_method", "none"))
-    import probability_calibration_fit as _pc
+    import calibration_math as _pc
     if method == "beta":
         a_, b_, c_ = [float(v) for v in meta[f"{head}_cal_beta"]]
         return _pc.apply_beta(p, a_, b_, c_)

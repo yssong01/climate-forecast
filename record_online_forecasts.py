@@ -39,7 +39,7 @@ import sys
 
 import accuracy
 from weather_collector import (
-    STATIONS, set_offline_fallback, is_real_observation, api_call_stats,
+    STATIONS, set_offline_fallback, is_real_observation, api_call_stats, redact_secrets,
 )
 
 
@@ -103,25 +103,38 @@ def main() -> int:
 
     # torch 임포트는 여기서 한다 — 인자 오류나 창 부재로 끝날 실행에서
     # 수백 MB 를 로드하지 않기 위해서다.
+    import predict as _pr
     from predict import load_model, predict, NWPUnavailable
 
     model, ckpt = load_model(args.checkpoint, "cpu")
+    # 보조 모델은 **한 번만** 읽는다(2026-10-22). 넘기지 않으면 predict() 가
+    # 관측소마다 기온 모델·두 GBM 을 디스크에서 다시 읽었다(12곳 × 3파일).
+    # 경로·호환 검증은 predict() 가 스스로 읽을 때와 같은 함수다.
+    temp_model, temp_ckpt = (_pr.load_temp_model(ckpt, _pr.TEMP_CHECKPOINT, "cpu")
+                             if _pr.TEMP_CHECKPOINT else (None, None))
+    precip_gbm = _pr.load_precip_gbm(ckpt, _pr.PRECIP_GBM) if _pr.PRECIP_GBM else None
+    extreme_gbm = _pr.load_extreme_gbm(ckpt, _pr.EXTREME_GBM) if _pr.EXTREME_GBM else None
     model_id = accuracy.model_fingerprint(args.checkpoint)
     print(f"체크포인트 {args.checkpoint} (+{ckpt['lead_hours']}h) · "
           f"model_id={model_id}")
 
-    written, skipped, failed = 0, 0, 0
+    # already — 같은 (관측소, 목표 시각)이 이미 기록돼 건너뛴 수. 관측은 매시
+    # 1회라 정시 직후가 아닌 실행(:16·:31·:46)은 거의 전부 여기에 든다 — 정상이다.
+    written, skipped, failed, already = 0, 0, 0, 0
     for name, stn in STATIONS.items():
         try:
-            res = predict(stn=stn, model=model, ckpt=ckpt)
+            res = predict(stn=stn, model=model, ckpt=ckpt,
+                          temp_model=temp_model, temp_ckpt=temp_ckpt,
+                          precip_gbm=precip_gbm, extreme_gbm=extreme_gbm)
         except NWPUnavailable as e:
             # 수치예보 창이 그 시각을 못 덮으면 이 모델은 출력을 만들 수
             # 없다 — 없는 값을 채워 넣지 않는다(CLAUDE.md 1절 5항).
-            print(f"  {name}({stn}) 건너뜀 — 수치예보 없음: {e}")
+            # 예외 문자열은 비밀값을 지운 뒤에만 낸다(CLAUDE.md 4절 — Actions 로그는 공개다).
+            print(f"  {name}({stn}) 건너뜀 — 수치예보 없음: {redact_secrets(str(e))}")
             failed += 1
             continue
         except Exception as e:                       # noqa: BLE001
-            print(f"  {name}({stn}) 실패 — {type(e).__name__}: {e}")
+            print(f"  {name}({stn}) 실패 — {type(e).__name__}: {redact_secrets(str(e))}")
             failed += 1
             continue
 
@@ -148,6 +161,8 @@ def main() -> int:
         )
         if accuracy.log_summary()["total"] > before:
             written += 1
+        else:
+            already += 1
 
     if args.dry_run:
         print(f"\n(--dry-run) 기록하지 않았다 — 실패 {failed}건 · 건너뜀 {skipped}건")
@@ -159,7 +174,7 @@ def main() -> int:
     resolved = accuracy.resolve_pending(lookup)
     removed = accuracy.trim(args.retain_days)
     summary = accuracy.log_summary()
-    print(f"\n신규 {written}건 · 대조 완료 {resolved}건 · 보존기간 초과 정리 "
+    print(f"\n신규 {written}건 · 이미 기록 {already}건 · 대조 완료 {resolved}건 · 보존기간 초과 정리 "
           f"{removed}건 · 로그 {summary['total']}건(대기 {summary['pending']}건)")
     calls = api_call_stats()
     print(f"API 호출 {calls['count']}건 — 이 경로는 0이어야 한다")
