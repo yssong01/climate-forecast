@@ -65,6 +65,12 @@ if _DAY2_PATH and os.path.exists(_DAY2_PATH):
 # day2 창에 쓸 유효시각 상한(예측 시점 기준 시간). 비우면 상한 없음 = 아카이브 확정값을 그대로
 # 쓰는 **상한 측정**이다(서빙 재현성은 따로 재야 한다 — nwp_drift_check.py).
 DAY2_CLEAN_H = int(os.environ["DAY2_CLEAN_H"]) if os.environ.get("DAY2_CLEAN_H") else None
+# jma_gsm previous_day1 강수의 관측소 주변 ±0.5° 8개 격자점(2016~) — G 그룹.
+GSM_NB = {}
+_NB_PATH = os.environ.get("GSM_NB_ARCHIVE", "")
+if _NB_PATH and os.path.exists(_NB_PATH):
+    with open(_NB_PATH, encoding="utf-8") as _fp:
+        GSM_NB = json.load(_fp)
 LABELS = {}
 if os.path.exists("./cache/weather_issue_labels.json"):
     with open("./cache/weather_issue_labels.json", encoding="utf-8") as _fp:
@@ -91,6 +97,9 @@ def build_extra(stn, src, lead, obs, nwp, groups):
     if "V" in groups:
         for name in ("p9_sum", "p9_max", "t9_min", "t9_max", "at9_max", "dT9min"):
             cols["V_" + name] = np.full(n, np.nan)
+    if "G" in groups:          # GSM 공간 이웃(3×3)·시간 창(±3h) 강수
+        for name in ("mean_V", "max_V", "mean_w3", "ctr_w3", "west_east_w3"):
+            cols["G_" + name] = np.full(n, np.nan)
     if "D" in groups:          # jma_gsm previous_day2 — 특보 기준에 맞춘 '목표일·다음날' 창
         for name in ("c_min_d0", "c_min_d1", "c_2day", "c_drop", "h_at_d0", "h_at_d1", "h_2day"):
             cols["D_" + name] = np.full(n, np.nan)
@@ -149,6 +158,26 @@ def build_extra(stn, src, lead, obs, nwp, groups):
                 cols["W_t24_max"][i] = max(w[1] for w in day)
                 if cur is not None:
                     cols["W_dT24"][i] = day[-1][1] - cur[0]
+        if "G" in groups and GSM_NB:
+            nb = GSM_NB.get(s, {})
+            ring, nrows, crow = nb.get("ring", []), nb.get("rows", {}), nwp.get(s, {})
+            V = T + timedelta(hours=lead)
+
+            def _pts(t):            # 중심 + 8 이웃 강수(9개) — 하나라도 없으면 None
+                c, r = crow.get(_key(t)), nrows.get(_key(t))
+                return None if (c is None or r is None) else [c[0]] + list(r)
+            pv = _pts(V)
+            if pv is not None:
+                cols["G_mean_V"][i] = float(np.mean(pv))
+                cols["G_max_V"][i] = max(pv)
+            win = [_pts(V + timedelta(hours=h)) for h in range(-3, 4)]
+            if all(w is not None for w in win):
+                sums = np.sum(np.array(win), axis=0)          # 지점별 ±3h 합(9개)
+                cols["G_mean_w3"][i] = float(sums.mean())
+                cols["G_ctr_w3"][i] = float(sums[0])
+                west = [sums[1 + j] for j, (dy, dx) in enumerate(ring) if dx < 0]
+                east = [sums[1 + j] for j, (dy, dx) in enumerate(ring) if dx > 0]
+                cols["G_west_east_w3"][i] = float(np.mean(west) - np.mean(east))
         if "D" in groups and DAY2:
             row = DAY2.get(s, {})
             V0 = T + timedelta(hours=lead)
