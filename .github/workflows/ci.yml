@@ -23,10 +23,14 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
+      # 배포와 같은 고정 명세(`requirements.txt` — torch 2.6.0 CPU 휠·numpy<2)로
+      # 시험한다(2026-10-22). 종전에는 최신 torch 를 받아 배포에 없는 스택을
+      # 시험했다. torchvision 은 배포에 없지만 ResNet 경로 시험이 지연 임포트로
+      # 쓰므로 torch 와 짝이 맞는 판(0.21.0)을 받는다.
       - name: Install CPU-only dependencies
         run: |
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install -r requirements-app.txt
+          pip install -r requirements.txt
+          pip install torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
 
       # 진단 스크립트 전용 의존성. requirements-app.txt 는 **서빙**이 쓰는
       # 최소 집합이라 여기 없는 것이 맞다 — 배포판에 matplotlib·scikit-learn
@@ -37,7 +41,8 @@ jobs:
       # 이것을 빠뜨려 연기 시험이 신설(2026-09-07) 이후 한 번도 통과하지
       # 못했고, CI 가 16일간 빨간불로 방치됐다(2026-09-23 점검에서 발견).
       - name: Install diagnostic-only dependencies
-        run: pip install matplotlib scipy scikit-learn
+        # numpy 상한을 함께 건다 — 없으면 해석기가 numpy 2.x 로 올릴 수 있다.
+        run: pip install matplotlib scipy scikit-learn $(grep -E '^numpy\b' requirements.txt)
 
       # 미정의 이름 정적 검사(2026-10-21 신설). `promote_checkpoint.py` 가
       # 정의된 적 없는 `gate_records` 를 참조해 `--promote` 가 **언제나**

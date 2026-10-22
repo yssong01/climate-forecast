@@ -115,14 +115,17 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      # streamlit 은 필요 없다. torch 는 필요하다(2026-09-23) — 아래
-      # `record_online_forecasts.py` 가 모델을 돌려 온라인 예측을 남긴다.
-      # CPU 휠만 받는다(러너에 GPU 가 없다). `cache: "pip"` 덕에 두 번째
-      # 실행부터는 내려받기가 캐시에서 해결된다.
+      # **배포와 같은 고정 명세를 쓴다(2026-10-22).** 종전에는 여기서 최신
+      # torch·numpy 2.x 를 받아, 화면에 쓰일 온라인 예측을 배포(torch 2.6.0·
+      # numpy<2)와 다른 스택으로 기록하고 있었다. 버전은 `requirements.txt`
+      # 한 곳에서 읽는다 — 여기 따로 적으면 두 곳이 어긋난다.
+      #
+      # 관측 갱신은 torch 를 쓰지 않으므로 torch 는 **관측 커밋 뒤의 별도
+      # 스텝**에서 받는다 — 종전에는 torch 설치가 실패하면(인덱스 장애 등)
+      # 관측 갱신까지 함께 멈췄다.
       - name: Install collector dependencies
         run: |
-          pip install requests python-dotenv numpy
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install $(grep -E '^(numpy|requests|python-dotenv)\b' code/requirements.txt)
 
       # 키가 없으면 RobustWeatherCollector 가 조용히 폴백으로 내려가
       # "성공 0건"인 채로 워크플로는 초록불이 된다. 그 상태를 실패로 만든다.
@@ -203,6 +206,13 @@ jobs:
         working-directory: data
         run: |
           python ${{ github.workspace }}/code/collect_nwp_archive.py --incremental
+
+      # 온라인 예측(아래)에만 필요하다. CPU 휠, 배포와 같은 파일(위 주석).
+      - name: Install model dependencies (torch, 배포와 같은 휠)
+        if: ${{ !cancelled() && !inputs.dry_run }}
+        run: |
+          pip install "$(grep -E '^torch @' code/requirements.txt)"
+          python -c "import torch, numpy; print('torch', torch.__version__, '· numpy', numpy.__version__)"
 
       # 적중률 로그에 온라인 예측을 남긴다(2026-09-23 신설).
       #
