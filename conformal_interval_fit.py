@@ -9,9 +9,11 @@ conformal_interval_fit.py — 기온·강수 점추정에 분포무관 예측구
 전혀 바꾸지 않는 사후 보정**이라 그 실패와 무관하다 — 이미 계산된 점추정에
 비순응도 점수(nonconformity score)로 구간 폭만 씌운다.
 
-**방법(split conformal, 부호 있는 잔차).** 검증셋을 보정용/평가용 절반씩
-무작위 분할한다(probability_calibration_fit.py와 같은 CALIB_SEED — 같은
-재분할을 재사용). 보정용에서 부호 있는 잔차 e = 실측 − 예측 의 (α/2, 1−α/2)
+**방법(split conformal, 부호 있는 잔차).** 검증셋을 **목표일 홀짝**으로
+보정용/평가용 절반씩 나눈다(2026-10-22 — `precip_gbm.py`·`extreme_gbm.py` 가
+판정선을 고를 때 쓰는 것과 같은 규칙). 종전에는 표본 단위 무작위 분할
+(`CALIB_SEED`)이라 같은 날 다른 시각이 양쪽에 들어가, 평가용 커버리지가
+보정용과 같은 종관 상황을 보고 채점됐다. 보정용에서 부호 있는 잔차 e = 실측 − 예측 의 (α/2, 1−α/2)
 분위수(q_lo, q_hi)를 구해 구간 [예측+q_lo, 예측+q_hi]를 만든다. 대칭 잔차
 가정(|e|의 단일 분위수)이 아니라 부호별로 따로 구하는 이유 — 강수는 무강수
 쪽 잔차가 항상 작은 음수 근처로 쏠려 있고 호우 쪽만 크게 벌어지는
@@ -33,6 +35,15 @@ head_rain(hurdle)이 이미 겪은 것과 같다 — "오는가"와 "얼마나"�
 없다"는 알려진 한계(distribution-free conditional coverage 불가능성)가
 드러난 것이며, 예측확률이 낮았는데 실제로 비가 온 사건(강수 헤드가 놓친
 사건)은 애초에 좁은 구간을 받으므로 못 잡는다. 이 한계를 README에 명시한다.
+
+**강수는 서빙이 내는 값(게이팅 후)으로 적합한다(2026-10-22).** 서빙은
+`rain_prob < τ` 이면 강수를 0 으로 자른 뒤 그 값에 구간을 씌운다. 종전에는
+자르기 전 양(amount)의 잔차로 분위수를 잡아, 판정선 아래 구간에서 점추정과
+구간이 서로 다른 값을 기준으로 했다(+6h 의 `[0.1,0.3)` 은 전부 τ 아래인데
+구간은 0 이 아닌 양 기준이었다). 같은 이유로 τ 에 가장 가까운 버킷 경계를
+τ 로 옮긴다 — 한 층 안에 잘린 표본과 안 잘린 표본이 섞이면 그 층의 분위수가
+두 분포의 혼합이 된다. 경계는 체크포인트의 `rain_prob_edges` 로 저장되고
+서빙이 그것을 읽으므로 따로 맞출 것이 없다.
 
 **채택 기준.** 정합적 예측의 이론적 보장은 "한 번도 보지 않은 표본에서
 목표 커버리지 이상"이다. 평가용(적합에 전혀 쓰이지 않은 절반)에서 실측
@@ -56,7 +67,7 @@ import torch
 from predict import CHECKPOINT
 import eval_cache
 
-CALIB_SEED = 1234       # probability_calibration_fit.py 와 같은 값 — 같은 재분할
+CALIB_SEED = 1234       # 2026-10-22 이전 분할(표본 단위 무작위). 기록용으로만 남긴다
 ALPHA = float(os.getenv("CONFORMAL_ALPHA", "0.1"))   # 목표 커버리지 1-ALPHA = 90%
 MIN_GROUP_N = 200       # 층화 그룹별 분위수를 따로 낼 최소 보정 표본 수
 COVERAGE_TOL = 0.02     # 평가용 실측 커버리지가 목표보다 이만큼 이상 못 미치면 기각
@@ -216,22 +227,37 @@ def main():
                 and (feat["stn_val"] == data["stn"].astype(feat["stn_val"].dtype)).all()):
             raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
         data = dict(data)
-        data["precip_pred"] = np.clip(amt.predict(feat["x_val"]), 0.0, None)
         data["rain_prob"] = occ.predict_proba1(feat["x_val"])
-        print(f"강수 예측 출처: {gbm_path} (서빙과 동일)")
+        gate_tau = float(meta["meta_gate_tau"])
+        # 서빙과 같은 값 — 판정선 아래는 0(모듈 docstring).
+        data["precip_pred"] = np.where(data["rain_prob"] >= gate_tau,
+                                       np.clip(amt.predict(feat["x_val"]), 0.0, None), 0.0)
+        print(f"강수 예측 출처: {gbm_path} (서빙과 동일, 판정선 τ={gate_tau:.3f} 아래는 0)")
+    else:
+        gate_tau = None
     stn = data["stn"]
-    n = len(stn)
-    rng = np.random.RandomState(CALIB_SEED)
-    calib_mask = rng.rand(n) < 0.5
+    # 목표일 홀짝 — 같은 날의 시각들이 한쪽에만 들어간다(모듈 docstring).
+    calib_mask = ((np.asarray(data["tgt_ts"]).astype(np.int64) // 10 ** 4) % 2 == 0)
 
     temp_result, temp_adopt = _fit_one(
         "기온", data["temp_true"], data["temp_pred"], stn, None, calib_mask, ALPHA)
 
     rain_prob = data["rain_prob"]
     wet_thresh = float(data["wet_thresh"])
-    bucket = np.digitize(rain_prob, RAIN_PROB_EDGES) - 1
-    bucket_label = {b: f"[{RAIN_PROB_EDGES[b]:.1f},{RAIN_PROB_EDGES[b+1]:.1f})"
-                     for b in range(len(RAIN_PROB_EDGES) - 1)}
+    edges = list(RAIN_PROB_EDGES)
+    if gate_tau is not None:
+        # τ 에 가장 가까운 안쪽 경계를 τ 로 옮긴다 — 층마다 전부 잘렸거나 전부
+        # 안 잘린 표본이 되게 한다(모듈 docstring).
+        k = min(range(1, len(edges) - 1), key=lambda i: abs(edges[i] - gate_tau))
+        edges[k] = gate_tau
+        assert all(a < b for a, b in zip(edges, edges[1:])), edges
+    bucket = np.digitize(rain_prob, edges) - 1
+    bucket = np.clip(bucket, 0, len(edges) - 2)
+    # 라벨 형식은 `predict._rain_prob_bucket` 과 **같아야** 한다(조회 키다).
+    bucket_label = {b: f"[{edges[b]:.1f},{edges[b+1]:.1f})"
+                     for b in range(len(edges) - 1)}
+    assert len(set(bucket_label.values())) == len(bucket_label), \
+        f"버킷 라벨이 겹친다 — 서빙 조회 키가 충돌한다: {bucket_label}"
     wet_mask = data["precip_true"] >= wet_thresh
     precip_result, precip_adopt = _fit_one(
         "강수", data["precip_true"], data["precip_pred"], bucket, bucket_label,
@@ -260,14 +286,15 @@ def main():
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     ckpt["conformal_interval"] = {
         "method": "split conformal, signed residual quantiles (Mondrian-stratified)",
-        "calib_seed": CALIB_SEED,
+        "split": "target-date parity (calib = even day)",
         "alpha": ALPHA,
         "temp": {"strata": "station", **temp_result} if temp_adopt else None,
         # 강수 구간이 어느 모델의 잔차로 잡혔는지 남긴다 — 표시가 없으면
         # 강수 출처를 바꿨을 때 다른 모델의 오차 분포로 구간을 그리게 되고,
         # 화면은 멀쩡해 보인다(predict.py 가 이 값을 대조해 막는다).
         "precip_source": (gbm_path or "model"),
-        "precip": ({"strata": "rain_prob_bucket", "rain_prob_edges": RAIN_PROB_EDGES,
+        "precip": ({"strata": "rain_prob_bucket", "rain_prob_edges": edges,
+                     "served_gate_tau": gate_tau,
                      **precip_result} if precip_adopt else None),
     }
     # 공유 파일 저장은 고유 tmp + os.replace 로 원자적으로(CLAUDE.md 6절).
