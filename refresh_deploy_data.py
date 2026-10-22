@@ -15,9 +15,10 @@ Streamlit Community Cloud 의 컨테이너 파일시스템은 휘발성이다. �
      채워주는 collect_incremental.py 가 돌지 않기 때문이다.
 
 이 스크립트는 그 둘을 저장소 바깥에서 고친다. GitHub Actions
-(.github/workflows/refresh-data.yml)가 주기적으로 실행해 결과를 main 에
-커밋하면, Streamlit Cloud 가 푸시를 감지해 자동 재배포하면서 갱신된
-데이터가 반영된다. 즉 "앱이 자기 파일을 유지한다"가 아니라 "저장소가
+(.github/workflows/refresh-data.yml)가 15분마다(Cloudflare 트리거) 실행해
+결과를 **`data` 브랜치**에 커밋하고, 앱은 그 브랜치를 raw.githubusercontent.com
+에서 직접 읽는다(2026-08-20 — 종전에는 main 에 커밋해 매번 재배포가 일어났다).
+즉 "앱이 자기 파일을 유지한다"가 아니라 "저장소가
 진실의 원본이고 앱은 그걸 읽기만 한다"로 구조를 바꾸는 것이다.
 
 ## collect_incremental.py 와 무엇이 다른가

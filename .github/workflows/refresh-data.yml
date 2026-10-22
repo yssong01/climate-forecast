@@ -5,11 +5,11 @@ name: Refresh deploy data
 # "앱이 자기 데이터를 유지한다"가 아니라 "저장소가 원본이고 이 워크플로가
 # 저장소를 갱신한다"로 구조를 잡는다.
 #
-# 갱신 대상 3개 (refresh_deploy_data.py 참고):
+# 갱신 대상 4개 (refresh_deploy_data.py · collect_nwp_archive.py · record_online_forecasts.py):
 #   · cache/recent_window.json   — 최근 10일 관측 (스파크라인·추이 탭·API 장애 시 폴백 입력)
-#   · cache/accuracy_log.json    — 예보 적중률 로그의 대기 항목 해소
+#   · cache/accuracy_log.json    — 적중률 로그(대기 항목 해소 + CI 온라인 예측 기록)
 #   · cache/api_usage_daily.json — 인증키 유출 대응용 사용량 감시(README '인증키 관리' 참고)
-#   · cache/nwp_recent.json      — 수치예보 창 (Open-Meteo, 강수 헤드의 보조 입력)
+#   · cache/nwp_recent.json      — 수치예보 창 (Open-Meteo, 기온 모델·GBM 의 입력 — 없으면 출력 불가)
 #
 # API 호출량: 관측소 12곳 × 경과 시간. 모든 관측이 제때 발표되면 **주기와
 # 무관하게 하루 약 288건**이다 — 각 실행이 '마지막 관측 이후의 빈 시간'만 채우는

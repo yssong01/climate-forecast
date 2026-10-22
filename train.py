@@ -119,7 +119,7 @@ STATION_NAMES = {v: k for k, v in STATIONS.items()}    # 코드 → 한글명
 # L 의 MAE 를 직접 비교하지 말고 각자의 기준선 대비 개선폭으로 비교할 것.
 LEAD_HOURS = int(os.getenv("LEAD_HOURS", "6"))
 
-# Gram-Schmidt 직교화 — ablation.py 실측 결과 기본값 False.
+# Gram-Schmidt 직교화 — 절제 실험(당시 ablation.py, 지금은 저장소에 없다) 실측 결과 기본값 False.
 #   ON  : 기온 0.8886 / 강수 0.3267
 #   OFF : 기온 0.8452 / 강수 0.2889   ← 우세
 # OFF 조건에서 네트워크가 학습한 Re-Im 상관도가 0.4809(ON은 0.0846)로,
@@ -1104,8 +1104,8 @@ def assert_split_matches(full_ds, val_idx, ckpt, where: str = "") -> None:
     **왜 이 함수가 `eval_cache` 밖에도 필요한가(2026-08-31 추가).**
     종전에는 `eval_cache._assert_split_matches_checkpoint()` 하나만 이 대조를
     했다. 그런데 2026-08-31 에 group 분할을 날짜 해시 기반으로 바꾸면서,
-    **그 이전에 학습된 체크포인트(현행 배포본 포함)는 현재 코드로 재구성한
-    검증셋과 다른 표본을 보게 됐다** — 실측: 저장된 기온 기준선 3.3452 vs
+    **그 이전에 학습된 체크포인트(당시 배포본 포함 — 현행 배포본은 해시 분할로
+    학습됐다)는 현재 코드로 재구성한 검증셋과 다른 표본을 보게 됐다** — 실측: 저장된 기온 기준선 3.3452 vs
     재구성값 3.3057. `eval_cache` 를 쓰는 경로는 여기서 멈추지만,
     `make_split()` 을 직접 부르는 진단 스크립트 16개는 아무 경고 없이
     **학습에 쓴 표본이 섞인 검증셋**에서 지표를 계산한다. 지표는 멀쩡해
@@ -1267,7 +1267,7 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
                         규모(328k)에서 학습이 16~36에폭에 조기종료되는 것이
                         실측됐는데, 고정 재시작 지점이 그보다 늦으면 단 한 번도
                         발동하지 않는다.
-    반환: 최종 성능 지표 dict (ablation.py 에서 비교용으로 사용)
+    반환: 최종 성능 지표 dict(대조 실험 스크립트가 비교용으로 쓴다)
     """
     axes = "Z" + ("+Re" if use_re else "") + ("+Im" if use_im else "")
     if verbose:

@@ -216,7 +216,11 @@ CI 구성 재현(10-21 21시)에서 기온이 관측소별 최대 0.5°C 바뀌�
    신뢰도 그림(`docs/images/probability_calibration.png`, 09-07)과 그 캡션, 헤더·푸터의
    "3축 융합", 황사 캡션의 입력 서술. **처리**: `extreme_source`/`precip_source`로 분기,
    그림은 GBM 모드로 재생성하거나 숨긴다. 승격 수동 작업 3-1의 grep 목록에 이 문구들을 추가.
-2. **문서 정합**: CLAUDE.md 1절 15항(해시 분할은 이미 구현됨 — `train.py:1034`),
+2. **(2026-10-22 수정) 문서 정합** — 해시 분할은 구현·배포 완료로 정정(배포 체크포인트 넷 모두
+   `split_algo=hash` 확인, CLAUDE.md 15항·`eval_cache`·`train` 주석·README), API 호출 서술 모순,
+   승격 자동화 서술(10-21 복구 경위·GBM 재구축 미자동화), 없는 `ablation.py` 참조, 갱신 잡·
+   `refresh_deploy_data` 의 옛 main 커밋 서술, `aerosol_gbm_check.py` 유지 사유(② 로 갱신).
+   종전 목록(기록): CLAUDE.md 1절 15항(해시 분할은 이미 구현됨 — `train.py:1034`),
    `eval_cache.py:124,153`·`train.py:1107` 주석, CLAUDE.md:596 "서빙 API 호출은 줄지 않는다"와
    500행의 모순, README:2169-2171 승격 자동화 서술, `train.py:122,1270`의 없는 `ablation.py`,
    `refresh-data.yml:8,226`·`refresh_deploy_data.py:17-21`의 옛 서술, 7절
