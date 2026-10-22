@@ -87,6 +87,10 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    # 잡 전체 상한(2026-10-22). 평시 2~3분이다. 수치예보 요청이 300초씩
+    # 매달리던 때 실행마다 10분을 넘겼는데, 상한이 없어 그런 실행이 다음
+    # 15분 주기와 겹쳐 concurrency 대기열에 쌓였다.
+    timeout-minutes: 20
     permissions:
       contents: write        # data 브랜치에 되커밋하기 위해 필요
 
@@ -155,6 +159,19 @@ jobs:
           python ${{ github.workspace }}/code/refresh_deploy_data.py \
             ${{ inputs.dry_run && '--dry-run' || '' }}
 
+      # 관측을 **먼저** 커밋한다(2026-10-22). 종전에는 수치예보 수집·온라인
+      # 기록이 끝난 뒤 한 번에 커밋해, 수치예보 요청이 매달리면(실측 매 실행
+      # 10분 안팎) 갓 받은 관측이 그만큼 늦게 화면에 닿았다. 관측은 뒤의
+      # 스텝과 무관하게 완결된 수집분이다. `!cancelled()` 인 이유는 아래 마지막
+      # 커밋 스텝 주석과 같다(게이트 실패와 저장을 분리한다).
+      - name: Commit observations to data 브랜치
+        if: ${{ !cancelled() && !inputs.dry_run }}
+        working-directory: data
+        run: |
+          bash ${{ github.workspace }}/code/.github/scripts/commit_data.sh \
+            "데이터 갱신: 최근 관측 창 + 적중률 로그 대조 (자동)" \
+            cache/recent_window.json cache/accuracy_log.json cache/api_usage_daily.json
+
       # 수치예보(NWP) 창 갱신(2026-09-06). 관측 갱신과 **분리된 스텝**이고
       # `!cancelled()` 를 붙인 이유는 아래 커밋 스텝과 같다 — 관측 쪽 최신성
       # 게이트가 실패하면 상태 함수 없는 스텝은 암묵적 success() 로 skipped
@@ -175,8 +192,12 @@ jobs:
       # 게이트가 실패해도 **수집분은 아래 커밋 스텝이 `!cancelled()` 로
       # 보존한다** — 2026-08-18 에 배운 "저장과 경보를 분리한다" 원칙 그대로다.
       # 게이트는 저장이 끝난 뒤에 판정하므로 진척이 버려지지 않는다.
+      #
+      # 스텝 상한 5분(2026-10-22) — 요청 타임아웃을 30초로 줄였으므로 12곳이
+      # 전부 재시도까지 실패해도 이 안에 끝난다. 넘기면 다른 원인이다.
       - name: Refresh NWP forecast window
         if: ${{ !cancelled() && !inputs.dry_run }}
+        timeout-minutes: 5
         env:
           PYTHONPATH: ${{ github.workspace }}/code
         working-directory: data
@@ -230,56 +251,8 @@ jobs:
         if: ${{ !cancelled() && !inputs.dry_run }}
         working-directory: data
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add cache/recent_window.json cache/accuracy_log.json cache/api_usage_daily.json
-          # data 브랜치는 **자체 .gitignore 스냅숏**을 갖고 있어 main 의 예외
-          # 규칙(`!cache/nwp_recent.json`)이 반영돼 있지 않다. 그래서 평범한
-          # `git add` 는 이 파일을 조용히 무시한다 — 2026-09-07 에 실제로
-          # 이것 때문에 워크플로가 계속 초록불인데 파일만 안 올라왔다.
-          # 이 브랜치는 캐시 파일 운반 전용이므로 -f 로 강제하는 것이 맞고,
-          # 실패를 `2>/dev/null` 로 삼키지 않는다(그 침묵이 원인 규명을
-          # 늦췄다). 파일이 없으면 경고로 드러낸다.
-          if [ -f cache/nwp_recent.json ]; then
-            git add -f cache/nwp_recent.json
-          else
-            echo "::warning::cache/nwp_recent.json 이 없다 — NWP 수집 스텝을 확인할 것"
-          fi
-          if git diff --cached --quiet; then
-            echo "변경 없음 — 커밋 생략 (이미 최신이거나 신규 관측 0건)"
-            exit 0
-          fi
-          git commit -m "데이터 갱신: 최근 관측 창 + 적중률 로그 대조 (자동)"
-          # 커밋과 푸시 사이에 다른 실행이 먼저 푸시하면(15분 주기라 겹칠
-          # 가능성이 2시간 주기 때보다 낮지만 0은 아니다) non-fast-forward 로
-          # 거부되므로 rebase 로 다시 얹는다.
-          #
-          # rebase --abort 가 반드시 먼저 와야 한다(2026-08-19 수정). 이 잡이
-          # 건드리는 cache/*.json 은 파일 전체가 한 줄로 재생성되므로, 원격이
-          # 같은 파일을 건드렸으면 충돌은 가능성이 아니라 **필연**이다. 그때
-          # 러너는 rebase 진행 중 상태로 남고, 뒤이은 재시도는 네트워크에
-          # 닿지도 못한 채 "Pulling is not possible... unmerged files" 로
-          # 죽으면서 화면에는 엉뚱하게 "원격이 앞서 있음"만 찍힌다.
-          #
-          # 충돌 시 러너가 방금 수집한 쪽을 택한다 — 이 파일들은 관측을 다시
-          # 받아 통째로 재생성한 결과라 우리 것이 더 최신이다.
-          #
-          # 여기서 `-X theirs` 인 것이 맞다. rebase 는 upstream 을 체크아웃한 뒤
-          # 내 커밋을 그 위에 replay 하므로 ours/theirs 가 뒤집힌다 —
-          # ours=원격(upstream), theirs=내 커밋. 실측(2026-08-19)으로 확인:
-          #   -X ours   → 결과 REMOTE      (수집분이 버려진다. 틀림)
-          #   -X theirs → 결과 LOCAL-fresh (수집분이 남는다. 맞음)
-          #
-          # push/pull 대상은 `origin data` 로 명시한다 — actions/checkout 은
-          # 브랜치 ref 를 detached HEAD 로 체크아웃하므로, 인자 없는
-          # `git push`/`git pull` 은 추적 브랜치가 없어 실패한다.
-          for i in 1 2 3; do
-            git rebase --abort 2>/dev/null || true
-            git pull --rebase -X theirs --autostash origin data \
-              && git push origin HEAD:data && exit 0
-            echo "push 재시도 $i/3 (원격이 앞서 있거나 rebase 충돌)"
-            sleep 5
-          done
-          git rebase --abort 2>/dev/null || true
-          echo "::error::3회 시도 후에도 push 실패"
-          exit 1
+          # 커밋·rebase·재시도 절차는 스크립트 안의 주석 참고.
+          bash ${{ github.workspace }}/code/.github/scripts/commit_data.sh \
+            "데이터 갱신: 수치예보 창 + 온라인 예측 기록 (자동)" \
+            cache/recent_window.json cache/accuracy_log.json cache/api_usage_daily.json \
+            -f:cache/nwp_recent.json

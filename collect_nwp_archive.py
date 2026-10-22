@@ -46,7 +46,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-from weather_collector import STATION_COORDS
+from weather_collector import KST, STATION_COORDS
 
 API = "https://previous-runs-api.open-meteo.com/v1/forecast"
 MODEL = "jma_gsm"
@@ -55,6 +55,11 @@ ARCHIVE_PATH = "./cache/nwp_archive.json"
 RECENT_PATH = "./cache/nwp_recent.json"
 RECENT_DAYS = 5                     # 배포용 창 — recent_window.json 과 같은 성격
 SUFFIX = "_previous_day1"
+# 증분 요청의 응답 대기 상한(초). 7일치 × 7변수 응답은 수십 KB 라 정상이면
+# 1초 안에 온다. 종전에는 백필과 같은 300초였는데, CI 실측으로 18회 중 17회가
+# 627~630초 걸렸다 — 한 요청이 300초를 꽉 채워 기다린 뒤 재시도로 성공한
+# 패턴이고, 그동안 관측 커밋이 11분가량 늦었다(2026-10-21 점검).
+INCREMENTAL_TIMEOUT = 30
 
 # 변수 순서는 nwp_collector.NWP_VARS 와 반드시 같아야 한다 — 저장 파일이
 # 이 순서에 의존하지 않도록 dict 로 저장하지만, 재구성 순서를 한 곳에
@@ -64,7 +69,8 @@ NWP_VARS = ["precipitation", "temperature_2m", "relative_humidity_2m",
             "surface_pressure"]
 
 
-def _request(lat, lon, start, end, past_days=None, forecast_days=None, retries=4):
+def _request(lat, lon, start, end, past_days=None, forecast_days=None, retries=4,
+             timeout=300):
     hourly = ",".join(v + SUFFIX for v in NWP_VARS)
     params = dict(latitude=lat, longitude=lon, timezone="Asia/Seoul",
                   models=MODEL, hourly=hourly)
@@ -76,7 +82,7 @@ def _request(lat, lon, start, end, past_days=None, forecast_days=None, retries=4
     last = None
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(url, timeout=300) as resp:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
                 return json.loads(resp.read().decode())["hourly"]
         except Exception as exc:            # noqa: BLE001 — 재시도 대상 전부
             # 예외 문자열에 URL 이 통째로 들어가는 경우가 있다(CLAUDE.md
@@ -108,7 +114,7 @@ def _to_records(hourly):
 
 
 def backfill(end_date=None):
-    end = end_date or datetime.now().strftime("%Y-%m-%d")
+    end = end_date or datetime.now(KST).strftime("%Y-%m-%d")
     archive = {}
     if os.path.exists(ARCHIVE_PATH):
         with open(ARCHIVE_PATH, "r", encoding="utf-8") as f:
@@ -130,24 +136,49 @@ def incremental(days=RECENT_DAYS):
 
     미래 구간이 필요한 이유: 서빙 시점 T 에서 쓰는 특징이 유효시각 T+6h·
     T+12h 의 예보값이라, 현재 시각 이후의 예보가 파일에 들어 있어야 한다.
+
+    **관측소 하나의 실패가 나머지를 버리지 않는다(2026-10-22).** 종전에는
+    한 관측소의 요청이 끝내 실패하면 예외가 그대로 올라가 나머지 11곳의
+    수집분까지 저장되지 않았다(4절 "게이트와 저장을 분리한다" 위반). 지금은
+    실패한 관측소만 직전 창의 행을 그대로 두고(그 시점에 발표됐던 실제
+    예보다 — 날조가 아니라 "지금 것이 아닌 것"이며, 미래 여유가 줄면 아래
+    최신성 게이트가 잡는다) 나머지를 저장한 뒤, 실패를 빨간불로 알린다.
     """
     archive = {}
     if os.path.exists(ARCHIVE_PATH):
         with open(ARCHIVE_PATH, "r", encoding="utf-8") as f:
             archive = json.load(f)
-    recent = {}
+    previous = {}
+    if os.path.exists(RECENT_PATH):
+        with open(RECENT_PATH, "r", encoding="utf-8") as f:
+            previous = json.load(f)
+    recent, failed = {}, []
     for stn, (lat, lon) in STATION_COORDS.items():
-        hourly = _request(lat, lon, None, None, past_days=days, forecast_days=2)
-        rows = _to_records(hourly)
+        try:
+            hourly = _request(lat, lon, None, None, past_days=days, forecast_days=2,
+                              retries=3, timeout=INCREMENTAL_TIMEOUT)
+            rows = _to_records(hourly)
+        except Exception as exc:            # noqa: BLE001 — 관측소 단위로 격리
+            failed.append(stn)
+            print(f"  {stn} 실패 — {type(exc).__name__}: 직전 창의 행을 유지한다")
+            if stn in previous:
+                recent[stn] = previous[stn]
+            continue
         archive.setdefault(stn, {}).update(rows)
         recent[stn] = rows
         time.sleep(1)
     if os.path.exists(ARCHIVE_PATH):
         _save(ARCHIVE_PATH, archive)
-    _save(RECENT_PATH, recent)
-    n = min(len(v) for v in recent.values())
-    print(f"  갱신 완료 — 관측소당 최소 {n:,}시각, 배포 창 {RECENT_PATH}")
+    if recent:
+        _save(RECENT_PATH, recent)
+        n = min(len(v) for v in recent.values())
+        print(f"  갱신 완료 — 관측소당 최소 {n:,}시각, 배포 창 {RECENT_PATH}")
+    if failed:
+        print(f"::error::수치예보 수집 실패 {len(failed)}곳({', '.join(failed)}) — "
+              f"나머지는 저장했다. 실패 관측소는 직전 창의 예보로 남아 있다.")
     _freshness_gate(recent)
+    if failed:
+        raise SystemExit(1)
     return recent
 
 
@@ -169,11 +200,18 @@ def _freshness_gate(recent: dict) -> None:
     관측과 달리 이 축은 **미래 시각**이 있어야 쓸모가 있다 — 과거만 가득한
     창은 파일 크기가 정상이어도 예보를 만들지 못한다. 그래서 '얼마나 최신인가'
     가 아니라 '현재 이후 몇 시간이 채워져 있는가'로 잰다.
+
+    **현재 시각은 KST 로 잡는다(2026-10-22).** 창의 키는 KST 벽시계인데 종전에는
+    `datetime.now()`(러너는 UTC)로 비교해 현재를 9시간 과거로 셌다 — 미래 여유가
+    9시간 부풀려 보여, 실제 여유가 6시간 아래로 떨어져야 실패했다(+12h 리드에
+    이미 모자란 상태를 통과시켰다).
     """
-    now = datetime.now().strftime("%Y%m%d%H%M")
+    now = datetime.now(KST).strftime("%Y%m%d%H%M")
     worst_stn, worst_n = None, None
-    for stn, rows in recent.items():
-        n_future = sum(1 for ts in rows if ts > now)
+    for stn in STATION_COORDS:
+        # 창에 아예 없는 관측소는 여유 0 이다 — 있는 것만 세면 통째로 빠진
+        # 관측소를 놓친다.
+        n_future = sum(1 for ts in recent.get(stn, {}) if ts > now)
         if worst_n is None or n_future < worst_n:
             worst_stn, worst_n = stn, n_future
     print(f"  미래 예보 여유 — 최소 관측소({worst_stn}) {worst_n}시각 "
