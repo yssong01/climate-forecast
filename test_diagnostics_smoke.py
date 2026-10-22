@@ -87,7 +87,7 @@ DIAGNOSTIC_MODULES = [
     # 같은 워크플로의 관측 창 갱신 — 임포트가 깨지면 창이 멈춘다(2026-10-21 추가).
     "refresh_deploy_data",
     # 2026-09-27 신설 — 남아 있던 세 항목을 닫은 측정 도구들.
-    "aerosol_gbm_check", "precip_floor_check",
+    "aerosol_gbm_check", "precip_floor_check", "migrate_training_wind_dir",
     # 2026-10-21 신설 — 관측소별 강수 F1 을 검증셋·온라인에서 같은 정의로 잰다.
     "station_precip_check",
     # 승격 절차의 수동 작업 4번이 이 스크립트를 부른다(2026-09-23 추가).
@@ -544,6 +544,24 @@ def _wind_dir_units():
     return f"파서 27→270° · sin/cos(-1,0) · 멱등 · 폴백 이행 · {note}"
 
 
+def _training_wd_guard():
+    """학습 캐시의 10도 단위 풍향이 학습을 막는가(2026-10-22).
+
+    `train.train()` 이 부르는 가드다. 포털 구간(2026 이전)·표식 있는 레코드는
+    통과하고, API 구간의 표식 없는 레코드는 막아야 한다.
+    """
+    import migrate_training_wind_dir as m
+    ok = [{"timestamp": "202512312300", "wind_dir": 20.0},
+          {"timestamp": "202603010000", "wind_dir": 270.0, "wind_dir_unit": "deg"}]
+    m.assert_migrated(ok)
+    try:
+        m.assert_migrated(ok + [{"timestamp": "202603010100", "wind_dir": 27.0}])
+        raise AssertionError("표식 없는 API 구간 레코드를 통과시켰다")
+    except SystemExit:
+        pass
+    return "포털 구간·이행 레코드 통과 · 미이행 API 레코드 차단"
+
+
 def _api_budget_guards():
     """API 호출이 결측·장애 때 폭주하지 않는가(2026-10-21).
 
@@ -797,6 +815,8 @@ def main():
     check("accuracy_wet", _accuracy_wet_stats)
     print("\n[T3-5] 서빙 입력의 풍향 단위(API 10도 단위 → 도)")
     check("wind_dir_units", _wind_dir_units)
+    print("\n[T3-5b] 학습 캐시 풍향 단위 가드")
+    check("training_wd_guard", _training_wd_guard)
     print("\n[T3-6] API 호출 폭주 방지(탐침·일일 상한·수치예보 선확인)")
     check("api_budget", _api_budget_guards)
     print("\n[T3-6b] 창 내부 공백·대조 불가 대기 항목")

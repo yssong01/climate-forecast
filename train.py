@@ -1298,6 +1298,10 @@ def train(orthogonalize: bool = ORTHOGONALIZE,
     if len(records) < 20:
         print("[ERROR] 데이터 부족 (최소 20개 필요). API 연결을 확인하세요.")
         return {}
+    # 학습 캐시의 API 경로 레코드가 10도 단위 풍향이면 학습하지 않는다(2026-10-22,
+    # migrate_training_wind_dir.py) — 서빙은 도 단위로 고쳐졌다.
+    from migrate_training_wind_dir import assert_migrated
+    assert_migrated(records)
 
     if verbose:
         print(f"Re축 공간보간장 생성 중 (12관측소 실측 IDW 보간, {RE_CHANNELS}ch 32×32)...")
