@@ -259,14 +259,26 @@ MSM_VARS = ["precipitation", "temperature_2m", "relative_humidity_2m", "cloud_co
 MSM_RECENT_PATH = "./cache/nwp_msm_recent.json"
 
 
-def msm_snapshot():
-    """MSM previous_day1 의 최근 2일 + 앞으로 2일 창을 저장한다. **실패해도 서빙과 무관하다** —
-    경고만 남기고 종료코드 0(측정용 수집이 관측·수치예보 갱신을 빨간불로 만들지 않게)."""
-    hourly_vars = ",".join(v + SUFFIX for v in MSM_VARS)
+# jma_gsm previous_day2 — 특보 기준에 맞춘 '다음날 아침 최저·낮 체감온도' 창이 한파 F1 을
+# +0.078(+6h)·+0.049(+12h) 올렸다(교차 적합, 유의 — NEXT.md 4-1). 단 그 측정은 예측 시점
+# +33h 이내 값이 서빙 때 이미 굳어 있다는 **유추**에 기대고 있어, 같은 방법으로 잰다.
+D2_RECENT_PATH = "./cache/nwp_d2_recent.json"
+SNAPSHOTS = {
+    "msm": (MSM_MODEL, "_previous_day1", MSM_RECENT_PATH),
+    "d2": (MODEL, "_previous_day2", D2_RECENT_PATH),
+}
+
+
+def msm_snapshot(kind="msm"):
+    """측정용 창(최근 2일 + 앞으로 2일)을 저장한다 — kind 는 SNAPSHOTS 키. 변수 배열 순서는
+    두 종류 모두 MSM_VARS(강수·기온·습도·운량)라 nwp_drift_check.py 가 그대로 읽는다.
+    **실패해도 서빙과 무관하다** — 경고만 남기고 종료코드 0."""
+    model, suffix, path = SNAPSHOTS[kind]
+    hourly_vars = ",".join(v + suffix for v in MSM_VARS)
     out, failed = {"fetched_at": datetime.now(KST).strftime("%Y%m%d%H%M"), "rows": {}}, []
     for stn, (lat, lon) in STATION_COORDS.items():
         q = urllib.parse.urlencode(dict(latitude=lat, longitude=lon, timezone="Asia/Seoul",
-                                        models=MSM_MODEL, hourly=hourly_vars,
+                                        models=model, hourly=hourly_vars,
                                         past_days=2, forecast_days=2))
         try:
             with urllib.request.urlopen(API + "?" + q, timeout=INCREMENTAL_TIMEOUT) as resp:
@@ -276,16 +288,16 @@ def msm_snapshot():
             continue
         rows = {}
         for i, t in enumerate(h["time"]):
-            row = [h[v + SUFFIX][i] for v in MSM_VARS]
+            row = [h[v + suffix][i] for v in MSM_VARS]
             if any(x is None for x in row):
                 continue
             rows[t.replace("-", "").replace("T", "").replace(":", "")[:12]] = row
         out["rows"][stn] = rows
         time.sleep(0.5)
     if out["rows"]:
-        _save(MSM_RECENT_PATH, out)
+        _save(path, out)
     if failed:
-        print(f"::warning::MSM 스냅숏 실패 {len(failed)}곳: {', '.join(failed)} (측정용 — 서빙 무관)")
+        print(f"::warning::{kind} 스냅숏 실패 {len(failed)}곳: {', '.join(failed)} (측정용 — 서빙 무관)")
 
 
 def main():
@@ -294,10 +306,11 @@ def main():
     ap.add_argument("--incremental", action="store_true", help="최근분만 갱신(CI용)")
     ap.add_argument("--days", type=int, default=RECENT_DAYS)
     ap.add_argument("--msm-snapshot", action="store_true",
-                    help="jma_msm previous_day1 실시간 변동 측정용 스냅숏(서빙 무관)")
+                    help="측정용 스냅숏 — jma_msm previous_day1 과 jma_gsm previous_day2(서빙 무관)")
     args = ap.parse_args()
     if args.msm_snapshot:
-        msm_snapshot()
+        msm_snapshot("msm")
+        msm_snapshot("d2")
         return
     if args.backfill:
         print(f"NWP 아카이브 백필 — {MODEL} {ARCHIVE_START}~현재, "

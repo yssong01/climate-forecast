@@ -57,6 +57,18 @@ def kma_apparent_temp(ta, rh):
 # 아카이브와 같고 11~13시간이면 34%, 17시간 이상이면 0% 였다. 그래서 V 그룹은 예측
 # 시점 +9시간까지만 쓴다.
 CLEAN_H = 9
+DAY2 = {}
+_DAY2_PATH = os.environ.get("DAY2_ARCHIVE", "")
+if _DAY2_PATH and os.path.exists(_DAY2_PATH):
+    with open(_DAY2_PATH, encoding="utf-8") as _fp:
+        DAY2 = json.load(_fp)
+# day2 창에 쓸 유효시각 상한(예측 시점 기준 시간). 비우면 상한 없음 = 아카이브 확정값을 그대로
+# 쓰는 **상한 측정**이다(서빙 재현성은 따로 재야 한다 — nwp_drift_check.py).
+DAY2_CLEAN_H = int(os.environ["DAY2_CLEAN_H"]) if os.environ.get("DAY2_CLEAN_H") else None
+LABELS = {}
+if os.path.exists("./cache/weather_issue_labels.json"):
+    with open("./cache/weather_issue_labels.json", encoding="utf-8") as _fp:
+        LABELS = json.load(_fp)
 MSM = {}
 _MSM_PATH = os.environ.get("MSM_ARCHIVE", "")
 if _MSM_PATH and os.path.exists(_MSM_PATH):
@@ -79,6 +91,9 @@ def build_extra(stn, src, lead, obs, nwp, groups):
     if "V" in groups:
         for name in ("p9_sum", "p9_max", "t9_min", "t9_max", "at9_max", "dT9min"):
             cols["V_" + name] = np.full(n, np.nan)
+    if "D" in groups:          # jma_gsm previous_day2 — 특보 기준에 맞춘 '목표일·다음날' 창
+        for name in ("c_min_d0", "c_min_d1", "c_2day", "c_drop", "h_at_d0", "h_at_d1", "h_2day"):
+            cols["D_" + name] = np.full(n, np.nan)
     if "M" in groups:          # jma_msm previous_day1(2022-07~) — 깨끗한 창(+9h) 안만
         for name in ("p_V", "pwin_sum", "pwin_max", "t_V", "rh_V", "cc_V"):
             cols["M_" + name] = np.full(n, np.nan)
@@ -134,6 +149,42 @@ def build_extra(stn, src, lead, obs, nwp, groups):
                 cols["W_t24_max"][i] = max(w[1] for w in day)
                 if cur is not None:
                     cols["W_dT24"][i] = day[-1][1] - cur[0]
+        if "D" in groups and DAY2:
+            row = DAY2.get(s, {})
+            V0 = T + timedelta(hours=lead)
+            d0 = V0.replace(hour=0, minute=0)
+
+            def _window(day, h0, h1, idx):
+                vals = []
+                for h in range(h0, h1 + 1):
+                    V = day + timedelta(hours=h)
+                    if DAY2_CLEAN_H is not None and (V - T).total_seconds() / 3600 > DAY2_CLEAN_H:
+                        continue
+                    w = row.get(_key(V))
+                    if w is not None:
+                        vals.append(w if idx is None else w[idx])
+                return vals
+            m0 = _window(d0, 0, 9, 0)
+            m1 = _window(d0 + timedelta(days=1), 0, 9, 0)
+            if m0:
+                cols["D_c_min_d0"][i] = min(m0)
+            if m1:
+                cols["D_c_min_d1"][i] = min(m1)
+            if m0 and m1:
+                cols["D_c_2day"][i] = max(min(m0), min(m1))
+            past = [obs.get((s, _key(T - timedelta(hours=h)))) for h in range(0, 24)]
+            past = [p_[0] for p_ in past if p_ is not None]
+            fut = [v for v in (m0 + m1)]
+            if past and fut:
+                cols["D_c_drop"][i] = min(fut) - min(past)
+            a0 = [float(kma_apparent_temp(w[0], w[1])) for w in _window(d0, 12, 17, None)]
+            a1 = [float(kma_apparent_temp(w[0], w[1])) for w in _window(d0 + timedelta(days=1), 12, 17, None)]
+            if a0:
+                cols["D_h_at_d0"][i] = max(a0)
+            if a1:
+                cols["D_h_at_d1"][i] = max(a1)
+            if a0 and a1:
+                cols["D_h_2day"][i] = min(max(a0), max(a1))
         if "M" in groups and MSM:
             row = MSM.get(s, {})
             V = T + timedelta(hours=lead)
@@ -213,7 +264,11 @@ def main():
     xtr0, xva0 = f["x_train"], f["x_val"]
     day = f["tgt_ts_val"].astype(np.int64) // 10 ** 4
     calib = day % 2 == 0
-    ev = ~calib
+    # CROSSFIT=1 — 각 절반의 판정선을 **다른 절반**에서 골라 양쪽을 모두 평가에 쓴다. 모델은
+    # 학습 분할로만 적합하므로 표본 내 이득이 없고, 평가 표본이 두 배가 된다(한파 착수처럼
+    # 사건이 수십 개뿐인 지표의 신뢰구간을 좁히려는 것 — 조사 권고의 날짜 그룹 k-fold).
+    CROSSFIT = os.environ.get("CROSSFIT") == "1"
+    ev = np.ones(len(day), bool) if CROSSFIT else ~calib
     ev_days = np.unique(day[ev])
     rows_of = {d: np.flatnonzero(ev & (day == d)) for d in ev_days}
 
@@ -223,9 +278,13 @@ def main():
         p = np.full(len(xva), np.nan)
         p[mva] = m.predict_proba(xva[mva])[:, 1]
         tau = pick_tau(p[mva], yva[mva], calib[mva])
+        if CROSSFIT:
+            tau_o = pick_tau(p[mva], yva[mva], ~calib[mva])
+            return np.where(calib, p >= tau_o, p >= tau) & mva, tau
         return (p >= tau) & mva, tau
 
     results = []
+    PREV = {}
     # ── 강수 발생 ──
     wet = 0.1
     ytr, yva = f["precip_true_train"] >= wet, f["precip_true_val"] >= wet
@@ -237,7 +296,6 @@ def main():
     # ── 폭염·한파 — 배포와 같은 마스크·단조 제약. 제약 열은 extreme_gbm 과 **같은
     # 함수**로 구한다(열 번호를 여기서 세면 특징 집합이 바뀔 때 조용히 어긋난다).
     import importlib
-    import os
     import extreme_gbm as _eg
     import train as _t
     os.environ["USE_NWP"] = "1" if bool(f["use_nwp"]) else "0"
@@ -256,12 +314,31 @@ def main():
         # 열 이름은 특징을 만든 함수가 돌려준 순서 그대로 쓴다 — 여기서 목록을 따로
         # 적으면 그룹을 늘릴 때 제약 벡터 길이가 어긋난다(M 그룹 추가 때 실제로 그랬다).
         names = extra_names
-        # 새 기온 열도 같은 방향으로 단조 제약한다(폭염 +, 한파 −).
-        cst1 = cst0 + [(sign if n in ("W_t24_min", "W_t24_max", "V_t9_min", "V_t9_max", "V_at9_max")
-                        else 0) for n in names]
+        # 새 기온 열도 같은 방향으로 단조 제약한다(폭염 +, 한파 −). day2 열은 자기 헤드에만 건다 —
+        # 한파 열(D_c_*)은 한파 헤드에서 −(더 춥고 더 크게 떨어질수록 ↑), 폭염 열(D_h_*)은 폭염 헤드에서 +.
+        def _c(n):
+            if n in ("W_t24_min", "W_t24_max", "V_t9_min", "V_t9_max", "V_at9_max"):
+                return sign
+            if n.startswith("D_c_"):
+                return -1 if head == "coldwave" else 0
+            if n.startswith("D_h_"):
+                return +1 if head == "heatwave" else 0
+            return 0
+        cst1 = cst0 + [_c(n) for n in names]
         pb, _ = fit_eval(np.hstack([xtr0, sets["train"]]), np.hstack([xva0, sets["val"]]),
                          ytr_e, yva_e, mtr, mva, cst1)
         results.append((head, pa, pb, yva_e, mva))
+        # 목표일 '전날' 라벨 — 착수(전날 0)·지속(전날 1) 분해용. 없으면 NaN(분해에서 빠진다).
+        from datetime import date as _date
+        prev = np.full(len(yva_e), np.nan)
+        lab = f"{head}_advisory"
+        for k_ in np.flatnonzero(mva):
+            dd = str(int(f["tgt_ts_val"][k_]))[:8]
+            d_prev = (_date(int(dd[:4]), int(dd[4:6]), int(dd[6:8])) - timedelta(days=1)).isoformat()
+            rec = LABELS.get(str(int(f["stn_val"][k_])), {}).get(d_prev)
+            if rec is not None and lab in rec:
+                prev[k_] = rec[lab]
+        PREV[head] = prev
 
     era = f["tgt_ts_val"].astype(np.int64) >= 202207100000
     if "M" in groups:
@@ -274,7 +351,22 @@ def main():
             lo, hi = boot_diff(sc2, ed, ro)
             print(f"  {name:<10}{f1(pa[e], y[e]):>10.4f}{f1(pb[e], y[e]):>12.4f}"
                   f"{f1(pb[e], y[e]) - f1(pa[e], y[e]):>+9.4f}   [{lo:+.4f}, {hi:+.4f}] (날짜 {len(ed)})")
-    print(f"\n평가용 절반(목표일 홀수) — 판정선은 보정용 절반에서 고름 · 부트스트랩 날짜 {len(ev_days)}개")
+    if PREV:
+        print(f"\n[착수·지속 분해 — {'검증셋 전체(교차 적합)' if CROSSFIT else '평가용 절반'}] "
+              "착수 = 목표일 전날 특보 0, 지속 = 전날 1")
+        for name, pa, pb, y, m in results:
+            if name not in PREV:
+                continue
+            for lab_, cond in (("착수", PREV[name] == 0), ("지속", PREV[name] == 1)):
+                e = np.flatnonzero(ev & m & cond)
+                ed = np.unique(day[e]); ro = {d: e[day[e] == d] for d in ed}
+                def sc3(idx, pa=pa, pb=pb, y=y):
+                    return f1(pb[idx], y[idx]) - f1(pa[idx], y[idx])
+                lo, hi = boot_diff(sc3, ed, ro)
+                print(f"  {name:<10}{lab_}  양성 {int(y[e].sum()):>5} · F1 {f1(pa[e], y[e]):.4f} → "
+                      f"{f1(pb[e], y[e]):.4f} ({f1(pb[e], y[e]) - f1(pa[e], y[e]):+.4f}) [{lo:+.4f}, {hi:+.4f}]")
+    print(f"\n{'교차 적합 — 검증셋 전체(각 절반의 판정선은 다른 절반에서)' if CROSSFIT else '평가용 절반(목표일 홀수) — 판정선은 보정용 절반에서 고름'}"
+          f" · 부트스트랩 날짜 {len(ev_days)}개")
     print(f"{'출력':<10}{'현행 28':>10}{'+'+args.groups:>12}{'Δ':>9}   95% CI")
     for name, pa, pb, y, m in results:
         def sc(idx, pa=pa, pb=pb, y=y, m=m):

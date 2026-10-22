@@ -214,8 +214,9 @@ jobs:
 
       # jma_msm 실시간 변동 측정용 스냅숏(2026-10-22) — **서빙에 쓰지 않는다.** 강수 후보
       # (MSM previous_day1)를 채택하기 전에, 미래 유효시각 값이 실시간으로 얼마나 바뀌는지를
-      # 커밋 이력으로 모은다(collect_nwp_archive.msm_snapshot 주석). 관측소 12곳 × 1회라
-      # 하루 약 1,152회 늘어 Open-Meteo 합계 약 2,300회/일(무료 한도 10,000). 실패는 경고만.
+      # 커밋 이력으로 모은다(collect_nwp_archive.msm_snapshot 주석). 2026-10-22 부터 jma_gsm
+      # previous_day2 도 같은 방식으로 모은다(한파 후보). 관측소 12곳 × 2종이라 하루 약 2,304회
+      # 늘어 Open-Meteo 합계 약 3,450회/일(무료 한도 10,000). 실패는 경고만.
       # 측정이 끝나면(2~4주, NEXT.md 4-1) 채택 여부와 함께 이 스텝을 정리한다.
       - name: Snapshot MSM window (측정용)
         if: ${{ !cancelled() && !inputs.dry_run }}
@@ -284,4 +285,4 @@ jobs:
           bash ${{ github.workspace }}/code/.github/scripts/commit_data.sh \
             "데이터 갱신: 수치예보 창 + 온라인 예측 기록 (자동)" \
             cache/recent_window.json cache/accuracy_log.json cache/api_usage_daily.json \
-            -f:cache/nwp_recent.json -f:cache/nwp_msm_recent.json
+            -f:cache/nwp_recent.json -f:cache/nwp_msm_recent.json -f:cache/nwp_d2_recent.json
