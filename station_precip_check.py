@@ -119,8 +119,39 @@ def rank_note(res, focus):
     return f"{focus} 은 {len(others) + 1}곳 중 F1 {f:.3f} 로 하위에서 {below + 1}번째"
 
 
+def station_tau(occ_p, amt_p, truth, stn, ts, tau, min_gain=0.01):
+    """관측소별 판정선을 따로 고르면 나아지는가(2026-10-22, NEXT.md P3-6).
+
+    2절 규약대로 **보정용(목표일 짝수)에서 고르고 평가용(홀수)에서만 채점**한다.
+    순이득이 `min_gain` 미만이면 채택하지 않는다. 한 관측소만 보지 않고 전부
+    재는 이유 — 기준을 넘는 관측소가 몇 곳 나오는지와 손해 본 곳의 수를 함께
+    보아야 선택 잡음과 진짜 이득을 가를 수 있다.
+    """
+    cand = np.arange(0.05, 0.96, 0.005)
+    calib = (ts // 10 ** 4) % 2 == 0
+    true = truth >= HIT_PRECIP_THRESH
+
+    def f1(t, m):
+        return f1_of(*counts(np.where(occ_p[m] >= t, amt_p[m], 0.0) >= HIT_PRECIP_THRESH,
+                             true[m]))
+    deltas = []
+    print(f"\n관측소별 판정선(보정용에서 선택 → 평가용 채점, 전역 τ={tau:.3f})")
+    for s_ in sorted(set(stn)):
+        m = stn == s_
+        best = cand[int(np.argmax([f1(t, m & calib) for t in cand]))]
+        g0, g1 = f1(tau, m & ~calib), f1(best, m & ~calib)
+        deltas.append(g1 - g0)
+        print(f"  {s_}: τ {best:.3f} · 평가용 F1 {g0:.4f} → {g1:.4f} (Δ {g1 - g0:+.4f})"
+              + ("  ← 기준 충족" if g1 - g0 >= min_gain else ""))
+    d = np.array(deltas)
+    print(f"  기준 충족 {int((d >= min_gain).sum())}곳 · 손해 ≥{min_gain} {int((d <= -min_gain).sum())}곳 · "
+          f"평균 Δ {d.mean():+.4f}")
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--station-tau", action="store_true",
+                    help="관측소별 판정선 선택의 순이득을 보정용/평가용 분리로 잰다")
     ap.add_argument("--log", default=None, help="적중률 로그 스냅숏(JSON)")
     ap.add_argument("--station", default="184")
     ap.add_argument("--model-id", default=None,
@@ -157,6 +188,11 @@ def main():
     if abs(f1_all - expected) > 5e-4:
         raise SystemExit("전체 F1 이 배포 기록값과 다르다 — 채점 정의가 어긋났으므로 "
                          "관측소별 표를 해석하지 않는다.")
+
+    if args.station_tau:
+        station_tau(occ.predict_proba1(x), np.clip(amt.predict(x), 0, None),
+                    truth, v_stn, v_ts, tau)
+        return
 
     res_val = table("검증셋 전체", v_stn, v_ts, v_pred, v_true, focus)
 
