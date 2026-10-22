@@ -87,7 +87,7 @@ DIAGNOSTIC_MODULES = [
     # 같은 워크플로의 관측 창 갱신 — 임포트가 깨지면 창이 멈춘다(2026-10-21 추가).
     "refresh_deploy_data",
     # 2026-09-27 신설 — 남아 있던 세 항목을 닫은 측정 도구들.
-    "aerosol_gbm_check", "precip_floor_check", "migrate_training_wind_dir", "calibration_math", "stack_compare",
+    "aerosol_gbm_check", "precip_floor_check", "migrate_training_wind_dir", "calibration_math", "stack_compare", "nwp_drift_check", "feature_probe_gbm",
     # 2026-10-21 신설 — 관측소별 강수 F1 을 검증셋·온라인에서 같은 정의로 잰다.
     "station_precip_check",
     # 승격 절차의 수동 작업 4번이 이 스크립트를 부른다(2026-09-23 추가).

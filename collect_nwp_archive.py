@@ -247,12 +247,58 @@ def _save(path, obj):
     print(f"  저장 {path} ({os.path.getsize(path) / 1e6:.1f}MB)")
 
 
+# ── jma_msm 실시간 변동 측정용 스냅숏(2026-10-22) ─────────────────────
+# `jma_msm`(5km·1시간) previous_day1 을 강수 GBM 에 더하면 MSM 자료가 있는 2022-07 이후
+# 표본에서 발생 F1 이 +0.021 [+0.007, +0.038] 올랐다(feature_probe_gbm.py, NEXT.md 4-1).
+# 그런데 GSM 의 previous_day1 은 미래 유효시각 값이 실시간으로 확정값이 아니었다(CLAUDE.md
+# 4절 정정 — 유효시각까지 11~13h 면 34% 만 아카이브와 같다). MSM 도 그런지 재기 전에는
+# 채택할 수 없으므로, **서빙에 쓰지 않고 수집만** 한다. data 브랜치 커밋 이력이 곧
+# 스냅숏 시계열이고, `nwp_drift_check.py` 가 그것을 아카이브와 대조한다.
+MSM_MODEL = "jma_msm"
+MSM_VARS = ["precipitation", "temperature_2m", "relative_humidity_2m", "cloud_cover"]
+MSM_RECENT_PATH = "./cache/nwp_msm_recent.json"
+
+
+def msm_snapshot():
+    """MSM previous_day1 의 최근 2일 + 앞으로 2일 창을 저장한다. **실패해도 서빙과 무관하다** —
+    경고만 남기고 종료코드 0(측정용 수집이 관측·수치예보 갱신을 빨간불로 만들지 않게)."""
+    hourly_vars = ",".join(v + SUFFIX for v in MSM_VARS)
+    out, failed = {"fetched_at": datetime.now(KST).strftime("%Y%m%d%H%M"), "rows": {}}, []
+    for stn, (lat, lon) in STATION_COORDS.items():
+        q = urllib.parse.urlencode(dict(latitude=lat, longitude=lon, timezone="Asia/Seoul",
+                                        models=MSM_MODEL, hourly=hourly_vars,
+                                        past_days=2, forecast_days=2))
+        try:
+            with urllib.request.urlopen(API + "?" + q, timeout=INCREMENTAL_TIMEOUT) as resp:
+                h = json.loads(resp.read().decode())["hourly"]
+        except Exception as exc:            # noqa: BLE001 — 관측소 단위로 격리
+            failed.append(f"{stn}({type(exc).__name__})")
+            continue
+        rows = {}
+        for i, t in enumerate(h["time"]):
+            row = [h[v + SUFFIX][i] for v in MSM_VARS]
+            if any(x is None for x in row):
+                continue
+            rows[t.replace("-", "").replace("T", "").replace(":", "")[:12]] = row
+        out["rows"][stn] = rows
+        time.sleep(0.5)
+    if out["rows"]:
+        _save(MSM_RECENT_PATH, out)
+    if failed:
+        print(f"::warning::MSM 스냅숏 실패 {len(failed)}곳: {', '.join(failed)} (측정용 — 서빙 무관)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backfill", action="store_true", help="2016년부터 전 구간 수집")
     ap.add_argument("--incremental", action="store_true", help="최근분만 갱신(CI용)")
     ap.add_argument("--days", type=int, default=RECENT_DAYS)
+    ap.add_argument("--msm-snapshot", action="store_true",
+                    help="jma_msm previous_day1 실시간 변동 측정용 스냅숏(서빙 무관)")
     args = ap.parse_args()
+    if args.msm_snapshot:
+        msm_snapshot()
+        return
     if args.backfill:
         print(f"NWP 아카이브 백필 — {MODEL} {ARCHIVE_START}~현재, "
               f"{len(STATION_COORDS)}개 관측소")
