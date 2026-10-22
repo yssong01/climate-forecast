@@ -84,6 +84,19 @@ CONCURRENCY = 6
 FETCH_RETRIES = 1
 PROBE_AFTER_HOURS = 3     # 정상 실행의 공백은 1~2시간이다
 
+# 창 **내부** 공백 재요청(2026-10-22). 위 격차 계산은 관측소별 최신 관측
+# **이후**만 보므로, 그 앞에 생긴 구멍(그 실행에서 미발표였다가 나중에
+# 발표된 시각)은 창에서 밀려날 때까지 영구히 남았다 — 수원(119) 10-20
+# 12~15시 4시간이 실재했고, 그 시각을 목표로 한 적중률 대기 4건도 함께
+# 영원히 대조되지 않았다. 결측이 KMA 쪽에서 영구적이면 매 실행 재요청이
+# 곧 호출 폭주이므로(위 2,466건 사고와 같은 유형) 세 겹으로 묶는다:
+# ① 최근 `INTERIOR_REFILL_HOURS` 안의 구멍만, ② **한 시간에 한 실행**
+# (분이 15 미만인 실행 — Cloudflare 트리거의 :01 실행)에서만, ③ 실행당
+# `INTERIOR_MAX_PER_RUN` 건까지(최신 쪽부터). 구멍 하나의 최대 비용은
+# 48건이고, 최악(구멍이 상한 이상 계속 있는 경우)에도 하루 144건이다.
+INTERIOR_REFILL_HOURS = 48
+INTERIOR_MAX_PER_RUN = 6
+
 # 최신성 감시 임계값 — 이 갱신이 끝난 뒤에도 가장 뒤처진 관측소가 기준
 # 시각보다 이만큼 이상 묵었으면 실행을 실패로 표시한다(2026-08-16 실측:
 # 워크플로가 6~7시간 주기로 "성공"을 계속 찍었는데도 실제 데이터는
@@ -211,6 +224,36 @@ def _plan_targets(existing: dict, stations: list, ceiling: datetime,
     return targets, backfill
 
 
+def _interior_holes(existing: dict, stations: list, skip: set) -> list:
+    """관측소별 최신 관측 앞 `INTERIOR_REFILL_HOURS` 안의 빈 시각, 최신 쪽부터.
+
+    `skip` 은 탐침 중인 관측소다 — 최신 관측조차 못 받는 관측소의 과거 구멍을
+    먼저 메울 이유가 없다. 상한(`INTERIOR_MAX_PER_RUN`)은 전체 기준이다.
+    """
+    latest = _latest_per_station(existing)
+    earliest = {}
+    for stn, ts in existing.keys():
+        dt = datetime.strptime(ts[:12], "%Y%m%d%H%M")
+        if stn not in earliest or dt < earliest[stn]:
+            earliest[stn] = dt
+    holes = []
+    for stn in stations:
+        if stn in skip or stn not in latest:
+            continue
+        for i in range(1, INTERIOR_REFILL_HOURS + 1):
+            dt = latest[stn] - timedelta(hours=i)
+            # **양쪽에 관측이 있는 구멍만** 본다 — 첫 관측 앞은 구멍이 아니라
+            # 창의 시작이다(갓 심은 관측소는 24시간뿐이라, 이 조건이 없으면
+            # 그 앞 24시간을 매시 재요청한다).
+            if dt <= earliest[stn]:
+                break
+            tm = dt.strftime("%Y%m%d%H00")
+            if (stn, tm) not in existing:
+                holes.append((i, stn, tm))
+    holes.sort()
+    return [(stn, tm) for _, stn, tm in holes[:INTERIOR_MAX_PER_RUN]]
+
+
 def _fetch(collectors: dict, targets: list) -> tuple[dict, int]:
     """(관측소, 시각) 목록을 병렬 조회한다. 반환: ({(stn, tm): 레코드}, 실패 수).
 
@@ -266,6 +309,14 @@ def main():
           + (f" · 풍향 단위 이행 {n_migrated:,}건" if n_migrated else "") + "\n")
 
     targets, backfill = _plan_targets(existing, args.stations, ceiling, station_names)
+    # 창 내부 공백 — 한 시간에 한 실행만(위 INTERIOR_REFILL_HOURS 주석).
+    if datetime.now(KST).minute < 15:
+        holes = _interior_holes(existing, args.stations, set(backfill))
+        if holes:
+            print(f"  창 내부 공백 {len(holes)}건 재요청(최근 {INTERIOR_REFILL_HOURS}시간, "
+                  f"실행당 상한 {INTERIOR_MAX_PER_RUN}): "
+                  + ", ".join(f"{station_names.get(s, s)} {t[4:10]}" for s, t in holes))
+            targets += holes
     print(f"\n총 {len(targets)}건 요청 예정"
           + (f"(탐침 {len(backfill)}곳 — 성공 시 최대 "
              f"{sum(map(len, backfill.values()))}건 추가)" if backfill else ""))
@@ -321,6 +372,13 @@ def main():
     # ── 적중률 로그의 대기 항목 해소 ──────────────────────────────────
     # 방금 갱신한 창이 곧 실측 원본이다. 새 API 호출은 하지 않는다.
     resolved = accuracy.resolve_pending(records)
+    # 창보다 오래된 대기 항목은 영영 대조될 수 없다 — 대조 원본이 이 창뿐이다.
+    if records:
+        window_start = min(str(r["timestamp"])[:12] for r in records.values())
+        expired = accuracy.expire_unresolvable(window_start)
+        if expired:
+            print(f"::warning::창({window_start[:10]}~)보다 오래돼 대조할 수 없는 대기 "
+                  f"항목 {expired}건을 지웠다 — 그 시각 관측이 끝내 창에 들어오지 않았다")
     stats = accuracy.stats()
     print(f"적중률 로그: 신규 해소 {resolved}건 / 대조 완료 누적 {stats['cum_n']}건")
     if stats["cum_n"]:

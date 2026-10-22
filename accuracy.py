@@ -272,6 +272,26 @@ def trim(retain_days: int = RETAIN_DAYS, path: str = LOG_PATH) -> int:
         return removed
 
 
+def expire_unresolvable(window_start: str, path: str = LOG_PATH) -> int:
+    """목표 시각이 관측 창의 시작보다 이른 **대기** 항목을 지운다. 반환: 지운 건수.
+
+    대조의 원본은 `recent_window.json` 하나라(`resolve_pending`), 창에서 밀려난
+    시각은 다시는 대조될 수 없다. `trim()` 이 대기 항목을 남기는 이유("영영
+    대조되지 않으면 그 자체가 갱신 경로가 끊겼다는 신호")는 그 신호가 **창
+    안에** 있는 동안만 성립한다 — 창 밖으로 나간 뒤에는 정체된 대기 수로
+    화면을 오염시킬 뿐이다(2026-10-22, 수원 10-20 12~15시 4건). 호출부가 지운
+    건수를 경고로 드러낸다.
+    """
+    with _lock:
+        entries = _load(path)
+        kept = [e for e in entries
+                if e["actual_temp"] is not None or str(e["target_time"])[:12] >= window_start]
+        removed = len(entries) - len(kept)
+        if removed:
+            _save(kept, path)
+        return removed
+
+
 def log_summary(path: str = LOG_PATH) -> dict:
     """
     로그 파일 자체의 규모 — 적중률이 아니라 "표본이 얼마나 있고 얼마나

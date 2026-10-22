@@ -612,6 +612,45 @@ def _api_budget_guards():
     return "탐침 계획(정상 1·결측 1+9·신규 1+23) · 재시도 1 · 일일 상한 · 수치예보 선확인(조회 1회)"
 
 
+def _window_gap_upkeep():
+    """창 내부 공백 재요청과 대조 불가 대기 항목 정리(2026-10-22).
+
+    ① 최신 관측 앞의 구멍을 최신 쪽부터 찾고, 탐침 중 관측소는 빼며, 실행당
+       상한을 지킨다. ② 창보다 오래된 **대기** 항목만 지우고 대조 완료 항목·
+       창 안의 대기 항목은 남긴다.
+    """
+    import tempfile
+    import accuracy
+    import refresh_deploy_data as rd
+    rec = lambda s, t: {"stn": s, "timestamp": t}
+    hours = [f"20261020{h:02d}00" for h in range(0, 24)]
+    existing = {(s, t): rec(s, t) for s in ("119", "108") for t in hours}
+    for t in ("202610201200", "202610201300", "202610201500"):
+        del existing[("119", t)]
+    got = rd._interior_holes(existing, ["119", "108"], set())
+    assert got == [("119", "202610201500"), ("119", "202610201300"),
+                   ("119", "202610201200")], got
+    assert rd._interior_holes(existing, ["119", "108"], {"119"}) == []
+    for t in hours[2:10]:
+        existing.pop(("108", t), None)
+    assert len(rd._interior_holes(existing, ["119", "108"], set())) == rd.INTERIOR_MAX_PER_RUN
+
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        e = lambda tt, done: {"station": "119", "target_time": tt, "source": "ci",
+                              "actual_temp": 1.0 if done else None}
+        accuracy._save([e("202610100000", False), e("202610100000", True),
+                        e("202610150000", False)], path)
+        assert accuracy.expire_unresolvable("202610120000", path) == 1
+        left = accuracy._load(path)
+        assert len(left) == 2 and all(x["target_time"] == "202610150000" or
+                                      x["actual_temp"] is not None for x in left)
+    finally:
+        os.remove(path)
+    return "내부 구멍 최신순·탐침 관측소 제외·실행당 상한 · 창 밖 대기 항목만 정리"
+
+
 def _promotion_guards():
     """승격 절차의 두 안전장치가 동작하는가(2026-10-21).
 
@@ -760,6 +799,8 @@ def main():
     check("wind_dir_units", _wind_dir_units)
     print("\n[T3-6] API 호출 폭주 방지(탐침·일일 상한·수치예보 선확인)")
     check("api_budget", _api_budget_guards)
+    print("\n[T3-6b] 창 내부 공백·대조 불가 대기 항목")
+    check("window_upkeep", _window_gap_upkeep)
     print("\n[T3-7] 승격 절차 — 죽은 게이트·입력 계약")
     check("promotion", _promotion_guards)
     print("\n[T3-8] GBM 정규화 통계·출처 결속, 앱 캐시 키")
