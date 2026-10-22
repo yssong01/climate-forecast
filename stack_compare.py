@@ -52,9 +52,11 @@ def stack_outputs(main, pgbm, egbm):
     pg.check_input_contract(pmeta, f, pgbm, "강수 GBM")
     models, emeta = eg.load(egbm)
     pg.check_input_contract(emeta, f, egbm, "극한기상 GBM")
-    x = f["x_val"]
-    served = np.where(occ.predict_proba1(x) >= float(pmeta["meta_gate_tau"]),
-                      np.clip(amt.predict(x), 0, None), 0.0)
+    import gbm_extra                          # GBM 전용 추가 특징 — 묶음마다 사양이 다를 수 있다
+    xp = gbm_extra.augment(pmeta, f["x_val"], f["stn_val"], f["src_ts_val"], int(f["lead_hours"]))
+    xe = gbm_extra.augment(emeta, f["x_val"], f["stn_val"], f["src_ts_val"], int(f["lead_hours"]))
+    served = np.where(occ.predict_proba1(xp) >= float(pmeta["meta_gate_tau"]),
+                      np.clip(amt.predict(xp), 0, None), 0.0)
     out = {"stn": f["stn_val"], "ts": f["tgt_ts_val"].astype(np.int64),
            "precip_served": served, "precip_true": f["precip_true_val"]}
     for head, short in (("heatwave", "heat"), ("coldwave", "cold"), ("dust", "dust")):
@@ -62,7 +64,7 @@ def stack_outputs(main, pgbm, egbm):
         off = f.get(f"{short}_mask_official_val")
         if off is not None and int(off.sum()) and int(off.sum()) != int(mask.sum()):
             mask = mask & off.astype(bool)
-        p = eg.calibrated_batch(models, emeta, head, x)
+        p = eg.calibrated_batch(models, emeta, head, xe)
         out[f"{head}_pred"] = p >= eg.threshold(emeta, head)
         out[f"{head}_true"] = f[f"y_{head}_val"] > 0
         out[f"{head}_mask"] = mask

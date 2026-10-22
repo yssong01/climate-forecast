@@ -559,8 +559,10 @@ def main():
         if len(feat["tgt_ts_val"]) != len(d["tgt_ts"]):
             raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
         d = dict(d)
-        d["precip_pred"] = np.clip(amt.predict(feat["x_val"]), 0.0, None)
-        d["rain_prob"] = occ.predict_proba1(feat["x_val"])
+        import gbm_extra                      # GBM 전용 추가 특징(사양이 없으면 그대로)
+        _xp = gbm_extra.augment(gmeta, feat["x_val"], feat["stn_val"], feat["src_ts_val"], int(feat["lead_hours"]))
+        d["precip_pred"] = np.clip(amt.predict(_xp), 0.0, None)
+        d["rain_prob"] = occ.predict_proba1(_xp)
         d["precip_gate"] = np.array(float(gmeta["meta_gate_tau"]))
         print(f"강수 예측 출처: {args.precip_gbm} "
               f"(판정선 τ={float(gmeta['meta_gate_tau']):.3f})")
@@ -579,10 +581,11 @@ def main():
         if len(feat["tgt_ts_val"]) != len(d["tgt_ts"]):
             raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
         d = dict(d)
+        import gbm_extra
+        _xe = gbm_extra.augment(gmeta, feat["x_val"], feat["stn_val"], feat["src_ts_val"], int(feat["lead_hours"]))
         for _k, _short in (("heatwave", "heat"), ("coldwave", "cold"),
                            ("dust", "dust")):
-            d[f"{_short}_prob"] = _eg.calibrated_batch(
-                gmodels, gmeta, _k, feat["x_val"])
+            d[f"{_short}_prob"] = _eg.calibrated_batch(gmodels, gmeta, _k, _xe)
         d["extreme_thresholds"] = {k: _eg.threshold(gmeta, k)
                                    for k in ("heatwave", "coldwave", "dust")}
         print(f"극한기상 확률 출처: {args.extreme_gbm} (서빙과 동일)")

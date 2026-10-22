@@ -81,6 +81,9 @@ def main():
     wet_thresh = float(d["meta_wet_thresh"])
     tau = float(d["meta_gate_tau"])
 
+    import gbm_extra                          # GBM 전용 추가 특징(사양이 없으면 그대로)
+    x_va = gbm_extra.augment({k: d[k] for k in d.files if k.startswith("meta_")}, x_va,
+                             f["stn_val"], f["src_ts_val"], int(f["lead_hours"]))
     amt = np.clip(NumpyGBM(d, "amt").predict(x_va), 0, None).astype(np.float64)
     occ = NumpyGBM(d, "occ").predict_proba1(x_va).astype(np.float64)
     base = np.where(occ >= tau, amt, 0.0)          # 현행 서빙값

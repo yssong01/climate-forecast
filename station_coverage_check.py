@@ -90,6 +90,9 @@ def main():
         from precip_gbm import check_input_contract
         check_input_contract(gmeta, ckpt, gbm_path, "극한기상 GBM")
         xv = ds.X_num[vi.tolist()].numpy().astype(np.float32)
+        import gbm_extra                      # GBM 전용 추가 특징(사양이 없으면 그대로)
+        xv = gbm_extra.augment(gmeta, xv, [ds.stns[i] for i in vi.tolist()],
+                               [ds.src_timestamps[i] for i in vi.tolist()], int(ckpt["lead_hours"]))
         P = {k: _eg.calibrated_batch(gmodels, gmeta, k, xv)
              for k in ("heatwave", "coldwave", "dust")}
         print(f"극한기상 확률 출처: {gbm_path} (서빙과 동일)")

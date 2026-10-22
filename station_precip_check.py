@@ -169,7 +169,8 @@ def main():
     f = eval_cache.load_features(CKPT)
     amt, occ, meta = load(GBM)
     tau = float(meta["meta_gate_tau"])
-    x = f["x_val"]
+    import gbm_extra                          # GBM 전용 추가 특징(사양이 없으면 그대로)
+    x = gbm_extra.augment(meta, f["x_val"], f["stn_val"], f["src_ts_val"], int(f["lead_hours"]))
     served = np.where(occ.predict_proba1(x) >= tau,
                       np.clip(amt.predict(x), 0, None), 0.0)
     truth = f["precip_true_val"].astype(np.float64)

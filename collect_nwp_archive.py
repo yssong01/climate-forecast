@@ -44,7 +44,7 @@ import os
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from weather_collector import KST, STATION_COORDS
 
@@ -300,14 +300,57 @@ def msm_snapshot(kind="msm"):
         print(f"::warning::{kind} 스냅숏 실패 {len(failed)}곳: {', '.join(failed)} (측정용 — 서빙 무관)")
 
 
+# GBM 전용 추가 특징(gbm_extra.py)의 학습 아카이브. 스냅숏과 같은 변수 배열(MSM_VARS)이다.
+EXTRA_ARCHIVES = {
+    "d2":  (MODEL, "_previous_day2", "./cache/nwp_d2_archive.json", ARCHIVE_START),
+    "msm": (MSM_MODEL, "_previous_day1", "./cache/nwp_msm_archive.json", "2022-07-08"),
+}
+
+
+def backfill_extra(end_date=None):
+    """gbm_extra 학습 아카이브를 만든다 — 원천마다 관측소당 1회(전 구간). 로컬 전용(gitignore)."""
+    end = end_date or (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+    for kind, (model, suffix, path, start) in EXTRA_ARCHIVES.items():
+        out = {}
+        for stn, (lat, lon) in STATION_COORDS.items():
+            q = urllib.parse.urlencode(dict(latitude=lat, longitude=lon, timezone="Asia/Seoul",
+                                            models=model, hourly=",".join(v + suffix for v in MSM_VARS),
+                                            start_date=start, end_date=end))
+            for attempt in range(4):
+                try:
+                    with urllib.request.urlopen(API + "?" + q, timeout=300) as resp:
+                        h = json.loads(resp.read().decode())["hourly"]
+                    break
+                except Exception as exc:        # noqa: BLE001
+                    print(f"  {kind} {stn} 재시도 {attempt + 1} ({type(exc).__name__})", flush=True)
+                    time.sleep(15 * (attempt + 1))
+            else:
+                raise RuntimeError(f"{kind} {stn} 아카이브 수집 실패")
+            rows = {}
+            for i, t in enumerate(h["time"]):
+                row = [h[v + suffix][i] for v in MSM_VARS]
+                if any(x is None for x in row):
+                    continue
+                rows[t.replace("-", "").replace("T", "").replace(":", "")[:12]] = row
+            out[stn] = rows
+            print(f"  {kind} {stn} {len(rows):,}시각 ({min(rows)}~{max(rows)})", flush=True)
+            time.sleep(2)
+        _save(path, out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backfill", action="store_true", help="2016년부터 전 구간 수집")
     ap.add_argument("--incremental", action="store_true", help="최근분만 갱신(CI용)")
     ap.add_argument("--days", type=int, default=RECENT_DAYS)
+    ap.add_argument("--backfill-extra", action="store_true",
+                    help="gbm_extra 학습 아카이브(jma_gsm day2 · jma_msm day1) 수집")
     ap.add_argument("--msm-snapshot", action="store_true",
                     help="측정용 스냅숏 — jma_msm previous_day1 과 jma_gsm previous_day2(서빙 무관)")
     args = ap.parse_args()
+    if args.backfill_extra:
+        backfill_extra()
+        return
     if args.msm_snapshot:
         msm_snapshot("msm")
         msm_snapshot("d2")

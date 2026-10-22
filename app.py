@@ -411,6 +411,32 @@ def sync_nwp_window() -> str:
     return "raw"
 
 
+def sync_gbm_extra_windows(*gbms) -> None:
+    """GBM 전용 추가 특징이 쓰는 창(`cache/nwp_d2_recent.json` 등)을 data 브랜치에서 받는다.
+
+    모델 파일에 추가 특징 사양이 없으면(현행 배포본) 아무것도 받지 않는다. 받기에
+    실패하면 기존 파일을 그대로 둔다 — 묵은 파일은 시간 정합 상한 안의 값이 비어
+    `predict()` 가 수치예보 결측과 같은 사유로 멈추므로, 낡은 값이 조용히 쓰이지 않는다.
+    """
+    import gbm_extra
+    kinds = sorted({k for g in gbms if g is not None for k in gbm_extra.spec_of(g[-1])})
+    for k in kinds:
+        path = gbm_extra.SOURCES[k]["recent"]
+        try:
+            resp = requests.get("https://raw.githubusercontent.com/yssong01/climate-forecast/"
+                                f"data/{path.lstrip('./')}", timeout=8)
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            json.loads(resp.content.decode())          # 잘린 응답을 파일로 남기지 않는다
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+            with os.fdopen(fd, "wb") as f:
+                f.write(resp.content)
+            os.replace(tmp, path)
+        except Exception as e:
+            print(f"[WARN] {k} 추가 특징 창 조회 실패({type(e).__name__}) — 기존 파일 유지")
+
+
 def load_merged_history() -> tuple[dict, str]:
     """
     (관측소, 시각) → 레코드, 그리고 그 출처.
@@ -1019,6 +1045,7 @@ try:
     # 수치예보 입력을 쓰는 체크포인트라면 그 창을 먼저 내려받는다 — 없으면
     # predict() 가 NWPUnavailable 을 올린다(중립값으로 메우지 않는다).
     _nwp_status = sync_nwp_window() if ckpt.get("use_nwp", False) else None
+    sync_gbm_extra_windows(precip_gbm, extreme_gbm)
     result = cached_predict(stn, obs_hour_key(), ckpt["lead_hours"], _fp6,
                             model, ckpt, _fpT, temp_model, temp_ckpt,
                             _fpG, precip_gbm, _fpE, extreme_gbm)

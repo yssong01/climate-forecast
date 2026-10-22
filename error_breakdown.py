@@ -257,8 +257,10 @@ def main():
         if len(feat["tgt_ts_val"]) != len(d["tgt_ts"]):
             raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
         d = dict(d)
-        d["precip_pred"] = np.clip(amt.predict(feat["x_val"]), 0.0, None)
-        d["rain_prob"] = occ.predict_proba1(feat["x_val"])
+        import gbm_extra                      # GBM 전용 추가 특징(사양이 없으면 그대로)
+        _xp = gbm_extra.augment(gmeta, feat["x_val"], feat["stn_val"], feat["src_ts_val"], int(feat["lead_hours"]))
+        d["precip_pred"] = np.clip(amt.predict(_xp), 0.0, None)
+        d["rain_prob"] = occ.predict_proba1(_xp)
         d["precip_gate"] = np.array(float(gmeta["meta_gate_tau"]))
         print(f"강수 예측 출처: {args.precip_gbm}")
         # 판정선도 그 모델 파일의 값을 쓴다 — 신경망용 상수를 씌우면

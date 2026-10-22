@@ -227,11 +227,13 @@ def main():
                 and (feat["stn_val"] == data["stn"].astype(feat["stn_val"].dtype)).all()):
             raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
         data = dict(data)
-        data["rain_prob"] = occ.predict_proba1(feat["x_val"])
+        import gbm_extra                      # GBM 전용 추가 특징(사양이 없으면 그대로)
+        _xp = gbm_extra.augment(meta, feat["x_val"], feat["stn_val"], feat["src_ts_val"], int(feat["lead_hours"]))
+        data["rain_prob"] = occ.predict_proba1(_xp)
         gate_tau = float(meta["meta_gate_tau"])
         # 서빙과 같은 값 — 판정선 아래는 0(모듈 docstring).
         data["precip_pred"] = np.where(data["rain_prob"] >= gate_tau,
-                                       np.clip(amt.predict(feat["x_val"]), 0.0, None), 0.0)
+                                       np.clip(amt.predict(_xp), 0.0, None), 0.0)
         print(f"강수 예측 출처: {gbm_path} (서빙과 동일, 판정선 τ={gate_tau:.3f} 아래는 0)")
     else:
         gate_tau = None

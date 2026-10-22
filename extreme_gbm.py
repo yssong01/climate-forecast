@@ -206,6 +206,8 @@ def main():
     ap.add_argument("--patch-checkpoint", action="store_true",
                     help="화면이 이미 읽는 스키마(extreme_metrics_served·"
                          "prob_calibration.heads)에 이 모델의 값을 적어 넣는다.")
+    ap.add_argument("--extra", default="",
+                    help="GBM 전용 추가 특징 사양(gbm_extra.SPECS 키, 쉼표) — 예: d2 · msm")
     ap.add_argument("--patch-only", default=None, metavar="NPZ",
                     help="학습하지 않고, 이미 내보낸 NPZ 의 성질을 --checkpoint 에 적는다. "
                          "출처로는 --out(배포 경로)을 기록한다 — 승격 스테이징용")
@@ -237,8 +239,18 @@ def main():
     from precip_gbm import resolve_out, backup_existing
     args.out = resolve_out(args.out, f, EXPORT_PATH)
     x_tr, x_va = f["x_train"], f["x_val"]
-    nf = x_va.shape[1]
+    nf = x_va.shape[1]            # 공유 입력(입력 계약) 차원 — 추가 특징은 그 뒤에 붙는다
     half = ((f["tgt_ts_val"].astype(np.int64) // 10 ** 4) % 2 == 0)
+    import gbm_extra
+    lead = int(f["lead_hours"])
+    spec = tuple(x for x in args.extra.split(",") if x)
+    extra_names = gbm_extra.names(spec)
+    if spec:
+        _src = gbm_extra.archive_sources(spec)
+        x_tr = np.hstack([x_tr, gbm_extra.build_matrix(spec, f["stn_train"], f["src_ts_train"], lead, _src)])
+        x_va = np.hstack([x_va, gbm_extra.build_matrix(spec, f["stn_val"], f["src_ts_val"], lead, _src)])
+        print(f"추가 특징 {spec}: {extra_names} — 결측률 "
+              + ", ".join(f"{n} {np.isnan(x_va[:, nf + j]).mean():.1%}" for j, n in enumerate(extra_names)))
 
     if args.stamp_norm:
         # 헤드마다 저장된 평가용 F1(원본 확률·τ)을 다시 계산해 **전부** 같을
@@ -254,7 +266,8 @@ def main():
             mva = (off if off is not None else f[f"{mk}_mask_val"]).astype(bool)
             y_va = f[f"y_{head}_val"][mva].astype(int)
             hv = half[mva]
-            p = m.predict_proba1(x_va[mva])
+            p = m.predict_proba1(gbm_extra.augment(
+                meta, f["x_val"], f["stn_val"], f["src_ts_val"], lead)[mva])
             tau = float(meta[f"meta_{head}_tau"])
             got.append(f1_at(np.where(p >= tau, 1.0, 0.0)[~hv], y_va[~hv], 0.5))
             want.append(float(meta[f"meta_{head}_f1"]))
@@ -290,6 +303,12 @@ def main():
         y_va = f[f"y_{head}_val"][mva].astype(int)
         hv = half[mva]
         cst = _mono_cst(head, nf, temp_cols)
+        if spec:
+            # 추가 특징의 단조 제약(gbm_extra.MONO) — 한파는 더 추울수록, 폭염은 더 더울수록.
+            _ext = [gbm_extra.MONO.get(head, {}).get(n, 0) for n in extra_names]
+            cst = (list(cst) if cst is not None else [0] * nf) + _ext
+            if not any(cst):
+                cst = None
 
         best = (-1.0, None)
         for g in GRID:
@@ -389,6 +408,9 @@ def main():
     print("\n" + "\n".join(summary))
 
     out["meta_num_features"] = np.asarray(nf)
+    if spec:
+        out["meta_extra_spec"] = np.asarray(",".join(spec))
+        out["meta_extra_names"] = np.asarray(extra_names)
     # 트리 임계값이 걸린 표준화 공간(`precip_gbm.check_input_contract`).
     out["meta_mean"] = np.asarray(f["mean"], dtype=np.float64)
     out["meta_std"] = np.asarray(f["std"], dtype=np.float64)

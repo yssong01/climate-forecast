@@ -98,6 +98,24 @@ class NWPUnavailable(RuntimeError):
     """수치예보 부가 입력을 구성할 수 없을 때 — 화면이 사유를 드러내도록 별도 형으로 둔다."""
 
 
+def _gbm_x(meta, num_norm, record, lead_hours):
+    """GBM 한 건의 입력 행. 모델 파일에 GBM 전용 추가 특징 사양(`meta_extra_spec`)이
+    있으면 학습과 **같은 함수**(`gbm_extra.extra_vector`)로 만들어 뒤에 붙인다. 사양이
+    없으면(현행 배포본) 공유 표준화 벡터 그대로다. 필요한 값이 없으면 수치예보 결측과
+    같이 멈춘다 — 화면은 같은 사유 패널로 드러낸다."""
+    import gbm_extra
+    from datetime import datetime as _dt
+    try:
+        ev = gbm_extra.serving_vector(
+            meta, record.get("stn"),
+            _dt.strptime(str(record["timestamp"])[:12], "%Y%m%d%H%M"), int(lead_hours))
+    except gbm_extra.ExtraUnavailable as e:
+        raise NWPUnavailable(str(e)) from e
+    if ev is None:
+        return num_norm[None, :]
+    return np.concatenate([np.asarray(num_norm, dtype=np.float64), ev])[None, :]
+
+
 _NWP_CACHE = None
 
 
@@ -760,7 +778,7 @@ def predict(stn: str = "108",
         # 파일에 저장된 값**을 쓴다 — 상수로 박아 두면 모델을 바꿀 때마다
         # 사람이 옮겨 적어야 하고 그 고리가 드리프트의 입구다.
         amt_m, occ_m, gmeta = precip_gbm
-        _xv = num_norm[None, :]
+        _xv = _gbm_x(gmeta, num_norm, record, lead_hours)
         rain_prob = float(occ_m.predict_proba1(_xv)[0])
         precip_pred = max(0.0, float(amt_m.predict(_xv)[0]))
         if rain_prob < float(gmeta["meta_gate_tau"]):
@@ -781,7 +799,7 @@ def predict(stn: str = "108",
         # 극한기상 3종을 전용 GBM 이 낸다. 보정 곡선도 **그 모델 파일의**
         # 것을 쓴다 — 신경망용 곡선을 GBM 확률에 씌우면 눈금이 어긋난다.
         _em, _emeta = extreme_gbm
-        _xv = num_norm[None, :]
+        _xv = _gbm_x(_emeta, num_norm, record, lead_hours)
         import extreme_gbm as _eg
         heatwave_prob = _eg.calibrated(_em, _emeta, "heatwave", _xv)
         coldwave_prob = _eg.calibrated(_em, _emeta, "coldwave", _xv)

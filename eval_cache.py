@@ -73,7 +73,11 @@ DEFAULT_BATCH = 8192
 def cache_signature(ckpt_path: str, ckpt: dict) -> dict:
     st = os.stat(ckpt_path)
     sig = {
-        "ckpt_path": ckpt_path,
+        # 절대경로로 적는다(2026-10-22) — 파일 이름(`cache_path_for`)은 절대경로로 정하는데
+        # 서명은 받은 철자 그대로였다. 그래서 `./checkpoints/x.pt` 와 `checkpoints/x.pt` 가
+        # **같은 캐시 파일을 두고 서로의 서명을 무효로 만들어**, 철자가 다른 두 스크립트를
+        # 번갈아 돌리면 매번 재구성(1회 약 220초·RAM 22GiB)했다.
+        "ckpt_path": os.path.abspath(ckpt_path),
         "ckpt_mtime": float(st.st_mtime),
         "ckpt_size": int(st.st_size),
         "split_mode": str(ckpt.get("split_mode", "random")),

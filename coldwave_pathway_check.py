@@ -75,7 +75,7 @@ def make_x(ckpt, record, nwp_fixed=None):
     return torch.tensor((vec - mean) / std, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
 
-def gbm_head_prob(gbm, ckpt, record, head, nwp_fixed=None):
+def gbm_head_prob(gbm, ckpt, record, head, nwp_fixed=None, extra_fixed=None):
     """극한기상 전용 GBM 의 보정 후 확률(2026-09-26).
 
     단조성은 `monotonic_cst` 로 **정의상** 보장되지만, 배선이 어긋나면
@@ -84,6 +84,11 @@ def gbm_head_prob(gbm, ckpt, record, head, nwp_fixed=None):
     """
     import extreme_gbm as _eg
     x = make_x(ckpt, record, nwp_fixed).cpu().numpy()
+    import gbm_extra
+    if gbm_extra.spec_of(gbm[1]):
+        # GBM 전용 추가 특징은 기준 레코드 값으로 고정한다(규약 7-1 — 기온·계절을 흔드는 동안
+        # 그 특징까지 바뀌면 '한 번에 하나만 바꾼다'가 깨지고, 흔드는 미래 날짜엔 값이 없다).
+        x = gbm_extra.augment(gbm[1], x, fixed=extra_fixed)
     return float(_eg.calibrated_batch(gbm[0], gbm[1], head, x)[0])
 
 
@@ -116,13 +121,22 @@ def build_grid(model, ckpt, base, img, txt, head="coldwave", gbm=None):
             raise RuntimeError(
                 f"탐침 기준 레코드({base.get('stn')} {base.get('timestamp')})의 "
                 f"수치예보가 아카이브에 없다 — 단조성 시험을 수행할 수 없다.")
+    extra_fixed = None
+    if gbm is not None:
+        import gbm_extra
+        _spec = gbm_extra.spec_of(gbm[1])
+        if _spec:
+            from datetime import datetime as _dt
+            extra_fixed = gbm_extra.extra_vector(
+                _spec, base.get("stn"), _dt.strptime(str(base["timestamp"])[:12], "%Y%m%d%H%M"),
+                int(ckpt["lead_hours"]), gbm_extra.archive_sources(_spec))
     grid = np.zeros((len(MONTHS), len(TEMPS)))
     for i, (_, mmdd) in enumerate(MONTHS):
         for j, t in enumerate(TEMPS):
             r = dict(base)
             r["temperature"] = t
             r["timestamp"] = f"2026{mmdd}{hh}"
-            grid[i, j] = (gbm_head_prob(gbm, ckpt, r, head, nwp_fixed) if gbm
+            grid[i, j] = (gbm_head_prob(gbm, ckpt, r, head, nwp_fixed, extra_fixed) if gbm
                           else head_prob(model, ckpt, r, img, txt, head, nwp_fixed))
     return grid
 

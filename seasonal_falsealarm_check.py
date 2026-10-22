@@ -87,7 +87,10 @@ def main():
         def probs(idx):
             if gmodels is not None:
                 import extreme_gbm as _eg
+                import gbm_extra              # GBM 전용 추가 특징(사양이 없으면 그대로)
                 xv = ds.X_num[idx.tolist()].numpy().astype(np.float32)
+                xv = gbm_extra.augment(gmeta, xv, [ds.stns[i] for i in idx.tolist()],
+                                       [ds.src_timestamps[i] for i in idx.tolist()], int(ckpt["lead_hours"]))
                 return (_eg.calibrated_batch(gmodels, gmeta, "heatwave", xv),
                         _eg.calibrated_batch(gmodels, gmeta, "coldwave", xv))
             hs, cs = [], []

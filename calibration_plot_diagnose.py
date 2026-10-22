@@ -186,6 +186,8 @@ def main():
         if not np.array_equal(_a, fz["stn_val"].astype(np.int64)):
             raise SystemExit("추론 캐시와 특징 캐시의 행 순서가 다르다 — "
                              "eval_cache 를 --force 로 다시 만들 것")
+        import gbm_extra                      # GBM 전용 추가 특징(사양이 없으면 그대로)
+        xv = gbm_extra.augment(meta, xv, fz["stn_val"], fz["src_ts_val"], int(fz["lead_hours"]))
         heat_p = _eg.calibrated_batch(models, meta, "heatwave", xv)
         cold_p = _eg.calibrated_batch(models, meta, "coldwave", xv)
         gbm = (models, meta)

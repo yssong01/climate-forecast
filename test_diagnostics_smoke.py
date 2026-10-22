@@ -90,6 +90,8 @@ DIAGNOSTIC_MODULES = [
     "aerosol_gbm_check", "precip_floor_check", "migrate_training_wind_dir", "calibration_math", "stack_compare", "nwp_drift_check", "feature_probe_gbm",
     # 2026-10-21 신설 — 관측소별 강수 F1 을 검증셋·온라인에서 같은 정의로 잰다.
     "station_precip_check",
+    # 2026-10-22 신설 — GBM 전용 추가 특징. 사양이 있는 모델이 배포되면 서빙이 직접 의존한다.
+    "gbm_extra",
     # 승격 절차의 수동 작업 4번이 이 스크립트를 부른다(2026-09-23 추가).
     "capture_tab_screenshots",
 ]
@@ -901,6 +903,89 @@ def _gbm_norm_binding():
     return "배포 GBM 4개 통계·출처 일치 · 통계 변조·통계 없음·출처 3방향 불일치 차단 · 캐시 키"
 
 
+# ── ③-9 GBM 전용 추가 특징 — 휴면·결측 구분·학습/서빙 동일 함수 ──
+def _gbm_extra_paths():
+    """GBM 전용 추가 특징(`gbm_extra`, 2026-10-22)이 안전하게 휴면하고, 켜지면 학습과
+    서빙이 같은 값을 만드는가.
+
+    ① 배포 GBM 넷은 사양이 없어 `augment`·`predict._gbm_x` 가 입력을 그대로 둔다.
+    ② 시간 정합 상한 너머의 NaN(구조적)은 결측으로 세지 않고, 상한 안의 빈 시각은
+       결측으로 세어 서빙이 멈춘다(`NWPUnavailable`).
+    ③ 같은 자료를 아카이브 형식·창 파일 형식으로 주면 `build_matrix`(학습)와
+       `serving_vector`(서빙)가 같은 벡터를 낸다.
+    ④ 고정값 broadcast, 이름 불일치 차단.
+    """
+    import json as _json
+    import tempfile as _tf
+    from datetime import datetime as _dt, timedelta as _td
+    import gbm_extra as gx
+    import predict
+    from precip_gbm import load as _pload
+    from extreme_gbm import load as _eload
+    root = os.path.dirname(os.path.abspath(predict.__file__))
+    x = np.random.default_rng(0).normal(size=(3, 28))
+    rec = {"stn": "108", "timestamp": "202601100300"}
+    for n in ("precip_gbm.npz", "precip_gbm_12h.npz", "extreme_gbm.npz", "extreme_gbm_12h.npz"):
+        meta = (_pload if n.startswith("precip") else _eload)(os.path.join(root, "checkpoints", n))[-1]
+        assert gx.spec_of(meta) == (), f"{n} 에 추가 특징 사양이 있다 — 배포본은 휴면이어야 한다"
+        assert gx.augment(meta, x) is x
+        assert np.array_equal(predict._gbm_x(meta, x[0], rec, 6), x[0][None, :])
+
+    T = _dt(2026, 1, 10, 3)
+    rows = {}
+    for h in range(-24, 72):
+        t = T + _td(hours=h)
+        rows[t.strftime("%Y%m%d%H00")] = [0.1 * (h % 5), -5.0 + 0.3 * h, 60.0 + h % 7, 50.0]
+    spec = ("d2", "msm")
+    src = {"d2": {"108": rows}, "msm": {"108": rows}}
+    miss = []
+    v6 = gx.extra_vector(spec, "108", T, 6, src, missing=miss)
+    assert not miss and np.isfinite(v6).all(), (miss, v6)
+    miss = []
+    v12 = gx.extra_vector(spec, "108", T, 12, src, missing=miss)
+    assert not miss, f"상한 너머가 결측으로 셌다: {miss[:3]}"
+    assert np.isnan(v12[-6:]).all(), "msm 은 +12h 에서 상한(9h) 너머라 NaN 이어야 한다"
+    gap = {k: v for k, v in rows.items() if k != (T + _td(hours=6)).strftime("%Y%m%d%H00")}
+    miss = []
+    gx.extra_vector(spec, "108", T, 6, {"d2": {"108": gap}, "msm": {"108": gap}}, missing=miss)
+    assert miss, "상한 안의 빈 시각을 결측으로 세지 않았다"
+
+    tmp = _tf.mkdtemp()
+    saved = {k: dict(v) for k, v in gx.SOURCES.items()}
+    try:
+        for k in spec:
+            gx.SOURCES[k]["recent"] = os.path.join(tmp, f"{k}.json")
+            with open(gx.SOURCES[k]["recent"], "w", encoding="utf-8") as fh:
+                _json.dump({"fetched_at": "x", "rows": {"108": rows}}, fh)
+        gx._RECENT.clear()
+        meta = {"meta_extra_spec": np.array("d2,msm"), "meta_extra_names": np.array(gx.names(spec))}
+        sv = gx.serving_vector(meta, "108", T, 6)
+        tr = gx.build_matrix(spec, ["108"], ["202601100300"], 6, src)[0]
+        assert np.array_equal(sv, tr), "학습 경로와 서빙 경로가 다른 값을 냈다"
+        xa = predict._gbm_x(meta, x[0], rec, 6)
+        assert xa.shape == (1, 28 + 12) and np.array_equal(xa[0, 28:], sv)
+        with open(gx.SOURCES["msm"]["recent"], "w", encoding="utf-8") as fh:
+            _json.dump({"fetched_at": "x", "rows": {"108": gap}}, fh)
+        os.utime(gx.SOURCES["msm"]["recent"], (1, 1))      # mtime 을 바꿔 다시 읽게 한다
+        try:
+            predict._gbm_x(meta, x[0], rec, 6)
+            raise AssertionError("창에 빈 시각이 있는데 서빙이 멈추지 않았다")
+        except predict.NWPUnavailable:
+            pass
+        fx = gx.augment(meta, x, fixed=sv)
+        assert fx.shape == (3, 40) and np.array_equal(fx[2, 28:], sv)
+        try:
+            gx.augment({**meta, "meta_extra_names": np.array(["a"])}, x, fixed=sv)
+            raise AssertionError("추가 특징 이름 불일치를 통과시켰다")
+        except RuntimeError:
+            pass
+    finally:
+        for k, v in saved.items():
+            gx.SOURCES[k].update(v)
+        gx._RECENT.clear()
+    return "배포 GBM 4개 휴면 · 구조적 NaN/결측 구분 · 학습=서빙 · 결측 시 멈춤 · 고정값·이름 대조"
+
+
 # ── ④ 판정선 조회가 모든 체크포인트 형태에서 동작하는가 ──────────
 def _threshold_paths():
     from predict import event_threshold, STATION_EVENT_THRESH_OVERRIDES
@@ -965,6 +1050,8 @@ def main():
     check("promotion", _promotion_guards)
     print("\n[T3-8] GBM 정규화 통계·출처 결속, 앱 캐시 키")
     check("gbm_binding", _gbm_norm_binding)
+    print("\n[T3-9] GBM 전용 추가 특징(휴면·결측 구분·학습=서빙)")
+    check("gbm_extra", _gbm_extra_paths)
     print("\n[T4] 판정선 조회(구버전/신버전 체크포인트)")
     check("event_threshold", _threshold_paths)
     print("\n[T5] 배포 체크포인트 로드·추론")

@@ -331,6 +331,8 @@ def main():
     ap.add_argument("--checkpoint", default=None,
                     help="특징을 만들 기준 체크포인트(리드타임을 결정한다). "
                          "생략하면 predict.CHECKPOINT(+6h).")
+    ap.add_argument("--extra", default="",
+                    help="GBM 전용 추가 특징 사양(gbm_extra.SPECS 키, 쉼표) — 예: d2 · msm")
     ap.add_argument("--stamp-norm", action="store_true",
                     help="기존 내보내기(--out)에 학습 시 정규화 통계를 소급 기록한다 — "
                          "저장된 평가 F1 이 재현될 때만")
@@ -343,6 +345,15 @@ def main():
          else eval_cache.load_features())
     args.out = resolve_out(args.out, f, EXPORT_PATH)
     x_tr, x_va = f["x_train"], f["x_val"]
+    nf_base = x_va.shape[1]       # 공유 입력(입력 계약) 차원 — 추가 특징은 그 뒤에 붙는다
+    import gbm_extra
+    lead = int(f["lead_hours"])
+    spec = tuple(x for x in args.extra.split(",") if x)
+    if spec and not (args.report or args.stamp_norm):
+        _src = gbm_extra.archive_sources(spec)
+        x_tr = np.hstack([x_tr, gbm_extra.build_matrix(spec, f["stn_train"], f["src_ts_train"], lead, _src)])
+        x_va = np.hstack([x_va, gbm_extra.build_matrix(spec, f["stn_val"], f["src_ts_val"], lead, _src)])
+        print(f"추가 특징 {spec}: {gbm_extra.names(spec)}")
     p_tr, p_va = f["precip_true_train"], f["precip_true_val"]
     wet = float(f["wet_thresh"])
     y_tr, y_va = (p_tr >= wet).astype(int), (p_va >= wet).astype(int)
@@ -354,6 +365,7 @@ def main():
         amt, occ, meta = load(args.out)
         if amt is None:
             raise SystemExit(f"내보낸 모델이 없다: {args.out}")
+        x_va = gbm_extra.augment(meta, x_va, f["stn_val"], f["src_ts_val"], lead)
         a, o = amt.predict(x_va), occ.predict_proba1(x_va)
         print(f"발생 F1(절반분리) {honest_f1(o, y_va, half):.4f} · "
               f"구간 MAE {conditional_mae(a, p_va, y_va):.4f} · "
@@ -364,6 +376,7 @@ def main():
         amt, occ, meta = load(args.out)
         if amt is None:
             raise SystemExit(f"내보낸 모델이 없다: {args.out}")
+        x_va = gbm_extra.augment(meta, x_va, f["stn_val"], f["src_ts_val"], lead)
         stamp_norm(args.out, f, honest_f1(occ.predict_proba1(x_va), y_va, half),
                    float(meta["meta_val_precip_wet_f1"]), "발생 F1(평가용 절반)")
         return 0
@@ -412,7 +425,10 @@ def main():
     d["meta_max_iter"] = np.asarray(grid["max_iter"])
     d["meta_learning_rate"] = np.asarray(grid["learning_rate"])
     d["meta_seed"] = np.asarray(SEED)
-    d["meta_num_features"] = np.asarray(x_va.shape[1])
+    d["meta_num_features"] = np.asarray(nf_base)
+    if spec:
+        d["meta_extra_spec"] = np.asarray(",".join(spec))
+        d["meta_extra_names"] = np.asarray(gbm_extra.names(spec))
     # 트리 임계값이 걸린 표준화 공간 — 서빙이 주 체크포인트와 대조한다
     # (`check_input_contract`). 없으면 재학습 후 조용히 어긋난다.
     d["meta_mean"] = np.asarray(f["mean"], dtype=np.float64)
