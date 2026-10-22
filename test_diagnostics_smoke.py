@@ -624,10 +624,31 @@ def _api_budget_guards():
         except pr.NWPUnavailable:
             pass
         assert calls == ["108"], f"수치예보 확인 전에 {len(calls)}회 조회했다: {calls}"
+
+        # ④ Z축 전용 구성(2026-10-22) — 보조 모델 셋이 다 있으면 이웃·시차를
+        #    조회하지 않는다(출력 1건에 API 1회). 축 배분도 내보내지 않는다.
+        class _ZeroNWP:
+            def encode(self, *a, **k):
+                return np.zeros(14, dtype=np.float32)
+
+        calls.clear()
+        orig_at = pr.RobustWeatherCollector.fetch_at
+        pr.RobustWeatherCollector.fetch_at = lambda self, tm, *a, **k: (
+            calls.append((self.stn, tm)) or _fake_fetch(self))
+        pr._nwp_collector = lambda: _ZeroNWP()
+        try:
+            res = pr.predict(stn="108", model=m, ckpt=c)
+        finally:
+            pr.RobustWeatherCollector.fetch_at = orig_at
+        cov = res["input_coverage"]
+        assert cov["z_only"] and calls == ["108"], f"Z축 전용인데 {len(calls)}회 조회: {calls}"
+        assert res["gate_weights"] is None and cov["neighbors_live"] is None
+        assert res["forecast"]["temperature"] is not None
     finally:
         pr.RobustWeatherCollector.fetch = orig_fetch
         pr._nwp_collector = orig_nwp
-    return "탐침 계획(정상 1·결측 1+9·신규 1+23) · 재시도 1 · 일일 상한 · 수치예보 선확인(조회 1회)"
+    return ("탐침 계획(정상 1·결측 1+9·신규 1+23) · 재시도 1 · 일일 상한 · "
+            "수치예보 선확인(조회 1회) · Z축 전용 출력 1건 = 조회 1회")
 
 
 def _window_gap_upkeep():

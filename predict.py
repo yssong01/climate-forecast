@@ -604,8 +604,22 @@ def predict(stn: str = "108",
                 f"{record.get('stn')} {record.get('timestamp')} 의 +{lead_hours}h "
                 f"수치예보가 없다 — cache/nwp_recent.json 갱신 상태를 확인할 것.")
 
+    # **Re·Im 축 입력을 모으지 않는 구성(2026-10-22).** 기온 전용 모델·강수
+    # GBM·극한기상 GBM 이 모두 있으면 화면에 나가는 출력은 전부 Z축 입력만으로
+    # 정해진다 — GBM 은 구조상 Z 만 받고, 기온 전용 모델은 검증셋 전체
+    # (+6h 203,871 · +12h 203,807 표본)에서 Im 을 실측·0·평균으로, Re 를 0 격자·
+    # 잡음 격자로 바꿔도 예측이 **정확히 0.0°C** 달라졌다(NEXT.md P3-1). 그런데
+    # 그 두 축을 만들려고 출력마다 API 를 14회(이웃 11·시차 3) 더 쓰고 있었다 —
+    # 호출 15회 중 14회가 화면에 영향이 없는 입력이었다. 이 구성에서는 그 조회를
+    # 건너뛰고, 그 축에는 '정보 없음' 중립값을 넣는다(출력에 기여하지 않음을
+    # 위에서 실측했다). 다중과제 신경망의 축 배분은 수집하지 않은 입력으로 계산한
+    # 값이 되므로 내보내지 않는다(`gate_weights=None`) — 화면이 그것을 이번 입력의
+    # 배분인 양 보이지 않게 한다.
+    zonly = (temp_model is not None and precip_gbm is not None
+             and extreme_gbm is not None)
+
     fetched = [record]
-    for other_stn in STATIONS.values():
+    for other_stn in ([] if zonly else STATIONS.values()):
         if other_stn == stn:
             continue
         try:
@@ -647,7 +661,7 @@ def predict(stn: str = "108",
         tendency_records = [record]
         target_collector = RobustWeatherCollector(stn=stn)
         now_ts = datetime.strptime(str(record["timestamp"])[:12], "%Y%m%d%H%M")
-        for lag in LAGS_HOURS:
+        for lag in ([] if zonly else LAGS_HOURS):
             try:
                 past = target_collector.fetch_at(
                     (now_ts - timedelta(hours=lag)).strftime("%Y%m%d%H00"))
@@ -664,7 +678,7 @@ def predict(stn: str = "108",
             # 실제 관측 간의 변화량이 된다.
             if is_real_observation(past.get("status")):
                 tendency_records.append(past)
-        live_lags = len(tendency_records) - 1
+        live_lags = None if zonly else len(tendency_records) - 1
         txt_vec = TendencyCollector(tendency_records).encode_single(record)
 
     mean = np.array(ckpt["mean"], dtype=np.float32)
@@ -809,11 +823,14 @@ def predict(stn: str = "108",
         # 이웃·과거 조회가 예산 상한이나 API 장애로 폴백된 상태가 가능하다.
         # 그 경우 보간장은 중립값(0.5), 경향벡터는 0으로 채워지므로 예보의
         # 근거가 실제로 얇아진다. 화면이 그 사실을 말할 수 있게 내보낸다.
+        # Re·Im 축을 모으지 않는 구성이면 None — 결측이 아니라 **조회하지 않음**
+        # 이다(위 zonly 주석). 화면이 "이웃 0/11곳만 실측" 경고를 띄우지 않게 한다.
         "input_coverage": {
-            "neighbors_live":  live_neighbors,
-            "neighbors_total": len(STATIONS) - 1,
+            "neighbors_live":  None if zonly else live_neighbors,
+            "neighbors_total": None if zonly else len(STATIONS) - 1,
             "lags_live":       live_lags,
             "lags_total":      len(LAGS_HOURS) if live_lags is not None else None,
+            "z_only":          zonly,
         },
         "current": {
             "temperature":   record.get("temperature"),
@@ -845,7 +862,8 @@ def predict(stn: str = "108",
             "dust":     round(dust_prob, 4)     if dust_prob     is not None else None,
         },
         "gate_weights": (
-            {k: round(v, 4) for k, v in gate.items()} if "w_re" in gate else None
+            {k: round(v, 4) for k, v in gate.items()}
+            if ("w_re" in gate and not zonly) else None
         ),
     }
 
