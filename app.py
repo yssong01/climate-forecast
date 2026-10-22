@@ -333,6 +333,26 @@ def _fetch_raw_window(retries: int = 1, backoff_sec: float = 1.0) -> dict | None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _fetch_raw_window_cached() -> dict:
+    """`_fetch_raw_window` 의 5분 캐시. **실패는 캐시하지 않는다.**
+
+    실패하면 예외를 올린다 — `st.cache_data` 는 예외를 저장하지 않으므로
+    다음 재실행이 곧바로 다시 시도하고, 그동안은 호출부가 마지막 정상본
+    (`_history_last_good_store`)으로 내려간다. `None` 을 돌려주면 그 실패가
+    5분간 굳는다.
+
+    이 캐시는 2026-09-06 `sync_nwp_window` 를 끼워 넣을 때 데코레이터가 그
+    함수로 옮겨 붙으면서 사라졌다 — `load_merged_history` 의 docstring 은
+    "5분 캐시"라고 적은 채로, 실제로는 재실행마다(위젯 조작 포함) 0.6MB 를
+    두 번씩 받고 있었다(2026-10-21 점검).
+    """
+    fetched = _fetch_raw_window()
+    if fetched is None:
+        raise RuntimeError("raw 창 조회 실패")
+    return fetched
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def sync_nwp_window() -> str:
     """data 브랜치의 NWP 창을 로컬 `cache/nwp_recent.json` 으로 내려받는다.
 
@@ -412,7 +432,10 @@ def load_merged_history() -> tuple[dict, str]:
     """
     store = _history_last_good_store()
 
-    fetched = _fetch_raw_window()
+    try:
+        fetched = _fetch_raw_window_cached()
+    except RuntimeError:
+        fetched = None
     if fetched is not None:
         store["data"] = fetched
         return fetched, "raw"
