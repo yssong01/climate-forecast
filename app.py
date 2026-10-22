@@ -2150,7 +2150,11 @@ with tab_perf:
                 f"({ckpt.get('val_precip_baseline_mae_wet', float('nan')):.3f}mm) 대비 "
                 f"{(1 - ckpt.get('val_precip_mae_wet', 1) / max(ckpt.get('val_precip_baseline_mae_wet', 1), 1e-9)):.1%} "
                 f"개선**이고, 강수 발생 판정 F1은 게이팅 적용 후 "
-                + (f"{ckpt['val_precip_wet_f1']:.3f}이다. "
+                + (f"{ckpt['val_precip_wet_f1']:.3f}이다"
+                   + (f"(판정선 선택에 쓰지 않은 평가용 절반에서는 "
+                      f"{ckpt['val_eval_half']['precip_wet_f1']:.3f}). "
+                      if (ckpt.get("val_eval_half") or {}).get("precip_wet_f1") is not None
+                      else ". ")
                    if ckpt.get("val_precip_wet_f1") is not None
                    else "체크포인트에 기록되지 않았다"
                         "(`metrics_report.py --patch-checkpoint` 로 기록한다). ")
@@ -2208,17 +2212,32 @@ with tab_perf:
             "사용한다. 범위는 0~1이며 1이 최댓값이다."
         )
         _label_ko = {"heatwave": "🔥 폭염", "coldwave": "🥶 한파"}
-        _rows = ["| 사건 | 정밀도 | 재현율 | F1 | 검증셋 실제 발생 |",
+        # 평가용 절반 F1 을 병기한다(2026-10-22). 판정선·보정 곡선·하이퍼
+        # 파라미터를 검증셋 짝수일에서 골랐으므로 전체 검증셋 값에는 그 선택
+        # 표본이 절반 섞여 있다(2절 — 같은 데이터로 고르고 채점하면 허수가
+        # 섞인다). 키가 없는 체크포인트에서는 열을 만들지 않는다.
+        _evh = ((ckpt.get("val_eval_half") or {}).get("extreme") or {})
+        _rows = ["| 사건 | 정밀도 | 재현율 | F1 | F1(평가용 절반) | 검증셋 실제 발생 |",
+                 "|---|---|---|---|---|---|"] if _evh else \
+                ["| 사건 | 정밀도 | 재현율 | F1 | 검증셋 실제 발생 |",
                  "|---|---|---|---|---|"]
         for _k in ("heatwave", "coldwave"):
             _m = _em.get(_k)
             if not _m:
                 continue
+            _half = (f" {_evh[_k]['f1']:.3f} |" if _k in _evh else " — |") if _evh else ""
             _rows.append(
                 f"| {_label_ko[_k]} | {_m['precision']:.0%} | {_m['recall']:.0%} | "
-                f"{_m['f1']:.3f} | {_m['n_pos']:,}건 |"
+                f"{_m['f1']:.3f} |{_half} {_m['n_pos']:,}건 |"
             )
         st.markdown("\n".join(_rows))
+        if _evh:
+            st.caption(
+                "'F1' 은 검증셋 전체, 'F1(평가용 절반)' 은 그중 판정선·확률 보정·"
+                "하이퍼파라미터 선택에 **쓰지 않은** 목표일 홀수 날짜만으로 잰 값이다. "
+                "선택은 짝수 날짜에서 했으므로 전체 값에는 표본 내(in-sample) 이득이 "
+                "섞여 있고, 처음 보는 날의 성능으로는 평가용 절반이 더 정직한 추정이다."
+            )
         # `t=0.5` 대조값은 체크포인트에서 읽는다 — 상수로 적어 두면 모델을
         # 바꿀 때마다 사람이 옮겨 적어야 하고, 실제로 신경망 시절 값(0.209)이
         # GBM 배포 후에도 남아 있었다(2026-09-26 수정).

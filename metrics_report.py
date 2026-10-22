@@ -161,6 +161,24 @@ def accuracy_block(d, ckpt=None):
     }
 
 
+def eval_half_mask(d):
+    """판정선·하이퍼파라미터·보정 곡선 선택에 **쓰지 않은** 절반(목표일 홀수).
+
+    `precip_gbm.py`·`extreme_gbm.py`·`conformal_interval_fit.py` 가 짝수일을
+    보정용으로 쓴다. 전체 검증셋 채점은 그 선택 표본을 절반 포함하므로
+    표본 내(in-sample) 값이 섞인다(2절 규약 — 같은 데이터로 고르고 채점하면
+    허수가 섞인다).
+    """
+    return (np.asarray(d["tgt_ts"]).astype(np.int64) // 10 ** 4) % 2 == 1
+
+
+def subset(d, mask):
+    """표본 축 배열만 잘라낸 사본 — 스칼라·사전(판정선 등)은 그대로 둔다."""
+    n = len(mask)
+    return {k: (v[mask] if isinstance(v, np.ndarray) and v.ndim >= 1 and len(v) == n
+                else v) for k, v in d.items()}
+
+
 def precision_block(d, ckpt):
     """② 정밀도 — 분류. 원본 0.5 기준과 서빙 판정선 기준을 함께 낸다."""
     out = {}
@@ -489,6 +507,17 @@ def main():
     cal = calibration_block(d, ckpt)
     print_report(acc, pre, cal)
 
+    # 선택에 쓰지 않은 절반에서 같은 지표(2026-10-22, 위 eval_half_mask).
+    _eh = eval_half_mask(d)
+    _de = subset(d, _eh)
+    acc_e, pre_e = accuracy_block(_de, ckpt), precision_block(_de, ckpt)
+    print(f"\n평가용 절반(목표일 홀수, n={int(_eh.sum()):,}) — 선택에 쓰지 않은 표본")
+    print(f"  강수 발생 F1 {acc['precip_wet_f1']:.4f}(전체) → {acc_e['precip_wet_f1']:.4f} · "
+          f"강수 구간 MAE {acc['precip_mae_wet']:.4f} → {acc_e['precip_mae_wet']:.4f}")
+    for _k, _v in pre_e.items():
+        print(f"  {_v['ko']:<4} F1 {pre[_k]['served']['f1']:.4f}(전체) → "
+              f"{_v['served']['f1']:.4f}")
+
     # 공용 산출물은 +6h 배포본으로 돌릴 때만 덮어쓴다(위 상수 주석 참고).
     _abs = os.path.abspath(args.ckpt)
     _is_primary = _abs == os.path.abspath(PRIMARY_CHECKPOINT)
@@ -517,16 +546,18 @@ def main():
                    "temp_checkpoint": args.temp_checkpoint,
                    "precip_gbm": args.precip_gbm,
                    "extreme_gbm": args.extreme_gbm,
-                   "accuracy": acc, "precision": pre, "calibration": cal},
+                   "accuracy": acc, "precision": pre, "calibration": cal,
+                   "eval_half": {"accuracy": acc_e, "precision": pre_e}},
                   f, ensure_ascii=False, indent=2)
     print(f"저장: {out_json}")
 
     if args.patch_checkpoint:
-        _patch_checkpoint(args.ckpt, acc, pre, args.precip_gbm)
+        _patch_checkpoint(args.ckpt, acc, pre, args.precip_gbm,
+                          eval_half=(acc_e, pre_e))
 
 
 def _patch_checkpoint(path: str, acc: dict, pre: dict = None,
-                      gbm: str = None) -> None:
+                      gbm: str = None, eval_half=None) -> None:
     """서빙 기준 강수 오차 두 개를 체크포인트에 적어 넣는다(2026-09-06).
 
     왜 필요한가 — '출력값 추이' 탭이 강수 출력값 옆에 붙이던 `±` 는
@@ -592,7 +623,31 @@ def _patch_checkpoint(path: str, acc: dict, pre: dict = None,
                 "n_pos": v["n_pos"], "n": v["n"]}
             for k, v in pre.items()
         }
-    torch.save(ck, path)
+    if eval_half is not None:
+        # 화면이 전체 검증셋 값 옆에 병기한다(2026-10-22, eval_half_mask 참고).
+        acc_e, pre_e = eval_half
+        ck["val_eval_half"] = {
+            "split": "target-date odd (calib half = even, used for τ·hyperparameters·calibration)",
+            "n": acc_e["n"],
+            "precip_wet_f1": acc_e["precip_wet_f1"],
+            "precip_mae_wet": acc_e["precip_mae_wet"],
+            "precip_mae_served": acc_e["precip_mae_served"],
+            "extreme": {k: {"precision": v["served"]["precision"],
+                            "recall": v["served"]["recall"],
+                            "f1": v["served"]["f1"], "n_pos": v["n_pos"]}
+                        for k, v in (pre_e or {}).items()},
+        }
+    # 고유 tmp + os.replace — 도중에 죽어도 배포 체크포인트가 잘리지 않는다(1절 6항).
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".pt")
+    os.close(fd)
+    try:
+        torch.save(ck, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     print(f"체크포인트 갱신: {path} — 서빙 MAE {acc['precip_mae_served']:.4f} · "
           f"강수구간 조건부 MAE {acc['precip_mae_wet']:.4f} · "
           f"발생 판정 F1 {acc['precip_wet_f1']:.4f}")
