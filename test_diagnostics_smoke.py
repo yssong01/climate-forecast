@@ -751,6 +751,13 @@ def _pipeline_units():
             assert np.array_equal(mdl.raw_tree_parallel(xr), mdl.raw_per_tree(xr)), (name, head)
         heat = eg.calibrated_batch(models, meta, "heatwave", x)
         assert np.all(np.diff(heat) >= -1e-12), f"{name} 폭염이 기온에 단조가 아니다: {heat}"
+        # '보정 안 함' 경로 — 배포 파일에는 지금 없지만(베타·등온만) 후보로 고르는
+        # 방법이므로, 고르는 순간 처음 실행되지 않게 원본 확률을 그대로 내는지 본다.
+        raw = models["heatwave"].predict_proba1(x)
+        none_meta = {**meta, "meta_heatwave_cal_method": np.asarray("none")}
+        assert np.array_equal(eg.calibrated_batch(models, none_meta, "heatwave", x), raw)
+        assert eg.calibrated(models, none_meta, "heatwave", x[:1]) == float(raw[0])
+        methods.add("none(합성)")
     return f"최신성 게이트 · trim · 극한 GBM 2개(보정 {sorted(methods)})"
 
 

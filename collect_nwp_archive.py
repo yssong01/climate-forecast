@@ -83,6 +83,8 @@ def _request(lat, lon, start, end, past_days=None, forecast_days=None, retries=4
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:
+                if attempt:
+                    print(f"    재시도 {attempt}회 후 성공(직전 {last})")
                 return json.loads(resp.read().decode())["hourly"]
         except Exception as exc:            # noqa: BLE001 — 재시도 대상 전부
             # 예외 문자열에 URL 이 통째로 들어가는 경우가 있다(CLAUDE.md
@@ -154,10 +156,14 @@ def incremental(days=RECENT_DAYS):
             previous = json.load(f)
     recent, failed = {}, []
     for stn, (lat, lon) in STATION_COORDS.items():
+        t0 = time.time()
         try:
             hourly = _request(lat, lon, None, None, past_days=days, forecast_days=2,
                               retries=3, timeout=INCREMENTAL_TIMEOUT)
             rows = _to_records(hourly)
+            # 관측소별 소요 시간 — CI 에서 이 스텝이 로컬(관측소당 1~3초)보다 훨씬
+            # 오래 걸려(실측 89초) 어느 요청이 매달리는지 로그로 가른다(2026-10-22).
+            print(f"  {stn} {time.time() - t0:5.1f}s")
         except Exception as exc:            # noqa: BLE001 — 관측소 단위로 격리
             failed.append(stn)
             print(f"  {stn} 실패 — {type(exc).__name__}: 직전 창의 행을 유지한다")
