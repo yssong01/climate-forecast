@@ -366,6 +366,8 @@ def main():
             _m, _mt = _eg.load(_gbm_path)
             if not _m:
                 raise SystemExit(f"극한기상 GBM 이 없다: {_gbm_path}")
+            from precip_gbm import check_input_contract
+            check_input_contract(_mt, ckpt, _gbm_path, "극한기상 GBM")
             _gbm = (_m, _mt)
             print(f"극한기상 확률 출처: {_gbm_path} (서빙과 동일)")
 

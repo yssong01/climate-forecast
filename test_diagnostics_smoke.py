@@ -641,6 +641,73 @@ def _promotion_guards():
     return "판정 누락 판별 · 배포 짝 계약 일치 · 리드타임 다른 짝 불일치"
 
 
+def _gbm_norm_binding():
+    """GBM 이 학습 때의 정규화 통계·출처에 묶여 있는가(2026-10-22).
+
+    ① 배포 GBM 넷이 각자의 주 체크포인트와 대조를 통과하고, 통계를 한 칸만
+       바꾼 체크포인트·통계가 없는 파일은 막는다(종전에는 차원만 봤다).
+    ② 출처 대조가 양방향이다 — 기록만 있음·모델만 있음·다른 파일을 막고,
+       경로 표기 차이(`./`)는 같은 파일로 본다.
+    ③ 앱의 보조 모델 캐시가 주 체크포인트 지문을 키로 받는다.
+    """
+    import copy
+    import predict
+    from precip_gbm import check_input_contract
+    root = os.path.dirname(os.path.abspath(predict.__file__))
+    ck_of = lambda n: torch.load(os.path.join(root, "checkpoints", n),
+                                 map_location="cpu", weights_only=True)
+    combos = [("numerical_trichef.pt", "precip_gbm.npz", "extreme_gbm.npz"),
+              ("numerical_trichef_12h.pt", "precip_gbm_12h.npz", "extreme_gbm_12h.npz")]
+    for ck_n, pg_n, eg_n in combos:
+        ck = ck_of(ck_n)
+        pg_p, eg_p = (os.path.join(root, "checkpoints", n) for n in (pg_n, eg_n))
+        g = predict.load_precip_gbm(ck, pg_p)
+        e = predict.load_extreme_gbm(ck, eg_p)
+        assert g is not None and e is not None, ck_n
+        # 배포 체크포인트의 기록과 실제 경로가 일치해야 한다(양방향 대조 통과).
+        predict._check_source("강수", ck.get("precip_source"), g, lambda t: t[2], "")
+        predict._check_source("극한기상", ck.get("extreme_source"), e, lambda t: t[1], "")
+        bad = copy.deepcopy(ck)
+        bad["mean"] = list(bad["mean"])
+        bad["mean"][3] = float(bad["mean"][3]) + 0.5
+        for fn, path in ((predict.load_precip_gbm, pg_p), (predict.load_extreme_gbm, eg_p)):
+            try:
+                fn(bad, path)
+                raise AssertionError(f"정규화 통계 불일치를 통과시켰다: {path}")
+            except RuntimeError:
+                pass
+    legacy = {k: v for k, v in g[2].items() if k not in ("meta_mean", "meta_std")}
+    try:
+        check_input_contract(legacy, ck, "legacy.npz")
+        raise AssertionError("통계가 없는 GBM 파일을 통과시켰다")
+    except RuntimeError:
+        pass
+
+    fake = (None, None, {"source_path": os.path.join(root, "checkpoints", "precip_gbm.npz")})
+    m = lambda t: t[2]
+    # 기록은 저장소 루트 기준이다 — CI 처럼 다른 디렉터리에서 돌아도 같은 파일로 본다.
+    _cwd = os.getcwd()
+    try:
+        os.chdir(os.path.dirname(root) or "/")
+        predict._check_source("강수", "./checkpoints/precip_gbm.npz", fake, m, "")
+    finally:
+        os.chdir(_cwd)
+    for rec, gbm in (("./checkpoints/precip_gbm.npz", None), (None, fake),
+                     ("./checkpoints/precip_gbm_12h.npz", fake)):
+        try:
+            predict._check_source("강수", rec, gbm, m, "")
+            raise AssertionError(f"출처 불일치를 통과시켰다: {rec} / {gbm}")
+        except RuntimeError:
+            pass
+
+    with open(os.path.join(root, "app.py"), encoding="utf-8") as fh:
+        app_src = fh.read()
+    for fn in ("get_extreme_gbm_at", "get_precip_gbm_at", "get_temp_model_at"):
+        assert f"def {fn}(path: str, fingerprint: str, main_fp: str," in app_src, \
+            f"{fn} 캐시 키에 주 체크포인트 지문이 없다"
+    return "배포 GBM 4개 통계·출처 일치 · 통계 변조·통계 없음·출처 3방향 불일치 차단 · 캐시 키"
+
+
 # ── ④ 판정선 조회가 모든 체크포인트 형태에서 동작하는가 ──────────
 def _threshold_paths():
     from predict import event_threshold, STATION_EVENT_THRESH_OVERRIDES
@@ -695,6 +762,8 @@ def main():
     check("api_budget", _api_budget_guards)
     print("\n[T3-7] 승격 절차 — 죽은 게이트·입력 계약")
     check("promotion", _promotion_guards)
+    print("\n[T3-8] GBM 정규화 통계·출처 결속, 앱 캐시 키")
+    check("gbm_binding", _gbm_norm_binding)
     print("\n[T4] 판정선 조회(구버전/신버전 체크포인트)")
     check("event_threshold", _threshold_paths)
     print("\n[T5] 배포 체크포인트 로드·추론")

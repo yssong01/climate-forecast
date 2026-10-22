@@ -47,6 +47,7 @@ scikit-learn 이 필요하고(GPU 컨테이너에 이미 있다), 서빙은 nump
 실행:
     python precip_gbm.py                 # 학습·선택·내보내기·검증
     python precip_gbm.py --report        # 내보낸 모델을 검증셋에서 채점만
+    python precip_gbm.py --stamp-norm    # 기존 내보내기에 정규화 통계 소급 기록
 """
 import argparse
 import os
@@ -132,6 +133,69 @@ def load(path: str = EXPORT_PATH):
     return NumpyGBM(d, "amt"), NumpyGBM(d, "occ"), meta
 
 
+def check_input_contract(meta, ref, path, label="GBM"):
+    """GBM 이 학습 때 본 표준화 입력과 `ref` 가 같은지 확인한다(2026-10-22).
+
+    `ref` 는 `mean`·`std`(·`num_features`)를 가진 dict 다 — 주 체크포인트나
+    특징 캐시(`eval_cache.load_features`)를 그대로 넘긴다. 트리 임계값은
+    **표준화된 값**에 걸려 있으므로, 주 체크포인트를 재학습해 정규화 통계가
+    바뀌면 같은 원시 관측이 다른 가지로 간다. 차원과 리드타임은 그대로라
+    종전 대조(차원만)로는 잡히지 않고, 오류 없이 다른 값을 낸다.
+    통계가 적히지 않은 파일(2026-10-22 이전 내보내기)도 멈춘다 — 무엇과
+    묶였는지 모르는 모델을 쓰지 않는다. `--stamp-norm` 으로 기록할 수 있다.
+    """
+    if "meta_mean" not in meta or "meta_std" not in meta:
+        raise RuntimeError(
+            f"{label} 에 학습 시 정규화 통계(meta_mean/meta_std)가 없다 — "
+            f"어느 입력 통계에 묶인 모델인지 확인할 수 없다: {path} "
+            f"(재내보내기 또는 --stamp-norm)")
+    nf = int(meta["meta_num_features"])
+    if ref.get("num_features") is not None and nf != int(ref["num_features"]):
+        raise RuntimeError(
+            f"{label} 의 입력 차원({nf})이 기준({int(ref['num_features'])})과 다르다: {path}")
+    for k in ("mean", "std"):
+        a = [round(float(v), 6) for v in np.ravel(meta[f"meta_{k}"])]
+        b = [round(float(v), 6) for v in np.ravel(np.asarray(ref[k], dtype=np.float64))]
+        if a != b:
+            raise RuntimeError(
+                f"{label} 의 학습 시 정규화 통계({k})가 기준과 다르다 — 트리 임계값이 "
+                f"다른 표준화 공간에 걸려 값이 조용히 어긋난다: {path}")
+
+
+def add_meta(path, extra):
+    """npz 에 메타 항목을 더해 원자적으로 다시 쓴다(고유 tmp + os.replace)."""
+    import tempfile
+    with np.load(path, allow_pickle=False) as z:
+        d = {k: z[k] for k in z.files}
+    d.update(extra)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".npz")
+    os.close(fd)
+    try:
+        np.savez_compressed(tmp, **d)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def stamp_norm(path, f, got, want, what):
+    """기존 내보내기에 학습 시 정규화 통계를 소급 기록한다.
+
+    **재현을 확인한 뒤에만 적는다.** 파일에 저장된 평가 지표(`want`)를 지금의
+    특징 캐시 `f` 로 다시 계산한 값(`got`)과 대조한다 — 트리 임계값이 표준화
+    공간에 걸려 있으므로 통계가 달랐다면 같은 값이 나올 수 없다. 일치하면
+    그 캐시의 통계가 학습 때의 통계이고, 어긋나면 아무것도 쓰지 않는다
+    (측정하지 않은 것을 기록하지 않는다).
+    """
+    print(f"재현 대조({what}): 저장 {want:.10f} · 재계산 {got:.10f}")
+    if abs(got - want) > 1e-9:
+        raise SystemExit("재현되지 않는다 — 학습 시 통계를 확정할 수 없어 기록하지 않는다.")
+    add_meta(path, {"meta_mean": np.asarray(f["mean"], dtype=np.float64),
+                    "meta_std": np.asarray(f["std"], dtype=np.float64)})
+    print(f"기록: {path} (meta_mean/meta_std, 기준 {f.get('ckpt_path', '?')})")
+
+
 # ── 내보내기 ─────────────────────────────────────────────────────
 
 def _flatten(model, prefix, out):
@@ -188,6 +252,9 @@ def main():
     ap.add_argument("--checkpoint", default=None,
                     help="특징을 만들 기준 체크포인트(리드타임을 결정한다). "
                          "생략하면 predict.CHECKPOINT(+6h).")
+    ap.add_argument("--stamp-norm", action="store_true",
+                    help="기존 내보내기(--out)에 학습 시 정규화 통계를 소급 기록한다 — "
+                         "저장된 평가 F1 이 재현될 때만")
     args = ap.parse_args()
 
     import eval_cache
@@ -211,6 +278,14 @@ def main():
         print(f"발생 F1(절반분리) {honest_f1(o, y_va, half):.4f} · "
               f"구간 MAE {conditional_mae(a, p_va, y_va):.4f} · "
               f"원본 MAE {mae(np.clip(a, 0, None), p_va):.4f}")
+        return 0
+
+    if args.stamp_norm:
+        amt, occ, meta = load(args.out)
+        if amt is None:
+            raise SystemExit(f"내보낸 모델이 없다: {args.out}")
+        stamp_norm(args.out, f, honest_f1(occ.predict_proba1(x_va), y_va, half),
+                   float(meta["meta_val_precip_wet_f1"]), "발생 F1(평가용 절반)")
         return 0
 
     from sklearn.ensemble import (HistGradientBoostingRegressor,
@@ -258,6 +333,10 @@ def main():
     d["meta_learning_rate"] = np.asarray(grid["learning_rate"])
     d["meta_seed"] = np.asarray(SEED)
     d["meta_num_features"] = np.asarray(x_va.shape[1])
+    # 트리 임계값이 걸린 표준화 공간 — 서빙이 주 체크포인트와 대조한다
+    # (`check_input_contract`). 없으면 재학습 후 조용히 어긋난다.
+    d["meta_mean"] = np.asarray(f["mean"], dtype=np.float64)
+    d["meta_std"] = np.asarray(f["std"], dtype=np.float64)
     d["meta_wet_thresh"] = np.asarray(wet)
     d["meta_val_precip_wet_f1"] = np.asarray(f1)
     d["meta_val_precip_mae_wet"] = np.asarray(cmae)

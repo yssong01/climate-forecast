@@ -55,6 +55,7 @@ GBM 이 세 헤드 모두에서 신경망을 앞섰다. 강수에서 확인한 �
 
 실행:
     python extreme_gbm.py [--checkpoint <주 체크포인트>] [--out <npz>]
+    python extreme_gbm.py --stamp-norm [--checkpoint ...] [--out ...]  # 정규화 통계 소급 기록
 """
 import argparse
 import os
@@ -145,6 +146,9 @@ def main():
     ap.add_argument("--patch-checkpoint", action="store_true",
                     help="화면이 이미 읽는 스키마(extreme_metrics_served·"
                          "prob_calibration.heads)에 이 모델의 값을 적어 넣는다.")
+    ap.add_argument("--stamp-norm", action="store_true",
+                    help="기존 내보내기(--out)에 학습 시 정규화 통계를 소급 기록한다 — "
+                         "저장된 헤드별 평가 F1 이 전부 재현될 때만")
     args = ap.parse_args()
 
     import eval_cache
@@ -157,6 +161,30 @@ def main():
     x_tr, x_va = f["x_train"], f["x_val"]
     nf = x_va.shape[1]
     half = ((f["tgt_ts_val"].astype(np.int64) // 10 ** 4) % 2 == 0)
+
+    if args.stamp_norm:
+        # 헤드마다 저장된 평가용 F1(원본 확률·τ)을 다시 계산해 **전부** 같을
+        # 때만 적는다 — 학습 경로(아래)와 같은 마스크·같은 절반을 쓴다.
+        from precip_gbm import stamp_norm
+        models, meta = load(args.out)
+        if not models:
+            raise SystemExit(f"내보낸 모델이 없다: {args.out}")
+        got, want = [], []
+        for head, m in models.items():
+            mk = SHORT[head]
+            off = f.get(f"{mk}_mask_official_val")
+            mva = (off if off is not None else f[f"{mk}_mask_val"]).astype(bool)
+            y_va = f[f"y_{head}_val"][mva].astype(int)
+            hv = half[mva]
+            p = m.predict_proba1(x_va[mva])
+            tau = float(meta[f"meta_{head}_tau"])
+            got.append(f1_at(np.where(p >= tau, 1.0, 0.0)[~hv], y_va[~hv], 0.5))
+            want.append(float(meta[f"meta_{head}_f1"]))
+            print(f"  {head:<9} 저장 {want[-1]:.10f} · 재계산 {got[-1]:.10f}")
+        worst = int(np.argmax(np.abs(np.subtract(got, want))))
+        stamp_norm(args.out, f, got[worst], want[worst],
+                   f"헤드별 평가 F1 중 최대 차이({list(models)[worst]})")
+        return 0
 
     # 제약 열은 train 이 쓰는 것과 **같은 함수**로 구한다 — 열 번호를 여기서
     # 세면 특징 집합이 바뀔 때 조용히 어긋난다.
@@ -283,6 +311,9 @@ def main():
     print("\n" + "\n".join(summary))
 
     out["meta_num_features"] = np.asarray(nf)
+    # 트리 임계값이 걸린 표준화 공간(`precip_gbm.check_input_contract`).
+    out["meta_mean"] = np.asarray(f["mean"], dtype=np.float64)
+    out["meta_std"] = np.asarray(f["std"], dtype=np.float64)
     out["meta_temp_cols"] = np.asarray(temp_cols)
     for k in ("lead_hours", "split_mode", "split_algo", "ckpt_path"):
         if k in f:

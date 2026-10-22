@@ -170,8 +170,10 @@ def main():
         models, meta = _eg.load(args.extreme_gbm)
         if not models:
             raise SystemExit(f"극한기상 GBM 이 없다: {args.extreme_gbm}")
-        if int(meta["meta_num_features"]) != ckpt["num_features"]:
-            raise SystemExit("GBM 의 입력 차원이 체크포인트와 다르다.")
+        # 차원뿐 아니라 학습 시 정규화 통계까지 본다(2026-10-22) — 트리 임계값은
+        # 표준화된 값에 걸려 있어 통계가 다르면 오류 없이 다른 값을 낸다.
+        from precip_gbm import check_input_contract
+        check_input_contract(meta, ckpt, args.extreme_gbm, "극한기상 GBM")
         # 표준화 입력 행렬은 특징 캐시에서 가져온다. 두 캐시가 같은 검증
         # 분할에서 나왔는지 **키로 대조한다** — 행 순서가 어긋나면 확률과
         # 라벨이 밀려 붙는데 지표는 그럴듯하게 나와 눈치챌 수 없다.

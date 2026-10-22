@@ -189,8 +189,13 @@ def get_model(fingerprint: str):
     return get_model_at(CHECKPOINT, fingerprint)
 
 
+# 아래 세 캐시는 **주 체크포인트 지문(`main_fp`)도 키로 받는다(2026-10-22).**
+# 호환 검증(정규화 통계·차원·리드타임)은 캐시된 함수 **안에서** `_main_ckpt`
+# 와 대조하는데, `_` 접두 인자는 해시에서 빠지므로 주 체크포인트만 바뀌고
+# 보조 모델 파일이 그대로면 **검증 없이** 옛 결과가 돌아온다 — 재학습한 주
+# 체크포인트와 어긋난 GBM 이 그대로 서빙되는 경로다(1절 14항).
 @st.cache_resource(show_spinner=False)
-def get_extreme_gbm_at(path: str, fingerprint: str, _main_ckpt):
+def get_extreme_gbm_at(path: str, fingerprint: str, main_fp: str, _main_ckpt):
     """리드타임별 극한기상 GBM. 호환 검증은 load_extreme_gbm 안에서 한다."""
     if not path or not os.path.exists(path):
         return None
@@ -198,7 +203,7 @@ def get_extreme_gbm_at(path: str, fingerprint: str, _main_ckpt):
 
 
 @st.cache_resource(show_spinner=False)
-def get_precip_gbm_at(path: str, fingerprint: str, _main_ckpt):
+def get_precip_gbm_at(path: str, fingerprint: str, main_fp: str, _main_ckpt):
     """리드타임별 강수 전용 GBM. 호환 검증은 load_precip_gbm 안에서 한다."""
     if not path or not os.path.exists(path):
         return None
@@ -206,7 +211,7 @@ def get_precip_gbm_at(path: str, fingerprint: str, _main_ckpt):
 
 
 @st.cache_resource(show_spinner=False)
-def get_temp_model_at(path: str, fingerprint: str, _main_ckpt):
+def get_temp_model_at(path: str, fingerprint: str, main_fp: str, _main_ckpt):
     """리드타임별 기온 전용 모델. path 를 캐시 키에 넣어 +6h/+12h 가 서로를
     덮어쓰지 않게 한다(get_model_at 과 같은 이유)."""
     if not path or not os.path.exists(path):
@@ -214,15 +219,15 @@ def get_temp_model_at(path: str, fingerprint: str, _main_ckpt):
     return load_temp_model(_main_ckpt, path)
 
 
-@st.cache_resource(show_spinner=False)
-def get_temp_model(fingerprint: str, _main_ckpt):
+def get_temp_model(fingerprint: str, main_fp: str, _main_ckpt):
     """기온 전용 보조 모델(없으면 `(None, None)`).
 
     `fingerprint` 는 캐시 무효화 전용이다. 주 체크포인트와의 호환 검증은
     `predict.load_temp_model()` 안에서 하며, 어긋나면 예외로 멈춘다 —
-    조용히 다른 값을 내는 것보다 화면이 멈추는 편이 낫다.
+    조용히 다른 값을 내는 것보다 화면이 멈추는 편이 낫다. 캐시는
+    `get_temp_model_at` 하나만 둔다 — 겹쳐 두면 바깥 캐시가 안쪽 키를 가린다.
     """
-    return get_temp_model_at(TEMP_CHECKPOINT, fingerprint, _main_ckpt)
+    return get_temp_model_at(TEMP_CHECKPOINT, fingerprint, main_fp, _main_ckpt)
 
 
 def obs_hour_key() -> str:
@@ -920,11 +925,11 @@ try:
     _fp6 = ckpt_fingerprint()
     model, ckpt = get_model(_fp6)
     _fpT = ckpt_fingerprint(TEMP_CHECKPOINT) if TEMP_CHECKPOINT else ""
-    temp_model, temp_ckpt = get_temp_model(_fpT, ckpt)
+    temp_model, temp_ckpt = get_temp_model(_fpT, _fp6, ckpt)
     _fpG = ckpt_fingerprint(PRECIP_GBM) if PRECIP_GBM else ""
-    precip_gbm = get_precip_gbm_at(PRECIP_GBM, _fpG, ckpt)
+    precip_gbm = get_precip_gbm_at(PRECIP_GBM, _fpG, _fp6, ckpt)
     _fpE = ckpt_fingerprint(EXTREME_GBM) if EXTREME_GBM else ""
-    extreme_gbm = get_extreme_gbm_at(EXTREME_GBM, _fpE, ckpt)
+    extreme_gbm = get_extreme_gbm_at(EXTREME_GBM, _fpE, _fp6, ckpt)
 
     def _thr(event, _stn=None, _ck=None):
         """서빙 판정선 — 극한기상을 GBM 이 내면 **그 모델 파일의 값**을 쓴다.
@@ -1414,11 +1419,11 @@ with tab_trend:
         model_12h, ckpt_12h = get_model_at(CHECKPOINT_12H, _fp12)
         _fpT12 = ckpt_fingerprint(TEMP_CHECKPOINT_12H)
         tmodel_12h, tckpt_12h = get_temp_model_at(TEMP_CHECKPOINT_12H, _fpT12,
-                                                  ckpt_12h)
+                                                  _fp12, ckpt_12h)
         _fpG12 = ckpt_fingerprint(PRECIP_GBM_12H)
-        gbm_12h = get_precip_gbm_at(PRECIP_GBM_12H, _fpG12, ckpt_12h)
+        gbm_12h = get_precip_gbm_at(PRECIP_GBM_12H, _fpG12, _fp12, ckpt_12h)
         _fpE12 = ckpt_fingerprint(EXTREME_GBM_12H)
-        egbm_12h = get_extreme_gbm_at(EXTREME_GBM_12H, _fpE12, ckpt_12h)
+        egbm_12h = get_extreme_gbm_at(EXTREME_GBM_12H, _fpE12, _fp12, ckpt_12h)
         result_12h = cached_predict(
             stn, obs_hour_key(), ckpt_12h["lead_hours"], _fp12, model_12h,
             ckpt_12h, _fpT12, tmodel_12h, tckpt_12h, _fpG12, gbm_12h,

@@ -211,6 +211,7 @@ def main():
         if amt is None:
             raise SystemExit(f"GBM 모델이 없다: {gbm_path}")
         feat = _ec.load_features(ckpt_path)
+        precip_gbm.check_input_contract(meta, feat, gbm_path, "강수 GBM")
         if not (len(feat["tgt_ts_val"]) == len(data["tgt_ts"])
                 and (feat["stn_val"] == data["stn"].astype(feat["stn_val"].dtype)).all()):
             raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")

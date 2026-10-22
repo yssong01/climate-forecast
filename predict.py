@@ -395,19 +395,19 @@ def load_temp_model(main_ckpt: dict, path: str = None, device: str = DEVICE):
 def load_extreme_gbm(main_ckpt: dict, path: str = None):
     """극한기상 전용 GBM 을 읽고 주 체크포인트와 호환되는지 확인한다.
 
-    강수 GBM 과 같은 이유로 차원·리드타임을 대조한다 — 같은 표준화 입력
-    벡터를 공유하므로 어긋나면 오류 없이 조용히 다른 값을 낸다.
+    강수 GBM 과 같은 이유로 차원·정규화 통계·리드타임을 대조한다 — 같은
+    표준화 입력 벡터를 공유하므로 어긋나면 오류 없이 조용히 다른 값을 낸다.
     """
     if not path or not os.path.exists(path):
         return None
     import extreme_gbm as _eg
+    from precip_gbm import check_input_contract
     models, meta = _eg.load(path)
     if not models:
         return None
-    nf = int(meta["meta_num_features"])
-    if nf != main_ckpt.get("num_features"):
-        raise RuntimeError(
-            f"극한기상 GBM 의 입력 차원({nf})이 주 체크포인트와 다르다: {path}")
+    check_input_contract(meta, main_ckpt, path, "극한기상 GBM")
+    # 실제로 읽은 경로 — predict() 가 체크포인트의 `extreme_source` 와 대조한다.
+    meta["source_path"] = path
     lead = meta.get("meta_lead_hours")
     if lead is not None and int(lead) != int(main_ckpt.get("lead_hours", -1)):
         raise RuntimeError(
@@ -420,8 +420,10 @@ def load_precip_gbm(main_ckpt: dict, path: str = None):
     """강수 전용 GBM 을 읽고 주 체크포인트와 호환되는지 확인한다.
 
     경로가 비었거나 파일이 없으면 `None` — 종전 동작(주 모델이 강수도 낸다).
-    같은 표준화 입력 벡터를 공유하므로 **차원이나 리드타임이 어긋나면 오류
-    없이 조용히 다른 값을 낸다.** 그래서 여기서 막는다.
+    같은 표준화 입력 벡터를 공유하므로 **차원·정규화 통계·리드타임이 어긋나면
+    오류 없이 조용히 다른 값을 낸다.** 그래서 여기서 막는다. 정규화 통계
+    대조는 2026-10-22 에 더했다 — 그 전에는 차원만 봐서, 주 체크포인트를
+    재학습해 통계가 바뀌면 트리 임계값이 다른 표준화 공간에 걸린 채 서빙됐다.
     """
     if not path or not os.path.exists(path):
         return None
@@ -429,17 +431,44 @@ def load_precip_gbm(main_ckpt: dict, path: str = None):
     amt, occ, meta = _pg.load(path)
     if amt is None:
         return None
-    nf = int(meta["meta_num_features"])
-    if nf != main_ckpt.get("num_features"):
-        raise RuntimeError(
-            f"강수 GBM 의 입력 차원({nf})이 주 체크포인트"
-            f"({main_ckpt.get('num_features')})와 다르다: {path}")
+    _pg.check_input_contract(meta, main_ckpt, path, "강수 GBM")
+    meta["source_path"] = path      # predict() 가 `precip_source` 와 대조한다
     lead = meta.get("meta_lead_hours")
     if lead is not None and int(lead) != int(main_ckpt.get("lead_hours", -1)):
         raise RuntimeError(
             f"강수 GBM 의 예보 시계({int(lead)}h)가 주 체크포인트"
             f"({main_ckpt.get('lead_hours')}h)와 다르다: {path}")
     return amt, occ, meta
+
+
+def _check_source(label, recorded, gbm, meta_of, fix):
+    """체크포인트가 적어 둔 출처(`recorded`)와 실제로 넘겨받은 GBM 이 같은지.
+
+    경로 대조는 `load_*_gbm` 이 남긴 `source_path` 가 있을 때만 한다 —
+    호출자가 직접 만든 튜플에는 경로가 없다. **두 경로의 기준 디렉터리가
+    다르다**: 기록(`./checkpoints/x.npz`)은 저장소 루트 기준이고, 실제로 연
+    경로는 현재 디렉터리 기준이다. CI 는 `data/` 에서 돌며 코드 경로를
+    절대경로로 넘기므로, 기록을 현재 디렉터리로 풀면 같은 파일이 다르다고
+    판정돼 12곳 전부 멈춘다(2026-10-22 시험에서 실제로 그랬다).
+    """
+    if recorded is not None and gbm is None:
+        raise RuntimeError(
+            f"{label} 판정선·지표가 '{recorded}' 기준으로 적혔는데 실제 출처가 "
+            f"주 모델이다 — {fix} 를 그 출처로 다시 돌릴 것.")
+    if gbm is None:
+        return
+    if recorded is None:
+        raise RuntimeError(
+            f"{label} GBM 을 넘겼는데 체크포인트의 판정선·지표는 주 모델 기준이다 — "
+            f"{fix} 로 그 GBM 을 기록할 것.")
+    got = (meta_of(gbm) or {}).get("source_path")
+    _root = os.path.dirname(os.path.abspath(__file__))
+    want = os.path.normpath(recorded if os.path.isabs(recorded)
+                            else os.path.join(_root, recorded))
+    if got and os.path.abspath(got) != want:
+        raise RuntimeError(
+            f"{label} 판정선·지표는 '{recorded}' 기준인데 실제로 읽은 모델은 "
+            f"'{got}' 이다 — 같은 파일이어야 한다.")
 
 
 def load_model(checkpoint_path: str = CHECKPOINT, device: str = DEVICE):
@@ -527,11 +556,15 @@ def predict(stn: str = "108",
     # 극한기상도 같은 대조를 한다 — 체크포인트의 판정선·지표가 GBM 기준으로
     # 적혔는데 실제 출처가 신경망이면, 보정 곡선이 지워진 원본 확률에 GBM
     # 판정선을 씌우게 되어 조용히 어긋난다.
-    _ex_src = ckpt.get("extreme_source")
-    if _ex_src is not None and (extreme_gbm is None):
-        raise RuntimeError(
-            f"극한기상 판정선·지표가 '{_ex_src}' 기준으로 적혔는데 실제 출처가 "
-            f"주 모델이다 — extreme_gbm.py --patch-checkpoint 를 그 출처로 다시 돌릴 것.")
+    #
+    # **양방향으로 본다(2026-10-22).** 종전에는 "기록은 GBM, 실제는 신경망"
+    # 한쪽만 막았다. 반대 방향(GBM 을 넘겼는데 체크포인트의 판정선·지표·
+    # 보정이 신경망 것)과 **다른 GBM 파일**(기록은 +6h 파일, 실제는 +12h
+    # 파일)도 오류 없이 어긋난 값을 낸다.
+    _check_source("극한기상", ckpt.get("extreme_source"), extreme_gbm,
+                  lambda g: g[1], "extreme_gbm.py --patch-checkpoint")
+    _check_source("강수", ckpt.get("precip_source"), precip_gbm,
+                  lambda g: g[2], "metrics_report.py --patch-checkpoint --precip-gbm")
     _ci_src = (ckpt.get("conformal_interval") or {}).get("precip_source")
     if _ci_src is not None:
         _want_gbm = _ci_src != "model"
@@ -698,7 +731,9 @@ def predict(stn: str = "108",
     # 전 확률과 맞물려 학습됐기 때문).
     if precip_gbm is not None:
         # 강수를 전용 GBM 이 낸다. 같은 표준화 입력 벡터를 쓰며(차원·정규화
-        # 통계 일치는 load_precip_gbm 이 이미 확인했다), 판정선도 **그 모델
+        # 통계 일치는 `load_precip_gbm` 이 모델 파일의 `meta_mean`/`meta_std`
+        # 로 확인한다 — 2026-10-22 전까지 이 주석은 사실이 아니었다. 그때는
+        # 차원만 봤다), 판정선도 **그 모델
         # 파일에 저장된 값**을 쓴다 — 상수로 박아 두면 모델을 바꿀 때마다
         # 사람이 옮겨 적어야 하고 그 고리가 드리프트의 입구다.
         amt_m, occ_m, gmeta = precip_gbm

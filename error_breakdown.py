@@ -253,6 +253,7 @@ def main():
         if amt is None:
             raise SystemExit(f"강수 GBM 이 없다: {args.precip_gbm}")
         feat = eval_cache.load_features(args.ckpt)
+        _pg.check_input_contract(gmeta, feat, args.precip_gbm, "강수 GBM")
         if len(feat["tgt_ts_val"]) != len(d["tgt_ts"]):
             raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
         d = dict(d)

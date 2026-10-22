@@ -451,6 +451,8 @@ def main():
         if amt is None:
             raise SystemExit(f"강수 GBM 이 없다: {args.precip_gbm}")
         feat = eval_cache.load_features(args.ckpt)
+        # 체크포인트에 적을 값이므로 GBM 이 이 표준화 입력에 묶인 모델인지 먼저 본다.
+        _pg.check_input_contract(gmeta, feat, args.precip_gbm, "강수 GBM")
         if len(feat["tgt_ts_val"]) != len(d["tgt_ts"]):
             raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
         d = dict(d)
@@ -469,6 +471,8 @@ def main():
         if not gmodels:
             raise SystemExit(f"극한기상 GBM 이 없다: {args.extreme_gbm}")
         feat = eval_cache.load_features(args.ckpt)
+        from precip_gbm import check_input_contract
+        check_input_contract(gmeta, feat, args.extreme_gbm, "극한기상 GBM")
         if len(feat["tgt_ts_val"]) != len(d["tgt_ts"]):
             raise SystemExit("특징 캐시와 추론 캐시의 검증 표본이 다르다.")
         d = dict(d)

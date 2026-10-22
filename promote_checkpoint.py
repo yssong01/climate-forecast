@@ -14,7 +14,8 @@ promote_checkpoint.py — 후보 체크포인트를 배포로 승격하는 절�
   0. 입력 계약 — 이 체크포인트와 **같은 표준화 입력 벡터를 공유하는 모델**
      (기온 전용 모델·강수 GBM·극한기상 GBM)이 있으면 정규화 통계·입력 차원이
      같아야 한다. 다르면 그 모델들이 조용히 어긋나거나(GBM) 서빙이 시작 시
-     멈춘다(기온 모델). 이 절차는 그 모델들을 다시 만들지 않는다.
+     멈춘다(기온 모델). 이 절차는 그 모델들을 다시 만들지 않는다. GBM 은
+     파일에 적힌 학습 시 통계(`meta_mean`/`meta_std`)와 직접 대조한다.
   1. 계절 오탐 — 라벨 마스크가 가리는 구간을 직접 본다. 폭염 헤드가 한겨울에,
      한파 헤드가 한여름에 작동하지 않는지. 집계 지표(F1)로는 잡히지 않는다.
   2. 단조성 — 기온을 흔들었을 때 두 헤드가 물리적으로 옳은 방향으로 반응하는지.
@@ -187,6 +188,15 @@ def input_contract_diff(a, b):
     return diff
 
 
+def gbm_contract(path, ck):
+    """GBM 파일의 학습 시 정규화 통계·차원이 체크포인트와 같은지 — 다르면 RuntimeError."""
+    import numpy as np
+    from precip_gbm import check_input_contract
+    with np.load(path, allow_pickle=False) as z:
+        meta = {k: z[k] for k in z.files if k.startswith("meta_")}
+    check_input_contract(meta, ck, path)
+
+
 def ckpt_metrics(c):
     em = c.get("extreme_metrics") or {}
     return {
@@ -289,6 +299,15 @@ def main():
         _shared = [p for p in (_temp_dep, _ex_gbm, _pr_gbm) if p]
         _diff = (input_contract_diff(deployed, cand_ck)
                  if (_shared and deployed is not None) else [])
+        # GBM 은 **자기 파일에 적힌 학습 시 통계**와 직접 대조한다(2026-10-22).
+        # 배포본을 거쳐 비교하면 배포본 자신이 이미 GBM 과 어긋나 있을 때
+        # 후보도 같은 통계라는 이유로 통과한다.
+        for _p, _lab in ((_pr_gbm, "강수 GBM"), (_ex_gbm, "극한기상 GBM")):
+            if _p:
+                try:
+                    gbm_contract(_p, cand_ck)
+                except RuntimeError as e:
+                    _diff.append(f"{_lab}({e})")
         _who = "이 체크포인트의 입력을 공유하는 " + (", ".join(_shared) or "모델 없음")
     if _diff:
         failures.append(
