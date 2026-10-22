@@ -669,6 +669,109 @@ def _window_gap_upkeep():
     return "내부 구멍 최신순·탐침 관측소 제외·실행당 상한 · 창 밖 대기 항목만 정리"
 
 
+def _pipeline_units():
+    """CI 파이프라인 단위 시험(2026-10-22, NEXT.md P3-2).
+
+    ① 수치예보 최신성 게이트 — 여유가 충분하면 통과, 관측소가 통째로 빠지면
+       실패(종전에는 있는 관측소만 세서 빠진 관측소를 놓쳤다).
+    ② `accuracy.trim` — 기간이 지난 대조 완료 항목만 지우고 대기 항목은 남긴다.
+    ③ 극한기상 GBM 두 파일 — 헤드마다 저장된 보정 방법(베타·등온·안 함)으로
+       확률이 [0, 1] 안에 나오고, 기온 단조 제약 헤드는 기온을 올리면 폭염이
+       내려가지 않는다.
+    """
+    import tempfile
+    from datetime import datetime, timedelta
+    import accuracy
+    import collect_nwp_archive as cna
+    import extreme_gbm as eg
+    from weather_collector import KST, STATION_COORDS
+
+    now = datetime.now(KST).replace(tzinfo=None)
+    keys = [(now + timedelta(hours=h)).strftime("%Y%m%d%H00") for h in range(-5, 30)]
+    full = {s_: {k: [0.0] * 7 for k in keys} for s_ in STATION_COORDS}
+    cna._freshness_gate(full)
+    short = dict(full)
+    short.pop(next(iter(STATION_COORDS)))
+    try:
+        cna._freshness_gate(short)
+        raise AssertionError("관측소가 빠진 수치예보 창을 통과시켰다")
+    except SystemExit:
+        pass
+
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        e = lambda tt, done: {"station": "108", "target_time": tt, "source": "ci",
+                              "actual_temp": 1.0 if done else None}
+        accuracy._save([e("202609010000", True), e("202609010000", False),
+                        e("202610200000", True)], path)
+        assert accuracy.trim(30, path) == 1
+        left = accuracy._load(path)
+        assert len(left) == 2 and any(x["actual_temp"] is None for x in left)
+    finally:
+        os.remove(path)
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    methods = set()
+    for name in ("extreme_gbm.npz", "extreme_gbm_12h.npz"):
+        models, meta = eg.load(os.path.join(root, "checkpoints", name))
+        assert set(models) == {"heatwave", "coldwave", "dust"}, (name, set(models))
+        nf = int(meta["meta_num_features"])
+        x = np.zeros((5, nf), dtype=np.float32)
+        x[:, 0] = np.linspace(-2, 2, 5)          # 표준화된 관측기온만 올린다
+        for head in models:
+            methods.add(str(meta[f"meta_{head}_cal_method"]))
+            p = eg.calibrated_batch(models, meta, head, x)
+            assert np.all(np.isfinite(p)) and np.all((p >= 0) & (p <= 1)), (name, head)
+        heat = eg.calibrated_batch(models, meta, "heatwave", x)
+        assert np.all(np.diff(heat) >= -1e-12), f"{name} 폭염이 기온에 단조가 아니다: {heat}"
+    return f"최신성 게이트 · trim · 극한 GBM 2개(보정 {sorted(methods)})"
+
+
+def _record_online_e2e():
+    """`record_online_forecasts.py --dry-run` 소형 종단 시험(2026-10-22, P3-2).
+
+    CI 가 15분마다 부르는 배포 경로다. 임시 작업 디렉터리에 main 의 저장소 창을
+    복사하고, **시험 전용 합성 수치예보 창**(상수값 — 출력의 정확성이 아니라
+    배선을 본다)을 만들어 API 0건으로 12곳 전부 예측이 나오는지 본다. 이 경로가
+    죽으면 화면의 적중률이 조용히 비어 간다(CLAUDE.md 7절).
+    """
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+    root = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(root, "cache", "recent_window.json")
+    if not os.path.exists(src):
+        return "저장소 창 없음 — 건너뜀"
+    with open(src, encoding="utf-8") as fh:
+        window = json.load(fh)
+    latest = max(str(r["timestamp"])[:12] for r in window)
+    from datetime import datetime, timedelta
+    t0 = datetime.strptime(latest, "%Y%m%d%H%M")
+    keys = [(t0 + timedelta(hours=h)).strftime("%Y%m%d%H00") for h in range(-48, 49)]
+    row = [0.0, 15.0, 60.0, 50.0, 2.0, 180.0, 1010.0]
+    stns = sorted({str(r["stn"]) for r in window})
+    tmp = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmp, "cache"))
+        shutil.copy(src, os.path.join(tmp, "cache", "recent_window.json"))
+        with open(os.path.join(tmp, "cache", "nwp_recent.json"), "w") as fh:
+            json.dump({s_: {k: row for k in keys} for s_ in stns}, fh)
+        env = dict(os.environ, KMA_API_KEY="", PYTHONPATH=root)
+        out = subprocess.run(
+            [sys.executable, os.path.join(root, "record_online_forecasts.py"), "--dry-run"],
+            cwd=tmp, env=env, capture_output=True, text=True, timeout=600)
+        txt = out.stdout + out.stderr
+        assert out.returncode == 0, txt[-800:]
+        assert "실패 0건" in txt, txt[-800:]
+        n = sum(1 for line in txt.splitlines() if " → " in line and "기온" in line)
+        assert n == len(stns), f"예측 {n}건 / 관측소 {len(stns)}곳\n{txt[-800:]}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return f"관측소 {n}곳 예측 · 실패 0 · API 키 없음"
+
+
 def _promotion_guards():
     """승격 절차의 두 안전장치가 동작하는가(2026-10-21).
 
@@ -821,6 +924,10 @@ def main():
     check("api_budget", _api_budget_guards)
     print("\n[T3-6b] 창 내부 공백·대조 불가 대기 항목")
     check("window_upkeep", _window_gap_upkeep)
+    print("\n[T3-6c] CI 파이프라인 단위(최신성 게이트·trim·극한 GBM)")
+    check("pipeline_units", _pipeline_units)
+    print("\n[T3-6d] 온라인 기록 종단 시험(dry-run)")
+    check("record_online_e2e", _record_online_e2e)
     print("\n[T3-7] 승격 절차 — 죽은 게이트·입력 계약")
     check("promotion", _promotion_guards)
     print("\n[T3-8] GBM 정규화 통계·출처 결속, 앱 캐시 키")
